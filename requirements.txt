@@ -1,0 +1,13 @@
+# Python dependencies for the X2 MO-CMA-ES driver optimisation project.
+#
+# Install with:  pip install -r requirements.txt
+#
+# External tools — NOT installed via pip, must be set up separately:
+#   PITOT3  (part of the gdtk / Eilmer suite)  https://gdtk.uqcloud.net
+#   SPARK   (piston dynamics solver)
+#   gdtk    (Eilmer gas dynamics toolkit — provides gdtk.gas)
+
+deap
+numpy
+matplotlib
+pyyaml

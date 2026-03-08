@@ -1,0 +1,33 @@
+# Experiment configurations for the X2 MO-CMA-ES driver optimisation.
+#
+# Each entry configures one call to main().  Fields:
+#
+#   sim_type     : constraint-handling strategy
+#                    'ParentValue'      – infeasible offspring inherit parent's attribute value
+#                    'ElitistCrossover' – HV-best parent donates the violating attribute
+#                    'RandomCrossover'  – random parent donates the violating attribute
+#                    'Penalty'          – infeasible individuals receive a fitness penalty
+#
+#   pop_size     : population size  (MU = LAMBDA = pop_size)
+#
+#   step_size    : initial CMA-ES step size (sigma), in normalised [1,2]^6 space
+#
+#   p4_treatment : how to enforce the upper p4 bound after mutation
+#                    'hard_bounds_on_p4' – re-transform to stay within the physical p4 limit
+#                    null                – no special treatment
+
+experiments:
+  - sim_type: ParentValue
+    pop_size: 12
+    step_size: 0.005
+    p4_treatment: hard_bounds_on_p4
+
+  - sim_type: ParentValue
+    pop_size: 36
+    step_size: 0.005
+    p4_treatment: hard_bounds_on_p4
+
+  - sim_type: ParentValue
+    pop_size: 36
+    step_size: 0.005
+    p4_treatment: hard_bounds_on_p4
