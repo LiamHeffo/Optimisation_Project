@@ -1,0 +1,24 @@
+# Runtime simulation outputs
+PITOT3_Outputs/
+
+# CEA temporary files
+thermo.inp
+thermo.lib
+thermo.out
+tmp.inp
+tmp.out
+trans.inp
+trans.lib
+trans.out
+
+# Runtime diagnostic text files (generated during runs)
+diagnostics.txt
+diagnostics1.txt
+diagnostics2.txt
+
+# Python cache
+__pycache__/
+*.pyc
+
+# LibreOffice lock files
+.~lock.*
