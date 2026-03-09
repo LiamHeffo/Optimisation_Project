@@ -55,7 +55,7 @@ def set_logbook(logbook):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def constraint_function(x1, bounds):
-    """Evaluate the shock-speed constraint |vs - 4900| via PITOT3.
+    """Evaluate the shock-speed constraint via PITOT3.
 
     Parameters
     ----------
@@ -67,7 +67,7 @@ def constraint_function(x1, bounds):
     Returns
     -------
     float
-        |vs - 4900| in m/s, or 3500 (penalty) on failure.
+        |vs - vs1| in m/s, or 3500 (penalty) on failure.
     """
     ind_number = x1.ind_number
     test_name = f"DEAP_tests_{ind_number}"
