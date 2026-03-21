@@ -36,12 +36,12 @@ def variable_transformation(pop, bounds):
 
 def variable_untransformation(x, bounds):
     """Map a single individual from normalised [1, 2]^6 space back to physical space."""
-    x_new_0 = np.abs(x[0] - 1) * (bounds[0][1] - bounds[0][0]) + bounds[0][0]
-    x_new_1 = np.abs(x[1] - 1) * (bounds[1][1] - bounds[1][0]) + bounds[1][0]
-    x_new_2 = np.abs(x[2] - 1) * (1190.63 * x_new_1 - 14.62 * x_new_1) + 14.62 * x_new_1
-    x_new_3 = np.abs(x[3] - 1) * (bounds[3][1] - bounds[3][0]) + bounds[3][0]
-    x_new_4 = np.abs(x[4] - 1) * (bounds[4][1] - x_new_1) + x_new_1
-    x_new_5 = np.abs(x[5] - 1) * (bounds[5][1] - bounds[5][0]) + bounds[5][0]
+    x_new_0 = (x[0] - 1) * (bounds[0][1] - bounds[0][0]) + bounds[0][0]
+    x_new_1 = (x[1] - 1) * (bounds[1][1] - bounds[1][0]) + bounds[1][0]
+    x_new_2 = (x[2] - 1) * (1190.63 * x_new_1 - 14.62 * x_new_1) + 14.62 * x_new_1
+    x_new_3 = (x[3] - 1) * (bounds[3][1] - bounds[3][0]) + bounds[3][0]
+    x_new_4 = (x[4] - 1) * (bounds[4][1] - x_new_1) + x_new_1
+    x_new_5 = (x[5] - 1) * (bounds[5][1] - bounds[5][0]) + bounds[5][0]
 
     return [x_new_0, x_new_1, x_new_2, x_new_3, x_new_4, x_new_5]
 
