@@ -96,6 +96,10 @@ class StrategyMultiObjective(object):
         self.ccov   = params.get("ccov",   2.0 / (self.dim ** 2 + 6.0))
         self.pthresh = params.get("pthresh", 0.44)
 
+        # Rank-mu_MO,succ recombination (Voss 2009).
+        # d_steps controls the Mahalanobis neighbourhood radius (eq. 13–17).
+        self.d_steps = params.get("d_steps", self.dim + 3)
+
         # Per-parent internal state
         self.sigmas      = [sigma] * len(population)
         self.A           = [np.identity(self.dim) for _ in range(len(population))]
@@ -126,11 +130,13 @@ class StrategyMultiObjective(object):
             for i in range(self.lambda_):
                 mutation = self.sigmas[i] * np.dot(self.A[i], arz[i])
                 new_individual = self.parents[i] + mutation
+                repaired = False
 
                 if self.sim_type != 'Penalty':
                     s = time.time()
                     while True:
                         if not self.check_feasibility(new_individual)[0]:
+                            repaired = True
                             # Record repair attempts in the logbook bookshelf
                             if self.logbook is not None:
                                 gen_key = f'{self.logbook.bookshelf["generation"]}'
@@ -153,6 +159,7 @@ class StrategyMultiObjective(object):
 
                 individuals.append(ind_init(new_individual))
                 individuals[-1]._ps = "o", i
+                individuals[-1]._repaired = repaired
 
         else:
             # Random-parent variant: pick parents from the first Pareto front
@@ -167,6 +174,7 @@ class StrategyMultiObjective(object):
                     )
                 )
                 individuals[-1]._ps = "o", p_idx
+                individuals[-1]._repaired = False
 
         return individuals
 
@@ -184,12 +192,35 @@ class StrategyMultiObjective(object):
         pc            = [self.pc[ind._ps[1]].copy()    if ind._ps[0] == "o" else None for ind in chosen]
         psucc         = [self.psucc[ind._ps[1]]        if ind._ps[0] == "o" else None for ind in chosen]
 
+        # Snapshot parent state for the rank-mu_MO,succ update (Voss 2009).
+        # The per-offspring loop below mutates self.sigmas in-place, so we
+        # need a frozen view of (x_k^(g), sigma_k^(g)) at update-entry time.
+        # Repaired offspring are excluded — their (x' - x) is not a clean
+        # Gaussian step (temporary; revisit when box-constraint handling
+        # is refactored).
+        parents_snapshot = [np.array(p) for p in self.parents]
+        sigmas_snapshot  = list(self.sigmas)
+        successful_steps = [
+            (ind._ps[1], np.array(ind))
+            for ind in chosen
+            if ind._ps[0] == "o"
+            and not getattr(ind, "_repaired", False)
+        ]
+
         for i, ind in enumerate(chosen):
             t, p_idx = ind._ps
             if t == "o":
                 psucc[i] = (1.0 - cp) * psucc[i] + cp
                 sigmas[i] = sigmas[i] * np.exp((psucc[i] - ptarg) / (d * (1.0 - ptarg)))
                 print(f"sigmas: {sigmas[i]}")
+
+                # Rank-mu_MO,succ recombination (Voss 2009): blend in
+                # information from neighbouring successful offspring before
+                # applying the standard rank-one Cholesky update below.
+                A[i], invCholesky[i] = self._rankMuSuccUpdate(
+                    A[i], invCholesky[i], p_idx,
+                    parents_snapshot, sigmas_snapshot, successful_steps,
+                )
 
                 if psucc[i] < pthresh:
                     xp = np.array(ind)
@@ -327,6 +358,90 @@ class StrategyMultiObjective(object):
             chosen += mid_front
 
         return chosen, not_chosen
+
+    def _rankMuSuccUpdate(self, A, invCholesky, parent_idx, parents_snapshot,
+                          sigmas_snapshot, successful_steps):
+        """Rank-mu_MO,succ update of parent_idx's covariance (Voss 2009, eq. 8).
+
+        Replaces C_i with (1 - sum_w) * C_i + Z, where Z is a weighted sum of
+        outer products of normalised steps from successful offspring across
+        the population, weighted by Mahalanobis closeness in C_i's metric.
+
+        The hybrid scheme: reconstruct C = A A^T, blend, re-Cholesky.  Cheap
+        for small n; preserves the existing rank-one Cholesky path that fires
+        immediately after this in update().
+
+        Parameters
+        ----------
+        A, invCholesky : ndarray
+            Current Cholesky factor of C_i and its inverse.
+        parent_idx : int
+            Index of the parent whose covariance is being updated.
+        parents_snapshot, sigmas_snapshot : list
+            Snapshots of self.parents and self.sigmas taken at the start of
+            update(), so values are not corrupted by mid-loop mutation.
+        successful_steps : list of (donor_parent_idx, x_offspring)
+            Offspring deemed successful and not repaired.  Each contributes a
+            step (x' - x_donor) / sigma_donor to the rank-mu aggregate.
+
+        Note on success criterion
+        -------------------------
+        Voss 2009 defines a successful offspring as one that dominates its
+        parent in the joint Q^(g) ranking (indicator I(a' < a)).  We instead
+        reuse the existing success-rate test (psucc < pthresh) that already
+        drives our sigma adaptation, for consistency.  Empirical impact has
+        not been measured; revisit if the recombination underperforms.
+        """
+        n = self.dim
+        mu_succ = len(successful_steps)
+        if mu_succ == 0:
+            return A, invCholesky
+
+        x_i     = np.array(parents_snapshot[parent_idx])
+        sigma_i = sigmas_snapshot[parent_idx]
+
+        w_pp  = np.zeros(mu_succ)   # w''_ij  (eq. 15)
+        steps = np.zeros((mu_succ, n))
+
+        scale = np.sqrt(self.d_steps * n)
+        for k, (donor_idx, x_off) in enumerate(successful_steps):
+            x_off  = np.asarray(x_off)
+            x_don  = np.asarray(parents_snapshot[donor_idx])
+            sig_don = sigmas_snapshot[donor_idx]
+            # Mahalanobis distance under C_i (eq. 10): ||invCholesky · diff|| / sigma_i
+            d_M = np.linalg.norm(invCholesky @ (x_off - x_i)) / sigma_i
+            w_pp[k]  = np.exp(-d_M / scale)         # h(x) = e^{-x}, eq. 17
+            steps[k] = (x_off - x_don) / sig_don
+
+        # Normalise (eq. 16).  Denominator includes the (mu - mu_succ) zero-weight slots.
+        denom = self.mu - mu_succ + np.sum(w_pp)
+        if denom <= 0:
+            return A, invCholesky
+        w_p = w_pp / denom
+
+        # mu_eff and degeneracy-guard rescale (eq. 19, 23).
+        sum_w_p_sq = np.sum(w_p ** 2)
+        if sum_w_p_sq <= 0:
+            return A, invCholesky
+        mu_eff = (np.sum(w_p) ** 2) / sum_w_p_sq
+        rescale = min(1.0, (2.0 * mu_eff - 1.0) / ((n + 2) ** 2 + mu_eff))
+        w = w_p * rescale
+
+        sum_w = np.sum(w)
+        Z = np.einsum("k,ki,kj->ij", w, steps, steps)
+
+        C_old = A @ A.T
+        C_new = (1.0 - sum_w) * C_old + Z
+        C_new = (C_new + C_new.T) / 2.0   # symmetrise for numerical safety
+
+        try:
+            A_new = np.linalg.cholesky(C_new)
+        except np.linalg.LinAlgError:
+            # Blend produced a non-PSD matrix (rare; usually means sum_w ~ 1
+            # with degenerate Z).  Skip the rank-mu step this generation.
+            return A, invCholesky
+        invCholesky_new = np.linalg.solve(A_new, np.eye(n))
+        return A_new, invCholesky_new
 
     def _rankOneUpdate(self, invCholesky, A, alpha, beta, v):
         """Rank-one update of the Cholesky factor and its inverse."""
