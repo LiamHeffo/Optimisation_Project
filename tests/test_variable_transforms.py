@@ -180,7 +180,6 @@ def test_midpoint_of_uncoupled_variables_maps_to_1_5():
 
 def test_roundtrip_slightly_below_lower_physical_bound():
     """A physical point slightly below the lower bounds round-trips exactly.
-
     The uncoupled variables (percent_He, D_throat, buffer_length) are set just
     below their lower bounds.  driver_p, p4, and reservoir_p are kept at valid
     in-bounds values so that the coupling logic is not involved.

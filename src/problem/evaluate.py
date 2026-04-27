@@ -72,11 +72,15 @@ def constraint_function(x1, bounds):
     ind_number = x1.ind_number
     test_name = f"DEAP_tests_{ind_number}"
 
+    # Rather than os.getcwd(), I should use: 
+    # script_dir = os.path.dirname(os.path.abspath(__file__))
+
     starting_working_directory = os.getcwd()
     if starting_working_directory[-1] in [f'{i}' for i in range(0, 12)]:
         starting_working_directory = starting_working_directory[:35]
 
-    os.chdir(starting_working_directory + '/PITOT3_Outputs/' + test_name)
+    project_root = os.path.abspath(os.path.join(starting_working_directory, ".."))
+    os.chdir(project_root + '/results/PITOT3_Outputs/' + test_name)
 
     x = variable_untransformation(x1, bounds)
 
