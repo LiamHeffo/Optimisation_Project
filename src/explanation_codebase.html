@@ -1,0 +1,1873 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Optimisation Project — Codebase Deep Dive</title>
+<style>
+  /* ─── Reset & Base ─────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:        #0d1117;
+    --surface:   #161b22;
+    --surface2:  #21262d;
+    --border:    #30363d;
+    --text:      #c9d1d9;
+    --muted:     #8b949e;
+    --accent:    #58a6ff;
+    --green:     #3fb950;
+    --orange:    #d29922;
+    --red:       #f85149;
+    --purple:    #bc8cff;
+    --teal:      #39d353;
+    --yellow:    #e3b341;
+    --pink:      #ff7b72;
+    --heading:   #f0f6fc;
+  }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    font-size: 16px;
+    line-height: 1.7;
+  }
+
+  /* ─── Navigation ───────────────────────────────── */
+  nav {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+    background: rgba(13,17,23,0.95);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; flex-wrap: wrap;
+    padding: 0 1.5rem; gap: 0;
+    backdrop-filter: blur(8px);
+  }
+  .nav-brand {
+    font-weight: 700; font-size: 1rem; color: var(--accent);
+    padding: 0.9rem 1rem 0.9rem 0; margin-right: 1rem;
+    white-space: nowrap;
+  }
+  nav a {
+    color: var(--muted); text-decoration: none;
+    padding: 0.9rem 0.6rem; font-size: 0.8rem;
+    transition: color 0.2s; white-space: nowrap;
+  }
+  nav a:hover { color: var(--accent); }
+
+  /* ─── Layout ───────────────────────────────────── */
+  .page { max-width: 1000px; margin: 0 auto; padding: 6rem 2rem 4rem; }
+  section { margin-bottom: 4rem; padding-top: 1rem; }
+  h1 { font-size: 2.6rem; color: var(--heading); line-height: 1.2; margin-bottom: 0.5rem; }
+  h2 { font-size: 1.8rem; color: var(--heading); margin-bottom: 1rem;
+       border-bottom: 2px solid var(--accent); padding-bottom: 0.4rem; }
+  h3 { font-size: 1.25rem; color: var(--accent); margin: 1.5rem 0 0.6rem; }
+  h4 { font-size: 1.05rem; color: var(--yellow); margin: 1.2rem 0 0.4rem; }
+  p  { margin-bottom: 0.9rem; }
+  ul, ol { padding-left: 1.5rem; margin-bottom: 0.9rem; }
+  li { margin-bottom: 0.3rem; }
+  strong { color: var(--heading); }
+  em { color: var(--muted); font-style: italic; }
+
+  /* ─── Code ─────────────────────────────────────── */
+  code {
+    background: var(--surface2); color: var(--pink);
+    padding: 0.1em 0.4em; border-radius: 4px;
+    font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    font-size: 0.87em;
+  }
+  pre {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.2rem 1.4rem;
+    overflow-x: auto;
+    margin: 1rem 0;
+    font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    font-size: 0.85rem;
+    line-height: 1.6;
+  }
+  pre code { background: none; padding: 0; color: var(--text); font-size: 1em; }
+  .kw  { color: var(--purple); }
+  .fn  { color: #79c0ff; }
+  .cl  { color: var(--yellow); }
+  .str { color: #a5d6ff; }
+  .num { color: var(--green); }
+  .cm  { color: var(--muted); }
+  .dec { color: var(--orange); }
+
+  /* ─── Cards ─────────────────────────────────────── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.4rem 1.6rem;
+    margin: 1rem 0;
+  }
+  .card-accent { border-left: 4px solid var(--accent); }
+  .card-green  { border-left: 4px solid var(--green); }
+  .card-orange { border-left: 4px solid var(--orange); }
+  .card-red    { border-left: 4px solid var(--red); }
+  .card-purple { border-left: 4px solid var(--purple); }
+
+  /* ─── Tag badges ──────────────────────────────── */
+  .badge {
+    display: inline-block;
+    padding: 0.15em 0.6em;
+    border-radius: 999px;
+    font-size: 0.75rem; font-weight: 600;
+    letter-spacing: 0.03em;
+    margin-right: 0.35rem;
+  }
+  .badge-blue   { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .badge-green  { background: rgba(63,185,80,0.15);  color: var(--green); }
+  .badge-orange { background: rgba(210,153,34,0.15); color: var(--orange); }
+  .badge-red    { background: rgba(248,81,73,0.15);  color: var(--red); }
+  .badge-purple { background: rgba(188,140,255,0.15);color: var(--purple); }
+
+  /* ─── ASCII Diagrams ──────────────────────────── */
+  .diagram {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.2rem 1.4rem;
+    font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    font-size: 0.82rem;
+    line-height: 1.5;
+    overflow-x: auto;
+    color: var(--teal);
+    margin: 1rem 0;
+    white-space: pre;
+  }
+
+  /* ─── Grid ───────────────────────────────────── */
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; }
+  @media (max-width: 700px) {
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  }
+
+  /* ─── Table ──────────────────────────────────── */
+  table {
+    width: 100%; border-collapse: collapse; margin: 1rem 0;
+    font-size: 0.9rem;
+  }
+  th {
+    background: var(--surface2); color: var(--heading);
+    padding: 0.6rem 1rem; text-align: left;
+    border-bottom: 2px solid var(--accent);
+  }
+  td { padding: 0.55rem 1rem; border-bottom: 1px solid var(--border); }
+  tr:hover td { background: rgba(88,166,255,0.04); }
+
+  /* ─── Callout boxes ───────────────────────────── */
+  .callout {
+    display: flex; gap: 0.8rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 1.2rem;
+    margin: 1rem 0;
+  }
+  .callout-icon { font-size: 1.3rem; flex-shrink: 0; }
+  .callout-body { flex: 1; }
+  .callout-title { font-weight: 700; color: var(--heading); margin-bottom: 0.3rem; }
+
+  /* ─── Expandable sections ────────────────────── */
+  details { margin: 0.5rem 0; }
+  summary {
+    cursor: pointer;
+    color: var(--accent);
+    font-weight: 600;
+    padding: 0.6rem 0;
+    list-style: none;
+    user-select: none;
+  }
+  summary::before { content: "▶ "; font-size: 0.8em; }
+  details[open] summary::before { content: "▼ "; }
+  .details-body { padding: 0.5rem 0 0.5rem 1rem; }
+
+  /* ─── Hero ───────────────────────────────────── */
+  .hero {
+    padding: 5rem 0 3rem;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 3rem;
+  }
+  .hero-subtitle { color: var(--muted); font-size: 1.1rem; margin-top: 0.5rem; }
+  .hero-meta { margin-top: 1.5rem; display: flex; flex-wrap: wrap; gap: 0.5rem; }
+
+  /* ─── TOC ─────────────────────────────────────── */
+  .toc {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.4rem 1.6rem;
+    margin: 2rem 0;
+  }
+  .toc h3 { margin-top: 0; }
+  .toc ol { margin: 0; }
+  .toc li { margin: 0.3rem 0; }
+  .toc a { color: var(--muted); text-decoration: none; }
+  .toc a:hover { color: var(--accent); }
+
+  /* ─── Separator ──────────────────────────────── */
+  hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+
+  /* ─── Inline highlight ───────────────────────── */
+  .hl { color: var(--yellow); font-weight: 600; }
+  .hl-blue { color: var(--accent); }
+  .hl-green { color: var(--green); }
+  .hl-red { color: var(--red); }
+</style>
+</head>
+<body>
+
+<nav>
+  <span class="nav-brand">MO-CMA-ES Codebase</span>
+  <a href="#overview">Overview</a>
+  <a href="#physics">The Problem</a>
+  <a href="#architecture">Architecture</a>
+  <a href="#pipeline">Pipeline</a>
+  <a href="#problem-module">problem/</a>
+  <a href="#algorithm-module">algorithm/</a>
+  <a href="#main">main.py</a>
+  <a href="#interactions">Interactions</a>
+  <a href="#function-ref">Function Ref</a>
+</nav>
+
+<div class="page">
+
+<!-- ═══════════════════════════════════════════════════════════ HERO -->
+<div class="hero" id="top">
+  <h1>Multi-Objective CMA-ES<br>Codebase Deep Dive</h1>
+  <p class="hero-subtitle">
+    A complete, function-level walkthrough of a real evolutionary optimisation system —<br>
+    designed to tune a hypersonic shock-tube facility.
+  </p>
+  <div class="hero-meta">
+    <span class="badge badge-blue">6 Design Variables</span>
+    <span class="badge badge-green">3 Objectives</span>
+    <span class="badge badge-orange">CMA-ES Algorithm</span>
+    <span class="badge badge-purple">PITOT3 + SPARK Simulators</span>
+    <span class="badge badge-red">Pareto Optimisation</span>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ TOC -->
+<div class="toc">
+  <h3>Table of Contents</h3>
+  <ol>
+    <li><a href="#overview">What Is This Project? (Big Picture)</a></li>
+    <li><a href="#physics">The Physical Problem — Shock Tube Optimisation</a></li>
+    <li><a href="#math">The Mathematical Problem — Variables, Objectives, Constraints</a></li>
+    <li><a href="#architecture">Directory Architecture & Data Flow</a></li>
+    <li><a href="#pipeline">The Full Algorithmic Pipeline</a></li>
+    <li><a href="#problem-module">The <code>problem/</code> Module — In Detail</a>
+      <ol>
+        <li><a href="#config">config.py — Problem Definition</a></li>
+        <li><a href="#transforms">transforms.py — Space Transformations</a></li>
+        <li><a href="#evaluate">evaluate.py — Fitness Evaluation</a></li>
+      </ol>
+    </li>
+    <li><a href="#algorithm-module">The <code>algorithm/</code> Module — In Detail</a>
+      <ol>
+        <li><a href="#toolbox">toolbox.py — Operator Registry</a></li>
+        <li><a href="#cmaes">cmaes.py — The Core Algorithm</a></li>
+        <li><a href="#hypervolume">hypervolume.py — HV Indicator</a></li>
+        <li><a href="#penalty">penalty.py — Obsolete Constraint Handler</a></li>
+      </ol>
+    </li>
+    <li><a href="#main">main.py — The Entry Point</a></li>
+    <li><a href="#interactions">Cross-Module Interactions & Call Graph</a></li>
+    <li><a href="#function-ref">Complete Function Reference</a></li>
+  </ol>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ SECTION 1 -->
+<section id="overview">
+<h2>1. What Is This Project?</h2>
+
+<p>
+  This codebase implements a <strong>multi-objective evolutionary algorithm</strong> to automatically discover the
+  best operating conditions for a hypersonic research facility. Let's unpack every word in that sentence.
+</p>
+
+<div class="grid-2">
+  <div class="card card-accent">
+    <h4>Evolutionary Algorithm</h4>
+    <p>
+      Inspired by natural selection: maintain a <em>population</em> of candidate solutions,
+      generate <em>offspring</em> via mutation, evaluate how good they are (<em>fitness</em>),
+      and keep the best. Repeat until converged.
+    </p>
+  </div>
+  <div class="card card-green">
+    <h4>Multi-Objective</h4>
+    <p>
+      We're not minimising a single number — we're simultaneously minimising <strong>3 competing
+      objectives</strong>. You can't make all three perfectly small at once. The result is a
+      <em>Pareto front</em>: a set of trade-off solutions.
+    </p>
+  </div>
+  <div class="card card-orange">
+    <h4>CMA-ES</h4>
+    <p>
+      <em>Covariance Matrix Adaptation — Evolution Strategy</em>. A sophisticated mutation
+      operator that <em>learns the geometry</em> of the search landscape and adapts the
+      shape of its mutation distribution accordingly.
+    </p>
+  </div>
+  <div class="card card-purple">
+    <h4>Shock Tube Facility</h4>
+    <p>
+      A physical device (the X2 facility) used to briefly simulate hypersonic
+      re-entry conditions. The "design variables" are knobs you can turn on the facility
+      before an experiment.
+    </p>
+  </div>
+</div>
+
+<div class="callout">
+  <span class="callout-icon">💡</span>
+  <div class="callout-body">
+    <div class="callout-title">The Core Idea in One Sentence</div>
+    The algorithm searches through possible shock-tube settings, running physics simulations
+    to score each setting on three criteria, and gradually converges on the best trade-offs
+    — without a human having to manually tweak parameters.
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════ SECTION 2 -->
+<section id="physics">
+<h2>2. The Physical Problem</h2>
+
+<p>
+  The X2 facility is a <strong>free-piston driven shock tube</strong>. Here's what that means physically:
+</p>
+
+<div class="diagram">
+  X2 Shock Tube — Simplified Cross-Section
+  ══════════════════════════════════════════════════════════════════════════
+
+  ┌──────────────┐  ┌──────────────────────┐  ┌──────────┐  ┌──────────┐
+  │   Reservoir  │  │   Driver Section     │  │  Shock   │  │  Test    │
+  │  (high-p He) │  │  (He/Ar gas, piston) │  │  Tube    │  │  Model   │
+  │              │→ │  ─────►  piston  ──► │→ │          │→ │          │
+  └──────────────┘  └──────────────────────┘  └──────────┘  └──────────┘
+        │                    │                      │
+  reservoir_p          driver_p, %He            shock wave
+  (pushes piston)    (gas behind piston)       travels here
+                             │
+                          p4 = test gas
+                          initial pressure
+
+  Events timeline:
+  t=0:  Piston released from rest
+  t→    Piston accelerates → compresses driver gas
+  t→    Diaphragm (throat) ruptures when p4 is exceeded
+  t→    Shock wave propagates into test section at speed vs
+  t→    Test gas briefly reaches target conditions
+  t_hold: Duration of useful test time (want this LONG)
+  t_impact: Piston hits the end — want impact speed LOW (no damage)</div>
+
+<h3>What Are We Trying to Achieve?</h3>
+<p>
+  For a hypersonic aerodynamics experiment, you want to produce a <strong>specific shock speed</strong>
+  (here, targeting 4900 m/s — a specific Mach number for re-entry simulation).
+  But you also want:
+</p>
+
+<div class="grid-3">
+  <div class="card card-orange">
+    <h4>Objective 1: Shock Speed Residual</h4>
+    <p>Minimise <code>|v_shock − 4900 m/s|</code>. You need the shock to arrive at the right speed or the
+    experiment conditions are wrong.</p>
+  </div>
+  <div class="card card-green">
+    <h4>Objective 2: Hold Time</h4>
+    <p>Maximise the duration of useful test conditions (in the code: <em>minimise negative hold time</em>
+    or equivalently we normalise so smaller = worse → bigger hold time is better = smaller normalised value).</p>
+  </div>
+  <div class="card card-red">
+    <h4>Objective 3: Piston Impact Speed</h4>
+    <p>Minimise the speed at which the piston hits the end of the driver section.
+    High impact speeds cause mechanical damage.</p>
+  </div>
+</div>
+
+<p>
+  These three objectives <em>conflict</em> with each other. For example, raising driver pressure
+  might improve shock speed but increase impact speed. This trade-off is exactly what
+  multi-objective optimisation is designed to handle.
+</p>
+
+<h3>The 6 Design Variables</h3>
+<table>
+  <tr><th>#</th><th>Variable</th><th>Physical Range</th><th>Description</th></tr>
+  <tr><td>0</td><td><code>percent_He</code></td><td>70–100 %</td><td>Helium fraction in driver gas (rest is Argon)</td></tr>
+  <tr><td>1</td><td><code>driver_p</code></td><td>1,000 – 2,740,000 Pa</td><td>Initial pressure of driver gas</td></tr>
+  <tr><td>2</td><td><code>p4</code></td><td><em>Coupled to driver_p</em></td><td>Test gas initial pressure (pressure ratio to driver)</td></tr>
+  <tr><td>3</td><td><code>D_throat</code></td><td>0.05 – 0.085 m</td><td>Throat (nozzle) diameter</td></tr>
+  <tr><td>4</td><td><code>reservoir_p</code></td><td><em>≥ driver_p</em>, up to 8 MPa</td><td>Reservoir pressure driving the piston</td></tr>
+  <tr><td>5</td><td><code>buffer_length</code></td><td>0.05 – 0.15 m</td><td>Length of gas buffer at piston end</td></tr>
+</table>
+
+<div class="callout">
+  <span class="callout-icon">⚠️</span>
+  <div class="callout-body">
+    <div class="callout-title">Coupled Constraints (Critical!)</div>
+    Variables 2 and 4 are <strong>not independent box-constrained</strong> — they are
+    <em>coupled to variable 1 (driver_p)</em>. This is the most architecturally important
+    feature of this problem and drives several design decisions in the code.
+    <ul>
+      <li><strong>p4</strong> must lie in <code>[14.62 × driver_p,  1190.63 × driver_p]</code></li>
+      <li><strong>reservoir_p</strong> must be <code>≥ driver_p</code></li>
+    </ul>
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════ SECTION 3 -->
+<section id="math">
+<h2>3. The Mathematical Problem</h2>
+
+<p>
+  Formally, we're solving a <strong>constrained multi-objective optimisation problem (MOP)</strong>:
+</p>
+
+<pre><code><span class="cm">-- Minimise simultaneously:</span>
+  f₁(x) = |v_shock(x) − 4900|        <span class="cm">-- shock speed residual [m/s]</span>
+  f₂(x) = −t_hold(x)                 <span class="cm">-- negative hold time [s] (min neg = max pos)</span>
+  f₃(x) = v_impact(x)                <span class="cm">-- piston impact speed [m/s]</span>
+
+<span class="cm">-- Subject to:</span>
+  x ∈ [1, 2]⁶                        <span class="cm">-- normalised box bounds</span>
+  p4 ∈ [14.62·driver_p, 1190.63·driver_p]  <span class="cm">-- coupled pressure constraint</span>
+  reservoir_p ≥ driver_p             <span class="cm">-- physical ordering constraint</span>
+
+<span class="cm">-- Where:</span>
+  x ∈ ℝ⁶  (6 design variables, in normalised space [1,2]⁶)
+  f evaluated by calling PITOT3 and SPARK physics simulators</code></pre>
+
+<h3>What Is a Pareto Front?</h3>
+<div class="diagram">
+  Objective Space (2D projection of 3D Pareto front)
+
+      f₂ (hold time, want small = want long actual hold)
+      │
+   1.0│  ×  ×                     × = dominated solutions
+      │    × ×                    ● = Pareto-optimal solutions
+   0.8│     × ×●
+      │      × ●                  A solution A *dominates* B if:
+   0.6│       ●×                    A is no worse than B in ALL objectives
+      │      ●  ×                   A is strictly better than B in ≥1 objective
+   0.4│     ●   ×
+      │    ●                      The Pareto front is the set of solutions
+   0.2│   ●                       not dominated by any other solution.
+      │
+      └──────────────────────── f₁ (shock residual, want small)
+       0.2  0.4  0.6  0.8  1.0</div>
+
+<h3>Normalisation</h3>
+<p>
+  The three objectives have wildly different scales (residuals in m/s, hold time in seconds, etc.).
+  The code linearly normalises each objective to <code>[0, 1]</code> using <strong>ideal</strong>
+  and <strong>nadir</strong> reference points:
+</p>
+
+<pre><code><span class="cm">-- In problem/config.py:</span>
+APPROX_IDEAL = (0,    0.01, 0)    <span class="cm">-- (best-case shock residual, hold time, impact speed)</span>
+APPROX_NADIR = (3500, 0,    350)  <span class="cm">-- (worst-case shock residual, hold time, impact speed)</span>
+
+<span class="cm">-- In problem/transforms.py:</span>
+normalised_f = (f - ideal) / (nadir - ideal)  <span class="cm">-- maps to [0, 1]</span></code></pre>
+
+<div class="callout">
+  <span class="callout-icon">📌</span>
+  <div class="callout-body">
+    <div class="callout-title">Why Normalise?</div>
+    Without normalisation, the hypervolume calculation (used for selection) would be
+    dominated by whichever objective happens to have the largest numerical range.
+    Normalisation ensures all three objectives contribute equally to selection pressure.
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════ SECTION 4 -->
+<section id="architecture">
+<h2>4. Directory Architecture &amp; Data Flow</h2>
+
+<div class="diagram">
+  /home/x-lab-user/Optimisation_Project/src/
+  │
+  ├── main.py                ← ENTRY POINT: orchestrates the whole loop
+  ├── utils.py               ← Helpers: bounds-checking, directory setup
+  ├── plotting.py            ← Pareto front visualisation
+  │
+  ├── problem/               ← WHAT we're optimising (the physics)
+  │   ├── config.py          ← Problem constants: bounds, reference points, base configs
+  │   ├── transforms.py      ← Convert variables between normalised ↔ physical space
+  │   └── evaluate.py        ← Actually run PITOT3 and SPARK, return fitness values
+  │
+  └── algorithm/             ← HOW we optimise (the search strategy)
+      ├── toolbox.py         ← Operator registry + evolution log
+      ├── cmaes.py           ← Multi-objective CMA-ES (generate + update)
+      ├── hypervolume.py     ← Hypervolume indicator for selection
+      └── penalty.py         ← Obsolete constraint handler (incomplete)</div>
+
+<div class="diagram">
+  Conceptual Separation of Concerns
+  ═══════════════════════════════════════════════════════════════════
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                        main.py                              │
+  │  (The "director": knows both problem and algorithm;         │
+  │   wires them together and runs the evolution loop)          │
+  └──────────────┬──────────────────────────────┬──────────────┘
+                 │                              │
+                 ▼                              ▼
+  ┌──────────────────────────┐  ┌──────────────────────────────┐
+  │     problem/ module      │  │      algorithm/ module        │
+  │                          │  │                               │
+  │  config.py               │  │  toolbox.py                   │
+  │    └─ bounds, constants  │  │    └─ register evaluate()     │
+  │                          │  │    └─ register generate()     │
+  │  transforms.py           │  │    └─ register update()       │
+  │    └─ physical ↔ normed  │  │    └─ Logbook (record stats)  │
+  │                          │  │                               │
+  │  evaluate.py             │  │  cmaes.py                     │
+  │    └─ PITOT3 → f₁       │  │    └─ generate() offspring    │
+  │    └─ SPARK  → f₂, f₃   │  │    └─ update() strategy       │
+  │    └─ normalise()        │  │    └─ constraint handling      │
+  └──────────────────────────┘  │                               │
+                                │  hypervolume.py               │
+                                │    └─ compute HV for selection│
+                                │    └─ track convergence        │
+                                └──────────────────────────────┘
+
+  Data flows:
+    Individuals (list of 6 floats) flow BOTH ways across the boundary.
+    Fitness tuples (3 floats) are produced by problem/ and consumed by algorithm/.</div>
+
+<h3>The Individual — The Fundamental Data Unit</h3>
+<p>
+  Every "candidate solution" in the population is an <strong>Individual</strong> — a Python
+  list subclass (from DEAP) with attached attributes:
+</p>
+
+<pre><code><span class="cm">-- An Individual is a list: [x0, x1, x2, x3, x4, x5]</span>
+<span class="cm">-- where each xi ∈ [1, 2] (normalised space)</span>
+
+<span class="cm">-- Attached attributes:</span>
+individual.fitness      <span class="cm">-- FitnessMulti object (3-tuple, weights=(-1,-1,-1))</span>
+individual.ind_number   <span class="cm">-- Unique ID (used for output directory naming)</span>
+individual.sim_type     <span class="cm">-- 'ParentValue' | 'ElitistCrossover' | ... (constraint strategy)</span>
+individual.bounds       <span class="cm">-- Physical-space bounds (needed during evaluation)</span>
+individual._ps          <span class="cm">-- ("o", parent_idx) — which parent generated this offspring</span></code></pre>
+
+<div class="callout">
+  <span class="callout-icon">🎓</span>
+  <div class="callout-body">
+    <div class="callout-title">Why Carry Bounds on the Individual?</div>
+    The bounds are stored <em>on each individual</em> rather than looked up from a global
+    because the evaluation function (<code>evaluate.py</code>) is designed to be callable
+    with just an individual — it needs access to bounds to do the untransformation, and
+    this makes the evaluate function self-contained and easier to parallelise.
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════ SECTION 5 -->
+<section id="pipeline">
+<h2>5. The Full Algorithmic Pipeline</h2>
+
+<div class="diagram">
+  MASTER FLOW — from experiment config to final Pareto front
+  ════════════════════════════════════════════════════════════════════════════
+
+  experiments.yaml
+      │  (sim_type, pop_size, step_size, p4_treatment)
+      ▼
+  main() called for each experiment
+      │
+      ├─[1]─ INITIALISE POPULATION ─────────────────────────────────────────
+      │       Sample 6 variables uniformly in physical space
+      │       Handle p4 coupling: p4 ∈ [14.62×driver_p, 1190.63×driver_p]
+      │       Handle reservoir_p coupling: reservoir_p ∈ [driver_p, 8e6]
+      │       Transform all individuals to normalised [1,2]⁶ space
+      │       Create PITOT3_Outputs subdirectory per individual (parallelisation)
+      │
+      ├─[2]─ EVALUATE INITIAL POPULATION ─────────────────────────────────
+      │       For each individual x:
+      │         constraint_function(x)  → δv_s = |v_shock − 4900|  [PITOT3]
+      │         objective_function(x)   → (t_hold, v_impact)        [SPARK]
+      │         normalise_fitness()     → (f̂₁, f̂₂, f̂₃) ∈ [0,1]³
+      │       Assign fitness to individual
+      │
+      ├─[3]─ CREATE STRATEGY ───────────────────────────────────────────────
+      │       StrategyMultiObjective(population, sigma, sim_type, ...)
+      │       Initialises per-parent: sigmas, A (Cholesky), invCholesky, pc, psucc
+      │
+      └─[4]─ EVOLUTION LOOP  (NGEN = 10 generations) ─────────────────────
+              │
+              ├─[4a]─ GENERATE OFFSPRING ───────────────────────────────────
+              │         For each of lambda_ parents:
+              │           z ~ N(0, I₆)                    [random perturbation]
+              │           mutation = sigma_i × A_i @ z    [shaped mutation]
+              │           offspring = parent + mutation    [apply]
+              │           While infeasible:
+              │             Identify violated constraint
+              │             Apply crossover repair (ParentValue / Elitist / Random)
+              │             Re-check feasibility
+              │           Tag offspring with parent index
+              │
+              ├─[4b]─ EVALUATE OFFSPRING ───────────────────────────────────
+              │         Same as step [2] above
+              │
+              ├─[4c]─ UPDATE STRATEGY ──────────────────────────────────────
+              │         Combine: offspring + current parents
+              │         Pareto-rank all combined candidates
+              │         Greedily fill fronts until mu slots used
+              │         Use HV contribution to break ties on boundary front
+              │         → New parent set (mu individuals)
+              │         Adapt sigma per parent (step-size control)
+              │         Update A, pc (covariance / Cholesky update)
+              │
+              ├─[4d]─ RECORD & VISUALISE ───────────────────────────────────
+              │         Compute hypervolume of current Pareto front
+              │         Append to logbook
+              │         Every 50 gens (in [200,750]): save intermediate plots
+              │
+              └── REPEAT until gen = NGEN ──────────────────────────────────
+
+  POST-PROCESSING
+      Save convergence_data.txt (HV per generation)
+      Plot: hypervolume trend | Pareto scatter (3 × 2D) | fixer count
+      Save output.txt: initial + final population in physical units</div>
+
+<h3>Key Numbers (Default Configuration)</h3>
+<table>
+  <tr><th>Parameter</th><th>Value</th><th>Meaning</th></tr>
+  <tr><td>NGEN</td><td>10</td><td>Number of generations</td></tr>
+  <tr><td>MU (pop_size)</td><td>12 or 36</td><td>Number of parents kept per generation</td></tr>
+  <tr><td>LAMBDA</td><td>= MU</td><td>Number of offspring generated per generation</td></tr>
+  <tr><td>sigma</td><td>0.005</td><td>Initial step size (in normalised [1,2] space)</td></tr>
+  <tr><td>N</td><td>6</td><td>Dimensionality of design space</td></tr>
+  <tr><td>Evaluations/gen</td><td>MU + LAMBDA = 2×MU</td><td>Physics sim calls per generation</td></tr>
+</table>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════ SECTION 6 -->
+<section id="problem-module">
+<h2>6. The <code>problem/</code> Module — In Detail</h2>
+
+<p>
+  The <code>problem/</code> module encapsulates <em>everything domain-specific</em>: what the variables
+  mean physically, how to transform between spaces, and how to score a given design via simulation.
+  The <code>algorithm/</code> module doesn't need to know anything about shock tubes — it just
+  calls functions registered in the <code>Toolbox</code>.
+</p>
+
+<!-- ──────────────────────────────── config.py -->
+<div id="config"></div>
+<h3>6.1 &nbsp; <code>config.py</code> — Problem Definition &amp; Constants</h3>
+
+<div class="card card-accent">
+  <strong>Role:</strong> Single source of truth for all problem-specific constants.
+  Every other file that needs bounds, reference points, or base configurations imports from here.
+</div>
+
+<h4>Constants Defined</h4>
+<pre><code><span class="kw">N</span> = 6                   <span class="cm"># Number of design variables</span>
+
+<span class="cm"># Normalised bounds — the algorithm always works in [1, 2]^6</span>
+MIN_BOUND = [1, 1, 1, 1, 1, 1]
+MAX_BOUND = [2, 2, 2, 2, 2, 2]
+
+<span class="cm"># Ideal and Nadir for normalisation (estimated from domain knowledge)</span>
+APPROX_IDEAL = (0,    0.01, 0)    <span class="cm"># (δvs=0, hold_time=0.01s, impact=0 m/s)</span>
+APPROX_NADIR = (3500, 0,    350)  <span class="cm"># (δvs=3500, hold_time=0, impact=350 m/s)</span>
+
+<span class="cm"># Physical bounds: list of (min, max) pairs, one per variable</span>
+BOUNDS = [
+    (70,  100),         <span class="cm"># percent_He [%]</span>
+    (1000, 2.74e6),     <span class="cm"># driver_p [Pa]</span>
+    (<span class="hl">14.62*driver_p</span>, <span class="hl">1190.63*driver_p</span>),  <span class="cm"># p4 — COUPLED!</span>
+    (0.05, 0.085),      <span class="cm"># D_throat [m]</span>
+    (<span class="hl">driver_p</span>, 8e6),   <span class="cm"># reservoir_p — COUPLED!</span>
+    (0.05, 0.15),       <span class="cm"># buffer_length [m]</span>
+]</code></pre>
+
+<div class="callout">
+  <span class="callout-icon">📌</span>
+  <div class="callout-body">
+    <div class="callout-title">Why are bounds stored as a list rather than numpy arrays?</div>
+    Because <code>BOUNDS[2]</code> and <code>BOUNDS[4]</code> are not fixed numbers — they
+    depend on <code>driver_p</code>, which is a variable. This coupling means bounds must be
+    recomputed per individual. Hence, <code>config.py</code> stores the <em>structure</em>
+    of the bounds (what variables are coupled to what), and the actual numeric bounds are
+    computed at evaluation time.
+  </div>
+</div>
+
+<h4>Functions in config.py</h4>
+
+<details>
+  <summary><code>base_config_dict()</code> → dict</summary>
+  <div class="details-body">
+    <p>Returns the base PITOT3 configuration dictionary. PITOT3 is a Python library for
+    computing shock tube thermodynamics; it expects a dict with fields like
+    <code>mode</code>, <code>facility</code>, etc. This function returns the fields
+    that are <em>constant</em> across all experiments — the algorithm then adds variable-specific
+    values on top.</p>
+    <p><strong>Why it exists:</strong> Centralises the PITOT3 config so if you change the
+    facility or mode, you change it in one place.</p>
+  </div>
+</details>
+
+<details>
+  <summary><code>base_driver_dict(x)</code> → dict</summary>
+  <div class="details-body">
+    <p>Takes a physical-space individual <code>x</code> and builds the "driver condition" dict
+    that PITOT3 expects. Maps <code>x[0]</code> (percent_He) to PITOT3's gas mixture format,
+    maps <code>x[1]</code> to <code>driver_p</code>, etc.</p>
+    <p><strong>Why it exists:</strong> Separates the mapping from physical variables to
+    PITOT3's API format, keeping <code>evaluate.py</code> cleaner.</p>
+  </div>
+</details>
+
+<hr>
+
+<!-- ──────────────────────────────── transforms.py -->
+<div id="transforms"></div>
+<h3>6.2 &nbsp; <code>transforms.py</code> — Space Transformations</h3>
+
+<div class="card card-accent">
+  <strong>Role:</strong> The algorithm operates in normalised <code>[1,2]⁶</code> space.
+  Physics simulators need physical units. This module is the <em>translator</em> between the two worlds.
+</div>
+
+<div class="diagram">
+  Two Coordinate Systems
+  ═══════════════════════════════════════════════════════════════════
+
+  Physical Space                         Normalised Space [1, 2]⁶
+  ─────────────────────────────────      ──────────────────────────────
+  percent_He  ∈ [70, 100] %            x₀ ∈ [1, 2]   (linear scaling)
+  driver_p    ∈ [1e3, 2.74e6] Pa       x₁ ∈ [1, 2]   (linear scaling)
+  p4          ∈ [14.62×p1, 1190×p1]   x₂ ∈ [1, 2]   (COUPLED scaling!)
+  D_throat    ∈ [0.05, 0.085] m        x₃ ∈ [1, 2]   (linear scaling)
+  reservoir_p ∈ [p1, 8e6] Pa          x₄ ∈ [1, 2]   (COUPLED scaling!)
+  buffer_len  ∈ [0.05, 0.15] m        x₅ ∈ [1, 2]   (linear scaling)
+
+                        ──────────────────────────────
+                        ↑                            ↑
+             variable_transformation()    variable_untransformation()
+             (physical → normalised)      (normalised → physical)
+                        ──────────────────────────────</div>
+
+<h4>Why Use a Normalised Space?</h4>
+<p>
+  CMA-ES works best when all variables have roughly equal scale and the search space is
+  compact and symmetric. <code>[1,2]⁶</code> achieves this: every variable has range 1,
+  mutation steps of 0.005 mean the same thing for all variables, and the Cholesky matrix
+  adaptation starts from a sensible baseline.
+</p>
+
+<h4>Functions in transforms.py</h4>
+
+<details>
+  <summary><code>variable_transformation(pop, bounds)</code> — physical → normalised (whole population)</summary>
+  <div class="details-body">
+    <p><strong>Input:</strong> <code>pop</code> — list of individuals in physical space;
+    <code>bounds</code> — list of (min, max) tuples per variable.</p>
+    <p><strong>Output:</strong> Population with values replaced by normalised values in [1, 2].</p>
+    <p><strong>Formula for uncoupled variables (0, 3, 5):</strong></p>
+    <pre><code>x_norm = (x_phys - bound_min) / (bound_max - bound_min) + 1</code></pre>
+    <p><strong>Formula for p4 (variable 2) — coupled:</strong></p>
+    <pre><code><span class="cm"># p4_min = 14.62 × driver_p;  p4_max = 1190.63 × driver_p</span>
+x_norm[2] = (p4 - 14.62×driver_p) / (1190.63×driver_p - 14.62×driver_p) + 1</code></pre>
+    <p><strong>Formula for reservoir_p (variable 4) — coupled:</strong></p>
+    <pre><code><span class="cm"># reservoir_min = driver_p;  reservoir_max = 8e6 (fixed)</span>
+x_norm[4] = (reservoir_p - driver_p) / (8e6 - driver_p) + 1</code></pre>
+    <p><strong>Called from:</strong> <code>main.py</code> during initial population creation.</p>
+    <p><strong>Why population-level?</strong> Initial population is created in bulk; this function
+    vectorises the operation over the whole list at once.</p>
+  </div>
+</details>
+
+<details>
+  <summary><code>variable_untransformation(x, bounds)</code> — normalised → physical (single individual)</summary>
+  <div class="details-body">
+    <p><strong>Input:</strong> A single normalised individual <code>x</code> (6 values in [1,2]);
+    <code>bounds</code> — the physical bounds structure.</p>
+    <p><strong>Output:</strong> A list of 6 physical-space values.</p>
+    <p>This is the inverse of <code>variable_transformation</code>. Importantly, it
+    processes variables in order: it must compute <code>driver_p</code> (variable 1) <em>first</em>,
+    because the bounds for p4 and reservoir_p depend on driver_p.</p>
+    <p><strong>Called from:</strong> <code>evaluate.py</code> — just before passing values to PITOT3 or SPARK.</p>
+  </div>
+</details>
+
+<details>
+  <summary><code>normalise_fitness(fitness, ideal_point, nadir_point)</code></summary>
+  <div class="details-body">
+    <p><strong>Input:</strong> Raw fitness tuple (δvs, t_hold, v_impact); ideal and nadir reference tuples.</p>
+    <p><strong>Output:</strong> Normalised tuple with values in approximately [0, 1].</p>
+    <pre><code>f_norm_i = (f_i - ideal_i) / (nadir_i - ideal_i)</code></pre>
+    <p>Note: values can exceed [0,1] if the simulator returns worse than nadir — this is expected
+    and indicates a very poor solution.</p>
+    <p><strong>Called from:</strong> <code>evaluate.py::evaluate()</code>.</p>
+  </div>
+</details>
+
+<details>
+  <summary><code>unnormalise_fitness(fitness, ideal_point, nadir_point)</code></summary>
+  <div class="details-body">
+    <p>Inverse of <code>normalise_fitness</code>. Used in post-processing (<code>main.py</code>)
+    to convert Pareto-front fitness values back to physical units for the output file.</p>
+  </div>
+</details>
+
+<hr>
+
+<!-- ──────────────────────────────── evaluate.py -->
+<div id="evaluate"></div>
+<h3>6.3 &nbsp; <code>evaluate.py</code> — Fitness Evaluation</h3>
+
+<div class="card card-accent">
+  <strong>Role:</strong> The most computationally expensive part of the codebase.
+  Given a normalised individual, run physics simulations and return a 3-tuple of normalised fitness values.
+  This is the function that "talks to the real world" (or a simulation thereof).
+</div>
+
+<div class="diagram">
+  evaluate() call chain
+  ═══════════════════════════════════════════════════════════════════════════
+
+  evaluate(x)
+      │
+      ├─► constraint_function(x, bounds)
+      │       │
+      │       ├─ Pre-check bounds (fast fail — no sim needed)
+      │       │    driver_p vs reservoir_p
+      │       │    throat diameter
+      │       │    pressure ratio
+      │       │    p4 vs computed bounds
+      │       │
+      │       ├─ variable_untransformation(x, bounds) → physical vars
+      │       ├─ base_config_dict() + base_driver_dict(x_phys)
+      │       ├─ PITOT3.Driver(driver_dict)
+      │       ├─ PITOT3.Tube(config_dict, driver)
+      │       └─ tube.calculate_shock_speed_and_related_states()
+      │              → v_shock
+      │              → δvs = |v_shock − 4900|
+      │              returns: δvs  (or 3500 on failure)
+      │
+      ├─► objective_function(x, bounds)
+      │       │
+      │       ├─ Pre-check bounds (same fast fail)
+      │       ├─ variable_untransformation(x, bounds) → physical vars
+      │       ├─ Set up SPARK fill conditions, facility geometry
+      │       ├─ SPARK simulation (mixed He/Ar + ideal air)
+      │       └─ Extract t_hold, v_impact from SPARK results
+      │              returns: (t_hold, v_impact)  (or (0, 350) on failure)
+      │
+      └─► normalise_fitness((δvs, t_hold, v_impact), IDEAL, NADIR)
+              → (f̂₁, f̂₂, f̂₃)   ← this is what gets stored as individual.fitness</div>
+
+<h4>Global State in evaluate.py</h4>
+<pre><code><span class="cm"># Module-level variable, injected from main.py:</span>
+_logbook = None   <span class="cm"># Reference to the Toolbox's Logbook instance</span>
+
+<span class="cm"># Used so evaluate() can increment counters (e.g., number of repairs, failures)</span>
+<span class="cm"># without needing to return them — they're side-channel statistics.</span></code></pre>
+
+<h4>Functions in evaluate.py</h4>
+
+<details>
+  <summary><code>constraint_function(x1, bounds)</code> → float</summary>
+  <div class="details-body">
+    <p><strong>Input:</strong> <code>x1</code> — normalised individual; <code>bounds</code> — physical bounds.</p>
+    <p><strong>Output:</strong> Shock speed residual <code>|v_shock − 4900|</code> in m/s.
+    Returns <code>3500</code> (the nadir value) on any failure.</p>
+
+    <p><strong>Step-by-step:</strong></p>
+    <ol>
+      <li><strong>Pre-checks</strong> — Before calling any simulator, fast-fail if obvious
+      constraint violations exist (e.g., reservoir_p < driver_p in physical space). These checks
+      avoid expensive simulator calls for clearly infeasible points.</li>
+      <li><strong>Untransform</strong> — Convert <code>x1</code> to physical space via
+      <code>variable_untransformation()</code>.</li>
+      <li><strong>Build PITOT3 config</strong> — Call <code>base_config_dict()</code> and
+      <code>base_driver_dict(x_phys)</code> to get the two dicts PITOT3 needs.</li>
+      <li><strong>Run PITOT3</strong> — Instantiate <code>Driver</code> and <code>Tube</code>
+      objects, then call <code>tube.calculate_shock_speed_and_related_states()</code>.
+      PITOT3 computes 1D gas-dynamics to find the shock speed.</li>
+      <li><strong>Return residual</strong> — <code>abs(v_shock - 4900)</code>.</li>
+    </ol>
+
+    <p><strong>Why is shock speed residual the "constraint"?</strong> Strictly speaking it's
+    also an objective — we want it to be zero. But from a constraint-handling perspective,
+    it's the variable that must be small for the experiment to be valid. In the code's framing,
+    it's objective f₁ and appears as <code>fitness[0]</code>.</p>
+  </div>
+</details>
+
+<details>
+  <summary><code>objective_function(x, bounds)</code> → (float, float)</summary>
+  <div class="details-body">
+    <p><strong>Input:</strong> <code>x</code> — normalised individual; <code>bounds</code>.</p>
+    <p><strong>Output:</strong> <code>(t_hold, v_impact)</code> — hold time in seconds and
+    impact speed in m/s. Returns <code>(0, 350)</code> on failure (worst-case values).</p>
+
+    <p><strong>Step-by-step:</strong></p>
+    <ol>
+      <li><strong>Pre-checks</strong> — Same constraint checks as <code>constraint_function</code>.</li>
+      <li><strong>Untransform</strong> — Convert to physical space.</li>
+      <li><strong>SPARK setup</strong> — Configure fill conditions (gas type, pressures),
+      facility geometry (tube length, piston mass, throat area), and rupture model
+      (diaphragm burst pressure).</li>
+      <li><strong>SPARK simulation</strong> — Creates a SPARK object with gas models
+      (<code>mixed_he_ar</code> for driver, <code>ideal_air</code> for test gas) and
+      runs piston dynamics simulation.</li>
+      <li><strong>Extract results</strong> — Pull <code>t_hold</code> (duration of useful
+      test window) and <code>v_impact</code> (final piston velocity) from SPARK's output dict.</li>
+    </ol>
+  </div>
+</details>
+
+<details>
+  <summary><code>evaluate(x)</code> → tuple (3 floats)</summary>
+  <div class="details-body">
+    <p><strong>Input:</strong> A normalised individual with <code>.sim_type</code> and
+    <code>.bounds</code> attributes set.</p>
+    <p><strong>Output:</strong> <code>(f̂₁, f̂₂, f̂₃)</code> — 3-tuple of normalised objectives.</p>
+
+    <p><strong>Logic:</strong></p>
+    <pre><code><span class="kw">def</span> <span class="fn">evaluate</span>(x):
+    <span class="kw">if</span> x.sim_type == <span class="str">'Penalty'</span> <span class="kw">and</span> <span class="kw">not</span> <span class="fn">feasible</span>(x):
+        <span class="kw">return</span> ClosestValidPenalty.wrapper(x)  <span class="cm"># ← incomplete, not used</span>
+    <span class="kw">else</span>:
+        delta_vs = constraint_function(x, x.bounds)
+        t_hold, v_impact = objective_function(x, x.bounds)
+        <span class="kw">return</span> normalise_fitness(
+            (delta_vs, t_hold, v_impact),
+            APPROX_IDEAL, APPROX_NADIR
+        )</code></pre>
+
+    <p><strong>This is the function registered in the Toolbox</strong> as
+    <code>toolbox.evaluate</code>. When <code>main.py</code> calls
+    <code>toolbox.evaluate(individual)</code>, it calls this function.</p>
+
+    <p><strong>Why doesn't evaluate() take bounds as a separate argument?</strong>
+    Because DEAP's <code>map(toolbox.evaluate, population)</code> calls evaluate with
+    a single argument. Storing bounds on the individual is the solution to this API constraint.
+    </p>
+  </div>
+</details>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════ SECTION 7 -->
+<section id="algorithm-module">
+<h2>7. The <code>algorithm/</code> Module — In Detail</h2>
+
+<p>
+  The <code>algorithm/</code> module contains the search strategy — the "brain" that decides
+  how to explore the design space. It knows nothing about physics; it only knows about
+  individuals, fitness values, and how to generate and select them.
+</p>
+
+<!-- ──────────────────────────────── toolbox.py -->
+<div id="toolbox"></div>
+<h3>7.1 &nbsp; <code>toolbox.py</code> — Operator Registry &amp; Logbook</h3>
+
+<div class="card card-accent">
+  <strong>Role:</strong> Acts as a <em>dependency injection container</em> and <em>event log</em>.
+  The Toolbox decouples <em>what</em> operators do from <em>who</em> calls them.
+</div>
+
+<div class="callout">
+  <span class="callout-icon">🎓</span>
+  <div class="callout-body">
+    <div class="callout-title">Design Pattern: Dependency Injection via Registry</div>
+    Instead of hardcoding "call <code>evaluate.evaluate()</code>" everywhere,
+    <code>main.py</code> registers <code>evaluate.evaluate</code> under the alias
+    <code>"evaluate"</code> in the Toolbox. Then <code>strategy</code> can call
+    <code>toolbox.evaluate(x)</code> without knowing which module provides it.
+    This makes swapping implementations easy (e.g., swap PITOT3 for a surrogate model).
+  </div>
+</div>
+
+<h4>Class: <code>Toolbox</code></h4>
+<pre><code><span class="kw">class</span> <span class="cl">Toolbox</span>:
+    <span class="cm">"""
+    Registry of operators for the evolution loop.
+    Operators are registered as partially-applied functions.
+    """</span>
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(self):
+        self.<span class="fn">register</span>(<span class="str">"clone"</span>, copy.deepcopy)   <span class="cm"># always available</span>
+        self.<span class="fn">register</span>(<span class="str">"map"</span>, map)               <span class="cm"># parallel or sequential map</span>
+        self.logbook = Logbook()
+
+    <span class="kw">def</span> <span class="fn">register</span>(self, alias, function, *args, **kargs):
+        <span class="cm"># Creates self.alias = functools.partial(function, *args, **kargs)</span>
+        <span class="cm"># So toolbox.evaluate(x) calls evaluate(x) with pre-bound args</span>
+
+    <span class="kw">def</span> <span class="fn">unregister</span>(self, alias):
+        <span class="cm"># Removes the alias</span>
+
+    <span class="kw">def</span> <span class="fn">decorate</span>(self, alias, *decorators):
+        <span class="cm"># Wraps the registered function with additional decorators</span></code></pre>
+
+<h4>Class: <code>Logbook</code></h4>
+<pre><code><span class="kw">class</span> <span class="cl">Logbook</span>(list):
+    <span class="cm">"""
+    A list of per-generation stats dicts, plus a .bookshelf for named objects.
+    """</span>
+
+    <span class="kw">def</span> <span class="fn">record</span>(self, **infos):
+        <span class="cm"># Appends a new dict entry: {'gen': 5, 'hv': 0.42, ...}</span>
+
+    <span class="kw">def</span> <span class="fn">select</span>(self, *names):
+        <span class="cm"># Returns per-field lists across all records</span>
+        <span class="cm"># e.g. logbook.select('gen', 'hv') → ([0,1,2,...], [0.1, 0.2, ...])</span>
+
+    <span class="kw">def</span> <span class="fn">add</span>(self, alias, obj):
+        <span class="cm"># Store arbitrary object: logbook.bookshelf['fixer_count'] = [...]</span></code></pre>
+
+<hr>
+
+<!-- ──────────────────────────────── cmaes.py -->
+<div id="cmaes"></div>
+<h3>7.2 &nbsp; <code>cmaes.py</code> — The Core Algorithm</h3>
+
+<div class="card card-accent">
+  <strong>Role:</strong> The heart of the system. Implements the multi-objective
+  CMA-ES strategy — generates mutation-adapted offspring and updates the
+  covariance matrix based on which offspring were successful.
+</div>
+
+<h4>What is CMA-ES? (First Principles)</h4>
+
+<p>
+  A standard evolution strategy mutates individuals by adding Gaussian noise:
+  <code>offspring = parent + σ × N(0, I)</code>. The problem: <em>the optimal
+  mutation shape depends on the fitness landscape</em>. CMA-ES learns this shape.
+</p>
+
+<div class="diagram">
+  CMA-ES Mutation Geometry
+  ═══════════════════════════════════════════════════════════════════════
+
+  Standard ES:                  CMA-ES (adapted):
+  Circular mutations            Elliptical mutations
+
+      x₂ │  ○○○                    x₂ │  ○
+         │ ○●○                        │ ○ ● ○
+         │  ○○○                       │   ○○○○○
+         └────── x₁                  └────────── x₁
+
+  ●  = parent                   CMA-ES has learned that x₁ should
+  ○  = possible offspring       be explored more than x₂ in this region.
+
+  The "learning" happens via the Cholesky matrix A:
+    mutation = σ × A × z    where z ~ N(0, I)
+
+  A encodes the correlation structure.
+  A^T A ≈ C  (the covariance matrix of successful mutations).</div>
+
+<h4>Multi-Objective Extension</h4>
+<p>
+  This code implements the <strong>MO-CMA-ES</strong> (Voss et al., 2010).
+  In multi-objective settings, we can't define "success" as "better fitness"
+  — we need Pareto dominance + hypervolume contribution instead.
+</p>
+
+<div class="diagram">
+  Selection Mechanism: Pareto Rank + Hypervolume Tie-Breaking
+  ════════════════════════════════════════════════════════════════════════
+
+  Combined pool = parents + offspring  (2μ individuals)
+
+  Step 1: Pareto ranking
+    Assign rank 1 to non-dominated front
+    Assign rank 2 to non-dominated among the rest
+    ... and so on
+
+  Step 2: Greedy fill
+    Take all rank-1 individuals (if ≤ μ, take them all)
+    If rank-1 fills exactly μ: done
+    If rank-1 overfills (> μ solutions): use HV contribution to choose
+
+  Step 3: Hypervolume tie-breaking (on boundary front)
+    Temporarily add all rank-1 solutions
+    Remove one at a time — always remove the one that contributes LEAST
+    to the hypervolume of the remaining set
+    Stop when exactly μ remain
+
+  Result: μ best-spread individuals across the Pareto front.</div>
+
+<h4>Class: <code>StrategyMultiObjective</code></h4>
+
+<pre><code><span class="kw">class</span> <span class="cl">StrategyMultiObjective</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, population, sigma, mu, lambda_, sim_type,
+                 p4_treatment, bounds, logbook, <span class="cm"># ... CMA-ES hyperparams</span>
+                 d=None, ptarg=None, cp=None, cc=None, ccov=None, pthresh=None):
+        <span class="cm"># Per-parent state (length mu lists):</span>
+        self.sigmas       <span class="cm"># σᵢ: step size for parent i</span>
+        self.A            <span class="cm"># Aᵢ: Cholesky factor of covariance for parent i</span>
+        self.invCholesky  <span class="cm"># Aᵢ⁻¹: inverse Cholesky for parent i</span>
+        self.pc           <span class="cm"># pᵢ: evolution path (cumulative mutation direction)</span>
+        self.psucc        <span class="cm"># p̄ᵢ: smoothed success rate for parent i</span></code></pre>
+
+<h4>CMA-ES Hyperparameters Explained</h4>
+<table>
+  <tr><th>Parameter</th><th>Default Formula</th><th>Role</th></tr>
+  <tr><td><code>d</code></td><td><code>1 + n/2</code></td><td>Step-size damping — controls how fast σ adapts</td></tr>
+  <tr><td><code>ptarg</code></td><td><code>1/(5+√(λ/μ))</code></td><td>Target success rate — the "sweet spot" σ converges to</td></tr>
+  <tr><td><code>cp</code></td><td><code>ptarg/(2+ptarg)</code></td><td>Success rate learning rate — how fast psucc updates</td></tr>
+  <tr><td><code>cc</code></td><td><code>2/(n+2)</code></td><td>Evolution path learning rate — how fast pc updates</td></tr>
+  <tr><td><code>ccov</code></td><td><code>2/(n²+6)</code></td><td>Covariance update learning rate — how fast A updates</td></tr>
+  <tr><td><code>pthresh</code></td><td><code>0.44</code></td><td>Threshold below which pc update activates</td></tr>
+</table>
+
+<h4>Methods in <code>StrategyMultiObjective</code></h4>
+
+<details>
+  <summary><code>generate(ind_init)</code> — Generate λ offspring</summary>
+  <div class="details-body">
+    <p><strong>Input:</strong> <code>ind_init</code> — a factory function (DEAP's
+    <code>toolbox.clone</code>) for creating blank individuals from parents.</p>
+    <p><strong>Output:</strong> List of <code>lambda_</code> offspring individuals.</p>
+
+    <p><strong>Algorithm:</strong></p>
+    <pre><code><span class="kw">for</span> i <span class="kw">in</span> <span class="fn">range</span>(lambda_):
+    <span class="cm">    # 1. Pick a parent (round-robin: parent index = i % mu)</span>
+    parent = self.parents[i % self.mu]
+    parent_idx = i % self.mu
+
+    <span class="cm">    # 2. Sample random direction</span>
+    z = np.random.<span class="fn">standard_normal</span>(N)   <span class="cm"># z ~ N(0, I_n)</span>
+
+    <span class="cm">    # 3. Shape the mutation using parent's Cholesky matrix</span>
+    mutation = self.sigmas[parent_idx] * self.A[parent_idx] @ z
+
+    <span class="cm">    # 4. Create offspring</span>
+    offspring = parent + mutation
+
+    <span class="cm">    # 5. Repair if infeasible (for non-Penalty sim_types)</span>
+    <span class="kw">while not</span> <span class="fn">feasible</span>(offspring):
+        attribute_index = <span class="fn">find_violated_constraint</span>(offspring)
+        <span class="fn">crossover</span>(offspring, attribute_index, parent_idx)
+
+    <span class="cm">    # 6. Tag for update step</span>
+    offspring._ps = (<span class="str">"o"</span>, parent_idx)
+    offspring_list.<span class="fn">append</span>(offspring)</code></pre>
+
+    <p><strong>The <code>_ps</code> tag</strong> is critical: the update step needs to know
+    which offspring came from which parent, so it can update that parent's σ and A.</p>
+  </div>
+</details>
+
+<details>
+  <summary><code>update(population)</code> — Update strategy after evaluation</summary>
+  <div class="details-body">
+    <p><strong>Input:</strong> <code>population</code> — the full combined pool
+    (offspring + current parents) after evaluation.</p>
+    <p><strong>Output:</strong> None (updates <code>self.parents</code>, <code>self.sigmas</code>,
+    <code>self.A</code>, <code>self.pc</code>, <code>self.psucc</code> in place).</p>
+
+    <p><strong>Algorithm:</strong></p>
+    <ol>
+      <li>
+        <strong>Select new parents:</strong> Call <code>_select(population)</code> to pick
+        the μ best individuals. Store as <code>self.parents</code>.
+      </li>
+      <li>
+        <strong>For each offspring in the new parent set:</strong> Determine if the offspring
+        was "successful" — i.e., does it appear in the new parent set?
+        <ul>
+          <li>If yes: success = 1 (offspring replaced its parent)</li>
+          <li>If no: success = 0</li>
+        </ul>
+      </li>
+      <li>
+        <strong>Update psucc (smoothed success rate):</strong>
+        <pre><code>psucc[i] = (1-cp) × psucc[i] + cp × success</code></pre>
+        This is an exponential moving average of the success rate.
+      </li>
+      <li>
+        <strong>Update sigma (step size):</strong>
+        <pre><code>sigma[i] *= exp((psucc[i] - ptarg) / (d × (1 - ptarg)))</code></pre>
+        If success rate > target: increase σ (be more exploratory).
+        If success rate &lt; target: decrease σ (be more exploitative).
+      </li>
+      <li>
+        <strong>Update pc and A (Cholesky/covariance):</strong>
+        <ul>
+          <li>If psucc < pthresh: update evolution path pc:
+            <pre><code>pc[i] = (1-cc) × pc[i] + sqrt(cc×(2-cc)) × (offspring - parent) / sigma</code></pre>
+          </li>
+          <li>Rank-one Cholesky update using pc:
+            <pre><code>A[i] = sqrt(1-ccov) × A[i] + sqrt(1-ccov)/ccov × (pc[i] @ pc[i].T - I)</code></pre>
+            This updates the shape of the mutation distribution to be correlated
+            with the direction of recent successful mutations.
+          </li>
+        </ul>
+      </li>
+    </ol>
+  </div>
+</details>
+
+<details>
+  <summary><code>check_feasibility(individual)</code> → (bool, int or None)</summary>
+  <div class="details-body">
+    <p><strong>Input:</strong> A normalised individual.</p>
+    <p><strong>Output:</strong> <code>(is_feasible, violated_index)</code>.</p>
+
+    <p>Checks two things:</p>
+    <ol>
+      <li>All 6 values are in <code>[1, 2]</code> (normalised box bounds).</li>
+      <li>If <code>p4_treatment == 'hard_bounds_on_p4'</code>: the p4 variable (index 2)
+      additionally must satisfy its coupling constraint with driver_p (index 1).
+      This is checked in normalised space using the inverse of the coupling transformation.</li>
+    </ol>
+    <p><strong>Why return the violated index?</strong> The repair (crossover) needs to know
+    <em>which</em> variable to fix, not just that something is wrong.</p>
+  </div>
+</details>
+
+<details>
+  <summary><code>crossover(individual, attribute_index, i)</code> — Repair infeasible offspring</summary>
+  <div class="details-body">
+    <p><strong>Input:</strong> Infeasible individual; which attribute is violated;
+    which parent index generated this offspring.</p>
+    <p><strong>Output:</strong> None — modifies individual in-place.</p>
+
+    <p>The "crossover" here is really a <em>repair</em>: we replace the offending
+    attribute with a value borrowed from another individual:</p>
+
+    <table>
+      <tr><th>sim_type</th><th>Donor</th><th>Rationale</th></tr>
+      <tr>
+        <td><code>ParentValue</code></td>
+        <td>The generating parent</td>
+        <td>Conservative: inherit parent's valid value; guaranteed feasible for box constraints</td>
+      </tr>
+      <tr>
+        <td><code>ElitistCrossover</code></td>
+        <td>The hypervolume-best parent in the current population</td>
+        <td>Biased toward best-spread parent; may accelerate convergence but risks diversity loss</td>
+      </tr>
+      <tr>
+        <td><code>RandomCrossover</code></td>
+        <td>A randomly chosen parent</td>
+        <td>Neutral; avoids bias, maintains diversity</td>
+      </tr>
+    </table>
+
+    <p><strong>The p4 Coupling Problem</strong> — the hardest part:</p>
+    <pre><code><span class="cm">-- If we're fixing attribute 2 (p4) by borrowing driver_p from a donor:</span>
+<span class="cm">-- The donor's driver_p is in a different normalised frame!</span>
+<span class="cm">-- We must:</span>
+<span class="cm">--   1. Untransform both to physical space</span>
+<span class="cm">--   2. Recompute p4_normalised relative to offspring's new driver_p</span>
+<span class="cm">--   3. Re-normalise back to [1,2] space</span>
+
+<span class="cm">-- Why? Because in normalised space, x₂=1.5 means different physical p4</span>
+<span class="cm">-- depending on what driver_p is. If we swap driver_p, we must re-express p4.</span></code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><code>_select(candidates)</code> — Pareto rank + HV selection</summary>
+  <div class="details-body">
+    <p><strong>Input:</strong> Combined pool of all candidates (offspring + parents).</p>
+    <p><strong>Output:</strong> List of μ selected individuals.</p>
+
+    <p><strong>Algorithm:</strong></p>
+    <pre><code><span class="cm"># Step 1: Sort by Pareto rank</span>
+pareto_fronts = <span class="fn">sort_nondominated</span>(candidates)
+
+<span class="cm"># Step 2: Greedily fill fronts</span>
+chosen = []
+<span class="kw">for</span> front <span class="kw">in</span> pareto_fronts:
+    <span class="kw">if</span> len(chosen) + len(front) <= mu:
+        chosen += front           <span class="cm"># take entire front</span>
+    <span class="kw">else</span>:
+        <span class="cm"># This front overflows μ — use HV to pick the best subset</span>
+        remaining_slots = mu - len(chosen)
+        chosen += <span class="fn">_select_by_hv</span>(front, remaining_slots)
+        <span class="kw">break</span>
+
+<span class="kw">return</span> chosen</code></pre>
+
+    <p><strong>HV-based tie-breaking:</strong></p>
+    <pre><code><span class="cm"># For the boundary front, compute each individual's HV contribution.</span>
+<span class="cm"># Greedily remove the individual with the LEAST contribution</span>
+<span class="cm"># until the right number remain.</span>
+<span class="cm"># This maximises the spread of the retained Pareto front.</span></code></pre>
+  </div>
+</details>
+
+<hr>
+
+<!-- ──────────────────────────────── hypervolume.py -->
+<div id="hypervolume"></div>
+<h3>7.3 &nbsp; <code>hypervolume.py</code> — Hypervolume Indicator</h3>
+
+<div class="card card-accent">
+  <strong>Role:</strong> Compute the hypervolume dominated by a set of Pareto-front
+  points relative to a reference point. Used both for <em>selection</em> (which individual
+  contributes least?) and <em>convergence tracking</em> (is the front improving?).
+</div>
+
+<h4>What is Hypervolume?</h4>
+<div class="diagram">
+  Hypervolume in 2D (intuition for 3D)
+  ══════════════════════════════════════════════════════
+
+      f₂ │
+      1.0├─────────────────────────────┐ reference
+         │                  ●          │ point (1,1)
+         │         ●        ┌──────────┤
+         │    ●    ┌────────┘          │
+         │    ├────┘                   │
+         │    │                        │
+         └────┴────────────────────────┘ f₁
+         0                          1.0
+
+  ████ = Hypervolume dominated by the Pareto front
+         = area of grey region above
+
+  A LARGER hypervolume means the Pareto front is:
+    - Closer to the reference point (better solutions)
+    - More spread out (good coverage of trade-offs)
+
+  Reference point is (0,0,0) in normalised space here.
+  Fitness values are multiplied by -1 before computing HV
+  because the algorithm minimises, but HV measures "dominates below".</div>
+
+<h4>Class: <code>HyperVolume</code></h4>
+
+<details>
+  <summary><code>__init__(referencePoint)</code></summary>
+  <div class="details-body">
+    <p>Stores the reference point. In <code>main.py</code>, this is <code>np.array((0,0,0))</code>
+    — the origin in normalised space.
+    Note: fitness values are multiplied by <code>-1</code> before passing to <code>compute()</code>
+    because the algorithm minimises objectives but hypervolume measures the volume dominated
+    <em>toward</em> the reference point.</p>
+  </div>
+</details>
+
+<details>
+  <summary><code>compute(front)</code> → float</summary>
+  <div class="details-body">
+    <p><strong>Input:</strong> List of fitness tuples forming the current Pareto front.</p>
+    <p><strong>Output:</strong> Scalar hypervolume value.</p>
+    <p><strong>Algorithm:</strong> Implements the <em>WFG (Walking Fish Group) dimension-sweep algorithm</em>
+    for exact HV computation. For 3D fronts:</p>
+    <ol>
+      <li>Sort points by the last dimension.</li>
+      <li>Use a recursive sweep, maintaining a multi-list (simultaneous membership in d linked lists — one per dimension).</li>
+      <li>At each depth, compute the 2D HV of the slice, weighted by the span in the sweep dimension.</li>
+    </ol>
+    <p>This is exact (not approximate) and runs in O(n log n) for 2D, O(n² / 2) in general.</p>
+  </div>
+</details>
+
+<h4>Class: <code>_MultiList</code></h4>
+<p>
+  An internal data structure: a doubly-linked list where each node simultaneously belongs to
+  <em>multiple lists</em> (one per dimension). This allows the sweep algorithm to efficiently
+  insert, remove, and restore nodes during the recursive dimension sweep without copying data.
+</p>
+
+<hr>
+
+<!-- ──────────────────────────────── penalty.py -->
+<div id="penalty"></div>
+<h3>7.4 &nbsp; <code>penalty.py</code> — Obsolete Constraint Handler</h3>
+
+<div class="card card-red">
+  <strong>Status: INCOMPLETE / NOT USED IN PRODUCTION.</strong>
+  Kept in the codebase as a reference implementation and future starting point.
+</div>
+
+<details>
+  <summary>What was the intended design?</summary>
+  <div class="details-body">
+    <p>The Penalty approach is an alternative to the crossover-repair approach.
+    Instead of repairing infeasible offspring, you <em>allow</em> them into the population
+    but penalise their fitness:</p>
+    <pre><code>f_penalised = f_closest_feasible - α × distance(offspring, closest_feasible)</code></pre>
+    <p>This means infeasible offspring can still be selected if they're "close enough" to
+    feasibility — and the gradient from the penalty guides the search back to the feasible region.</p>
+
+    <p><strong>Why is it incomplete?</strong> The <code>wrapper()</code> method has a
+    scoping bug — <code>self</code> and <code>func</code> are not bound. The original DEAP
+    implementation it was based on used decorator syntax that doesn't translate directly
+    to this architecture. It was never refactored to work correctly.</p>
+  </div>
+</details>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════ SECTION 8 -->
+<section id="main">
+<h2>8. <code>main.py</code> — The Entry Point &amp; Orchestrator</h2>
+
+<div class="card card-accent">
+  <strong>Role:</strong> The "director" — it wires together the problem and algorithm modules,
+  initialises everything, and runs the evolution loop. This is the only file that imports
+  from both <code>problem/</code> and <code>algorithm/</code>.
+</div>
+
+<h3>DEAP Integration</h3>
+<p>
+  The code uses <a href="https://github.com/DEAP/deap">DEAP</a> (Distributed Evolutionary
+  Algorithms in Python) for two things:
+</p>
+<ol>
+  <li><strong>FitnessMulti</strong> — a fitness container with weights <code>(-1,-1,-1)</code>
+  (all minimise). DEAP's fitness classes support Pareto dominance comparison automatically.</li>
+  <li><strong>Individual</strong> — a list subclass with a <code>.fitness</code> attribute.
+  DEAP's creator system registers these as new classes.</li>
+</ol>
+
+<pre><code><span class="kw">from</span> deap <span class="kw">import</span> base, creator, tools
+
+creator.<span class="fn">create</span>(<span class="str">"FitnessMulti"</span>, base.Fitness, weights=(<span class="num">-1</span>, <span class="num">-1</span>, <span class="num">-1</span>))
+creator.<span class="fn">create</span>(<span class="str">"Individual"</span>, list, fitness=creator.FitnessMulti)</code></pre>
+
+<div class="callout">
+  <span class="callout-icon">📌</span>
+  <div class="callout-body">
+    <div class="callout-title">Why weights=(-1,-1,-1)?</div>
+    DEAP's Pareto dominance comparison uses the convention that <em>higher weighted fitness is better</em>.
+    By setting weights = -1, a lower raw objective value produces a higher weighted value.
+    So minimising raw objectives is equivalent to DEAP's "maximise weighted fitness" default.
+  </div>
+</div>
+
+<h3>The Toolbox Setup</h3>
+<pre><code>toolbox = Toolbox()
+
+<span class="cm"># Register the evaluation function (from problem/evaluate.py)</span>
+toolbox.<span class="fn">register</span>(<span class="str">"evaluate"</span>, evaluate.evaluate)
+
+<span class="cm"># Register generate and update from the strategy</span>
+<span class="cm"># (done after StrategyMultiObjective is created):</span>
+toolbox.<span class="fn">register</span>(<span class="str">"generate"</span>, strategy.<span class="fn">generate</span>, creator.Individual)
+toolbox.<span class="fn">register</span>(<span class="str">"update"</span>,   strategy.<span class="fn">update</span>)</code></pre>
+
+<h3>Initial Population Creation</h3>
+<pre><code><span class="kw">def</span> <span class="fn">create_initial_population</span>(pop_size, bounds):
+    pop = []
+    <span class="kw">for</span> _ <span class="kw">in</span> <span class="fn">range</span>(pop_size):
+        x = [<span class="num">0</span>] * N
+
+        <span class="cm"># Variables 0, 3, 5: independent, uniform sampling</span>
+        x[<span class="num">0</span>] = np.random.<span class="fn">uniform</span>(bounds[<span class="num">0</span>][<span class="num">0</span>], bounds[<span class="num">0</span>][<span class="num">1</span>])  <span class="cm"># percent_He</span>
+        x[<span class="num">3</span>] = np.random.<span class="fn">uniform</span>(bounds[<span class="num">3</span>][<span class="num">0</span>], bounds[<span class="num">3</span>][<span class="num">1</span>])  <span class="cm"># D_throat</span>
+        x[<span class="num">5</span>] = np.random.<span class="fn">uniform</span>(bounds[<span class="num">5</span>][<span class="num">0</span>], bounds[<span class="num">5</span>][<span class="num">1</span>])  <span class="cm"># buffer_length</span>
+
+        <span class="cm"># Variable 1: driver_p (independent)</span>
+        x[<span class="num">1</span>] = np.random.<span class="fn">uniform</span>(bounds[<span class="num">1</span>][<span class="num">0</span>], bounds[<span class="num">1</span>][<span class="num">1</span>])  <span class="cm"># driver_p</span>
+
+        <span class="cm"># Variable 2: p4 — COUPLED to driver_p</span>
+        p4_min = <span class="num">14.62</span> * x[<span class="num">1</span>]
+        p4_max = <span class="num">1190.63</span> * x[<span class="num">1</span>]
+        x[<span class="num">2</span>] = np.random.<span class="fn">uniform</span>(p4_min, p4_max)
+
+        <span class="cm"># Variable 4: reservoir_p — COUPLED to driver_p</span>
+        x[<span class="num">4</span>] = np.random.<span class="fn">uniform</span>(x[<span class="num">1</span>], <span class="num">8e6</span>)
+
+        pop.<span class="fn">append</span>(x)
+
+    <span class="cm"># Transform all to normalised [1,2]^6 space</span>
+    <span class="kw">return</span> <span class="fn">variable_transformation</span>(pop, bounds)</code></pre>
+
+<h3>The Evolution Loop</h3>
+<pre><code><span class="kw">for</span> gen <span class="kw">in</span> <span class="fn">range</span>(NGEN):
+
+    <span class="cm"># ── 1. Generate offspring ─────────────────────────────────────────────</span>
+    offspring = toolbox.<span class="fn">generate</span>()            <span class="cm"># calls strategy.generate()</span>
+
+    <span class="cm"># ── 2. Evaluate offspring ─────────────────────────────────────────────</span>
+    fitnesses = toolbox.<span class="fn">map</span>(toolbox.evaluate, offspring)
+    <span class="kw">for</span> ind, fit <span class="kw">in</span> <span class="fn">zip</span>(offspring, fitnesses):
+        ind.fitness.values = fit
+
+    <span class="cm"># ── 3. Update strategy ────────────────────────────────────────────────</span>
+    toolbox.<span class="fn">update</span>(offspring)                  <span class="cm"># calls strategy.update()</span>
+
+    <span class="cm"># ── 4. Track convergence ──────────────────────────────────────────────</span>
+    current_front = [ind.fitness.values <span class="kw">for</span> ind <span class="kw">in</span> strategy.parents]
+    hv = pop_hypervolumes.<span class="fn">compute</span>(np.<span class="fn">array</span>(current_front) * <span class="num">-1</span>)
+    logbook.<span class="fn">record</span>(gen=gen, hv=hv)
+
+    <span class="cm"># ── 5. Intermediate plots ─────────────────────────────────────────────</span>
+    <span class="kw">if</span> gen % <span class="num">50</span> == <span class="num">0</span> <span class="kw">and</span> <span class="num">200</span> <= gen <= <span class="num">750</span>:
+        <span class="fn">plot_objective_space</span>(fitness_history, ...)  <span class="cm"># save PNG</span></code></pre>
+
+<h3>Post-Processing</h3>
+<p>After the loop finishes:</p>
+<ul>
+  <li>Convergence plot: hypervolume vs. generation number → <code>convergence_*.png</code></li>
+  <li>Final Pareto scatter: 3 × 2D projections of the 3D Pareto front → <code>cma_es_mo_*.png</code></li>
+  <li>Fixer count plot: how many constraint repairs were needed per generation</li>
+  <li>Text output: initial and final populations in physical units → <code>output.txt</code></li>
+  <li>Convergence data: HV per generation → <code>convergence_data.txt</code></li>
+</ul>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════ SECTION 9 -->
+<section id="interactions">
+<h2>9. Cross-Module Interactions &amp; Call Graph</h2>
+
+<div class="diagram">
+  COMPLETE CALL GRAPH (→ = calls, -- = data flow)
+  ════════════════════════════════════════════════════════════════════════════
+
+  main.py
+  ├─ imports: problem.config (constants), problem.evaluate, problem.transforms
+  ├─ imports: algorithm.toolbox (Toolbox), algorithm.cmaes (Strategy)
+  ├─ imports: algorithm.hypervolume (HyperVolume)
+  │
+  ├─ [startup] creator.create("Individual", ...) → DEAP Individual class
+  ├─ [startup] toolbox = Toolbox()
+  │                └─ toolbox.logbook = Logbook()
+  ├─ [startup] evaluate._logbook = toolbox.logbook  ← INJECTION
+  │
+  ├─ [init pop] variable_transformation(pop, bounds)
+  │               └─ transforms.py: normalise 6 vars (with coupling)
+  │
+  ├─ [evaluate initial] toolbox.map(toolbox.evaluate, pop)
+  │   └─ evaluate(x)  [evaluate.py]
+  │       ├─ constraint_function(x, bounds)
+  │       │   ├─ variable_untransformation(x, bounds)  [transforms.py]
+  │       │   ├─ base_config_dict()  [config.py]
+  │       │   ├─ base_driver_dict(x)  [config.py]
+  │       │   └─ PITOT3.Tube.calculate_shock_speed...()
+  │       ├─ objective_function(x, bounds)
+  │       │   ├─ variable_untransformation(x, bounds)  [transforms.py]
+  │       │   └─ SPARK.simulate()
+  │       └─ normalise_fitness(...)  [transforms.py]
+  │
+  ├─ [create strategy] StrategyMultiObjective(pop, sigma, ...)
+  │   └─ cmaes.py: init per-parent state (sigmas, A, invCholesky, pc, psucc)
+  │
+  ├─ [register] toolbox.register("generate", strategy.generate, ...)
+  ├─ [register] toolbox.register("update", strategy.update)
+  │
+  └─ [evolution loop]
+      ├─ toolbox.generate()
+      │   └─ strategy.generate(ind_init)  [cmaes.py]
+      │       ├─ np.random.standard_normal(N)
+      │       ├─ sigma[i] × A[i] @ z
+      │       ├─ [repair loop] check_feasibility(offspring)  [cmaes.py]
+      │       │   └─ crossover(offspring, attr, parent_idx)  [cmaes.py]
+      │       │       └─ variable_untransformation/transformation  [transforms.py]
+      │       └─ returns offspring list
+      │
+      ├─ toolbox.map(toolbox.evaluate, offspring)
+      │   └─ [same as initial evaluation above]
+      │
+      ├─ toolbox.update(offspring)
+      │   └─ strategy.update(population)  [cmaes.py]
+      │       ├─ _select(candidates)  [cmaes.py]
+      │       │   ├─ sortNondominated()  [DEAP tools]
+      │       │   └─ HyperVolume.compute()  [hypervolume.py]
+      │       ├─ adapt sigma (step-size control)
+      │       └─ update A, pc (Cholesky rank-one update)
+      │
+      └─ HyperVolume.compute(front × -1)  [hypervolume.py] → HV scalar
+          └─ logbook.record(gen=gen, hv=hv)</div>
+
+<h3>Key Injection Points</h3>
+<div class="grid-2">
+  <div class="card card-purple">
+    <h4>Logbook Injection</h4>
+    <p><code>evaluate._logbook = toolbox.logbook</code></p>
+    <p>The evaluate module stores a reference to the global logbook, allowing
+    it to record fixer counts and failure counts as side-channel statistics
+    without needing to return them from <code>evaluate()</code>.</p>
+  </div>
+  <div class="card card-orange">
+    <h4>Bounds on Individual</h4>
+    <p><code>individual.bounds = BOUNDS</code></p>
+    <p>Since DEAP's <code>map(evaluate, pop)</code> calls evaluate with a single
+    argument, bounds are stored on each individual so evaluate can access them
+    without a second argument.</p>
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════ SECTION 10 -->
+<section id="function-ref">
+<h2>10. Complete Function Reference</h2>
+
+<h3>problem/config.py</h3>
+<table>
+  <tr><th>Function</th><th>Inputs</th><th>Output</th><th>Called From</th></tr>
+  <tr>
+    <td><code>base_config_dict()</code></td>
+    <td>None</td>
+    <td>dict (PITOT3 base config)</td>
+    <td>evaluate.py::constraint_function()</td>
+  </tr>
+  <tr>
+    <td><code>base_driver_dict(x)</code></td>
+    <td>x: physical-space vars</td>
+    <td>dict (PITOT3 driver config)</td>
+    <td>evaluate.py::constraint_function()</td>
+  </tr>
+</table>
+
+<h3>problem/transforms.py</h3>
+<table>
+  <tr><th>Function</th><th>Inputs</th><th>Output</th><th>Called From</th></tr>
+  <tr>
+    <td><code>variable_transformation()</code></td>
+    <td>pop (list), bounds</td>
+    <td>pop (normalised)</td>
+    <td>main.py (initial pop creation)</td>
+  </tr>
+  <tr>
+    <td><code>variable_untransformation()</code></td>
+    <td>x (single, normalised), bounds</td>
+    <td>list (physical)</td>
+    <td>evaluate.py (both eval functions), cmaes.py (crossover repair)</td>
+  </tr>
+  <tr>
+    <td><code>normalise_fitness()</code></td>
+    <td>fitness tuple, ideal, nadir</td>
+    <td>normalised fitness tuple</td>
+    <td>evaluate.py::evaluate()</td>
+  </tr>
+  <tr>
+    <td><code>unnormalise_fitness()</code></td>
+    <td>normalised fitness, ideal, nadir</td>
+    <td>raw fitness tuple</td>
+    <td>main.py (post-processing output)</td>
+  </tr>
+</table>
+
+<h3>problem/evaluate.py</h3>
+<table>
+  <tr><th>Function</th><th>Inputs</th><th>Output</th><th>Called From</th></tr>
+  <tr>
+    <td><code>constraint_function()</code></td>
+    <td>x1 (normalised), bounds</td>
+    <td>float: |v_shock − 4900|</td>
+    <td>evaluate()</td>
+  </tr>
+  <tr>
+    <td><code>objective_function()</code></td>
+    <td>x (normalised), bounds</td>
+    <td>(t_hold, v_impact)</td>
+    <td>evaluate()</td>
+  </tr>
+  <tr>
+    <td><code>evaluate()</code></td>
+    <td>x (Individual with .bounds, .sim_type)</td>
+    <td>(f̂₁, f̂₂, f̂₃) normalised</td>
+    <td>toolbox.evaluate → main.py</td>
+  </tr>
+</table>
+
+<h3>algorithm/toolbox.py</h3>
+<table>
+  <tr><th>Method</th><th>Class</th><th>Purpose</th></tr>
+  <tr><td><code>register(alias, fn, *args)</code></td><td>Toolbox</td><td>Store partially-applied operator under alias</td></tr>
+  <tr><td><code>unregister(alias)</code></td><td>Toolbox</td><td>Remove stored operator</td></tr>
+  <tr><td><code>decorate(alias, *decorators)</code></td><td>Toolbox</td><td>Wrap stored operator</td></tr>
+  <tr><td><code>record(**infos)</code></td><td>Logbook</td><td>Append generation stats dict</td></tr>
+  <tr><td><code>select(*names)</code></td><td>Logbook</td><td>Extract named fields across all records</td></tr>
+  <tr><td><code>add(alias, obj)</code></td><td>Logbook</td><td>Store named object on bookshelf</td></tr>
+</table>
+
+<h3>algorithm/cmaes.py</h3>
+<table>
+  <tr><th>Method</th><th>Inputs</th><th>Output</th><th>Purpose</th></tr>
+  <tr>
+    <td><code>generate(ind_init)</code></td>
+    <td>factory function</td>
+    <td>list of λ offspring</td>
+    <td>Mutate parents → offspring with feasibility repair</td>
+  </tr>
+  <tr>
+    <td><code>update(population)</code></td>
+    <td>combined pool</td>
+    <td>None (in-place)</td>
+    <td>Select new parents; update σ, A, pc per parent</td>
+  </tr>
+  <tr>
+    <td><code>check_feasibility(ind)</code></td>
+    <td>individual</td>
+    <td>(bool, index)</td>
+    <td>Check box bounds + p4 coupling constraint</td>
+  </tr>
+  <tr>
+    <td><code>crossover(ind, attr, i)</code></td>
+    <td>individual, violated attr, parent idx</td>
+    <td>None (in-place)</td>
+    <td>Repair infeasible attribute from donor parent</td>
+  </tr>
+  <tr>
+    <td><code>_select(candidates)</code></td>
+    <td>candidate pool</td>
+    <td>list of μ individuals</td>
+    <td>Pareto rank + HV tie-breaking selection</td>
+  </tr>
+</table>
+
+<h3>algorithm/hypervolume.py</h3>
+<table>
+  <tr><th>Method</th><th>Class</th><th>Inputs</th><th>Output</th></tr>
+  <tr>
+    <td><code>compute(front)</code></td>
+    <td>HyperVolume</td>
+    <td>list of fitness tuples</td>
+    <td>float: hypervolume scalar</td>
+  </tr>
+  <tr>
+    <td><code>append(node, index)</code></td>
+    <td>_MultiList</td>
+    <td>node, dimension</td>
+    <td>Insert node into dimension's list</td>
+  </tr>
+  <tr>
+    <td><code>remove(node, index, bounds)</code></td>
+    <td>_MultiList</td>
+    <td>node, dimension, bounds</td>
+    <td>Temporarily remove node (sweep)</td>
+  </tr>
+  <tr>
+    <td><code>reinsert(node, index, bounds)</code></td>
+    <td>_MultiList</td>
+    <td>node, dimension, bounds</td>
+    <td>Restore temporarily removed node</td>
+  </tr>
+</table>
+
+<h3>utils.py</h3>
+<table>
+  <tr><th>Function</th><th>Inputs</th><th>Output</th><th>Called From</th></tr>
+  <tr>
+    <td><code>distance(feasible, original)</code></td>
+    <td>two individuals</td>
+    <td>float: squared Euclidean</td>
+    <td>penalty.py (incomplete)</td>
+  </tr>
+  <tr>
+    <td><code>closest_feasible(ind)</code></td>
+    <td>individual</td>
+    <td>clamped individual</td>
+    <td>penalty.py (incomplete)</td>
+  </tr>
+  <tr>
+    <td><code>valid(ind)</code></td>
+    <td>individual</td>
+    <td>bool</td>
+    <td>penalty.py (incomplete)</td>
+  </tr>
+  <tr>
+    <td><code>parallelization_setup(pop)</code></td>
+    <td>population</td>
+    <td>None (creates dirs)</td>
+    <td>main.py: creates PITOT3_Outputs/DEAP_tests_i/ per individual</td>
+  </tr>
+</table>
+
+<h3>plotting.py</h3>
+<table>
+  <tr><th>Function</th><th>Inputs</th><th>Output</th><th>Called From</th></tr>
+  <tr>
+    <td><code>plot_objective_space()</code></td>
+    <td>fitness history, obj1, obj2, kwargs</td>
+    <td>PNG file on disk</td>
+    <td>main.py (intermediate + post-processing)</td>
+  </tr>
+</table>
+
+<hr>
+
+<!-- ═══════════════════════════════════════════════════════════ SUMMARY -->
+<section id="summary">
+<h2>Summary: Key Takeaways</h2>
+
+<div class="grid-2">
+  <div class="card card-green">
+    <h4>Separation of Concerns</h4>
+    <p>The code cleanly separates <em>what</em> is being optimised (<code>problem/</code>)
+    from <em>how</em> it is optimised (<code>algorithm/</code>). You could swap PITOT3
+    for a surrogate model by changing only <code>evaluate.py</code>. You could swap
+    CMA-ES for a genetic algorithm by changing only <code>cmaes.py</code>.</p>
+  </div>
+  <div class="card card-orange">
+    <h4>The Coupling Problem</h4>
+    <p>The non-box constraint (p4 coupled to driver_p) is the dominant complexity driver.
+    It affects the transformation, the feasibility check, the crossover repair, and
+    the initial population sampling. Every module that touches variables 1, 2, or 4
+    must handle this carefully.</p>
+  </div>
+  <div class="card card-purple">
+    <h4>CMA-ES Learns the Landscape</h4>
+    <p>The Cholesky matrix <code>A</code> per parent encodes <em>what kind of mutations
+    work</em>. Over generations, if moving along a particular direction consistently
+    produces good offspring, <code>A</code> rotates to favour that direction. This is
+    why CMA-ES outperforms random search on correlated, non-separable problems.</p>
+  </div>
+  <div class="card card-accent">
+    <h4>Hypervolume as a Universal Measure</h4>
+    <p>Hypervolume serves double duty: as a selection criterion (choose individuals that
+    maximally spread the Pareto front) and as a convergence indicator (is the HV
+    still growing? If not, we've converged). It's one number that summarises the
+    entire quality of a multi-objective solution set.</p>
+  </div>
+</div>
+
+<div class="diagram">
+  One-Page Mental Model
+  ════════════════════════════════════════════════════════════════════════════
+
+  WHAT:  Find the best trade-offs for 3 competing objectives
+         of a hypersonic shock-tube experiment, using 6 design variables.
+
+  HOW:   Multi-objective CMA-ES:
+           - Maintain μ parents (the current Pareto-optimal set)
+           - Each generation: mutate → evaluate → select
+           - Mutation shape adapts per-parent (learns the landscape)
+           - Feasibility enforced by crossover repair (coupling-aware)
+           - Selection by Pareto rank + hypervolume contribution
+
+  DATA:  Individuals move through three spaces:
+           Physical space  ─[transform]─►  Normalised [1,2]⁶  ─[evaluate]─►  Fitness [0,1]³
+                                              (CMA-ES lives here)              (Pareto rank here)
+
+  OUTPUT: Pareto-optimal set of shock-tube configurations + visualisations</div>
+</section>
+
+</div><!-- /page -->
+
+<script>
+  // Smooth highlight for active nav link
+  const sections = document.querySelectorAll('section[id], div[id]');
+  const navLinks = document.querySelectorAll('nav a');
+  window.addEventListener('scroll', () => {
+    let current = '';
+    sections.forEach(s => {
+      if (window.scrollY >= s.offsetTop - 100) current = s.id;
+    });
+    navLinks.forEach(a => {
+      a.style.color = a.getAttribute('href') === '#' + current
+        ? 'var(--accent)' : '';
+    });
+  });
+</script>
+</body>
+</html>
