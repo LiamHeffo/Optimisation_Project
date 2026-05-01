@@ -50,7 +50,11 @@ from problem.config      import (
 )
 from problem.transforms  import variable_transformation, variable_untransformation, unnormalise_fitness
 from problem.evaluate    import evaluate, set_logbook
-from plotting            import plot_objective_space
+from plotting            import (
+    plot_objective_space,
+    plot_objective_space_3d,
+    plot_objective_space_heatmap,
+)
 from utils               import parallelization_setup
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -89,13 +93,13 @@ def main(experiment_type):
     N           = 6
     pop_size    = experiment_type[1]
     MU, LAMBDA  = pop_size, pop_size
-    NGEN        = 10
+    NGEN        = 500
     sim_type    = experiment_type[0]
     p4_treatment = experiment_type[3]
     step_size   = experiment_type[2]
 
     print(f"Step Size = {step_size}")
-    print(f'Pop Size = {pop_size}')
+    print(f'Pop Size = {pop_size}\n')
 
     # ── Logbook initialisation ────────────────────────────────────────────
     gen_counter = 0
@@ -223,12 +227,13 @@ def main(experiment_type):
 
         toolbox.update(population)
 
-        fitness_copy = list(fitnesses)
-        fitness_copy = [fit for fit in fitness_copy if fit[0] != 1.0]
-
-        avg_hypervolume = pop_hypervolumes.compute(np.array(fitness_copy) * -1)
-        print(f'average hypervolume = {avg_hypervolume}')
-        toolbox.logbook.bookshelf['hypervolume'][gen] = avg_hypervolume
+        # HV is computed on the elitist parent set (size = mu, constant across
+        # generations) rather than raw offspring. This removes the cardinality
+        # noise that produced the discrete-plateau jumps in the convergence trace.
+        parent_fitnesses = np.array([ind.fitness.values for ind in strategy.parents])
+        hypervolume = pop_hypervolumes.compute(parent_fitnesses * -1)
+        print(f'hypervolume = {hypervolume}')
+        toolbox.logbook.bookshelf['hypervolume'][gen] = hypervolume
 
         # Intermediate Pareto scatter plots every 50 generations (200–750)
         if gen % 50 == 0 and 200 <= gen <= 750:
@@ -236,10 +241,14 @@ def main(experiment_type):
             if starting_working_directory[-1] in [f'{i}' for i in range(0, 12)]:
                 starting_working_directory = starting_working_directory[:35]
 
+            if 'Scatter_Plots' not in os.listdir(starting_working_directory):
+                os.mkdir(starting_working_directory + '/Scatter_Plots')
             os.chdir(starting_working_directory + '/Scatter_Plots')
             plot_objective_space(fitness_history, 'delta_vs1',  'hold_time',    MU=MU, sim_type=sim_type, gen=gen)
             plot_objective_space(fitness_history, 'delta_vs1',  'impact_speed', MU=MU, sim_type=sim_type, gen=gen)
             plot_objective_space(fitness_history, 'hold_time',  'impact_speed', MU=MU, sim_type=sim_type, gen=gen)
+            plot_objective_space_3d(fitness_history,      MU=MU, sim_type=sim_type, gen=gen)
+            plot_objective_space_heatmap(fitness_history, MU=MU, sim_type=sim_type, gen=gen)
             os.chdir(starting_working_directory)
 
     # ── Post-processing ───────────────────────────────────────────────────
@@ -298,6 +307,8 @@ def main(experiment_type):
     plot_objective_space(fitness_history, 'delta_vs1', 'hold_time',    MU=MU, sim_type=sim_type, gen=NGEN)
     plot_objective_space(fitness_history, 'delta_vs1', 'impact_speed', MU=MU, sim_type=sim_type, gen=NGEN)
     plot_objective_space(fitness_history, 'hold_time', 'impact_speed', MU=MU, sim_type=sim_type, gen=NGEN)
+    plot_objective_space_3d(fitness_history,      MU=MU, sim_type=sim_type, gen=NGEN)
+    plot_objective_space_heatmap(fitness_history, MU=MU, sim_type=sim_type, gen=NGEN)
 
     # ── Fixer count plot (non-Penalty runs only) ──────────────────────────
     fixer_count = []
