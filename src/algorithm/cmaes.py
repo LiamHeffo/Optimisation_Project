@@ -397,7 +397,7 @@ class StrategyMultiObjective(object):
         if mu_succ == 0:
             return A, invCholesky
 
-        x_i     = np.array(parents_snapshot[parent_idx])
+        x_i = np.array(parents_snapshot[parent_idx])
         sigma_i = sigmas_snapshot[parent_idx]
 
         w_pp  = np.zeros(mu_succ)   # w''_ij  (eq. 15)
@@ -429,6 +429,9 @@ class StrategyMultiObjective(object):
 
         sum_w = np.sum(w)
         Z = np.einsum("k,ki,kj->ij", w, steps, steps)
+        # Note: This reads as:
+        #   for k in range(mu_succ):
+        #       Z += w[k] * np.outer(steps[k], steps[k])
 
         C_old = A @ A.T
         C_new = (1.0 - sum_w) * C_old + Z
@@ -454,7 +457,7 @@ class StrategyMultiObjective(object):
             root    = np.sqrt(1 + beta / alpha * norm_w2)
             b       = a / norm_w2 * (root - 1)
 
-            A            = a * A + b * np.outer(v, w)
+            A = a * A + b * np.outer(v, w)
             invCholesky  = (
                 1.0 / a * invCholesky
                 - b / (a ** 2 + a * b * norm_w2) * np.outer(w, w_inv)
