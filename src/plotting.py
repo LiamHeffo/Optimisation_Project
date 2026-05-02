@@ -1,19 +1,40 @@
 """
 Objective-space scatter plots for the Pareto front history.
 
-plot_objective_space(fitness_history, obj1, obj2, **kwargs)
+All functions accept an optional ``out_dir`` keyword argument.  When given,
+the plot is written into that directory; otherwise it is written to the
+current working directory (legacy behaviour).
 
-Supported objective-pair combinations:
-    ('delta_vs1', 'hold_time')
-    ('delta_vs1', 'impact_speed')
-    ('hold_time',  'impact_speed')
+Functions
+---------
+plot_objective_space(fitness_history, obj1, obj2, **kwargs)
+    Two-axis Pareto scatter for the supported objective pairs:
+        ('delta_vs1', 'hold_time')
+        ('delta_vs1', 'impact_speed')
+        ('hold_time',  'impact_speed')
+
+plot_objective_space_3d(fitness_history, **kwargs)
+    Three-axis Pareto scatter (delta_vs1, hold_time, impact_speed).
+
+plot_objective_space_heatmap(fitness_history, **kwargs)
+    Two-axis hold_time vs impact_speed scatter, with delta_vs1 encoded
+    as a viridis colour gradient.
 
 The last MU entries in fitness_history are treated as the current Pareto
-front and highlighted in a distinct colour.
+front and highlighted.
 """
+
+from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
+
+
+def _resolve_path(filename, out_dir):
+    """Return a save path inside out_dir if given, else just the filename (cwd)."""
+    if out_dir is None:
+        return filename
+    return str(Path(out_dir) / filename)
 
 
 def plot_objective_space(fitness_history, obj1, obj2, **kwargs):
@@ -27,17 +48,17 @@ def plot_objective_space(fitness_history, obj1, obj2, **kwargs):
         Names of the two objectives to plot (see module docstring).
     MU : int, optional
         Population size — the last MU entries are the current front (default 10).
-    sim_type : str, optional
-        Used in the output filename (default 'Parent_Value').
     gen : int, optional
         Generation number for the filename (default 0).
     normalised : bool, optional
         If True, axes are clamped to [0, 1.1] (default True).
+    out_dir : Path or str, optional
+        Directory to save the plot in.  Defaults to current working directory.
     """
     MU         = kwargs.get('MU',         10)
-    sim_type   = kwargs.get('sim_type',   'Parent_Value')
     gen        = kwargs.get('gen',         0)
     normalised = kwargs.get('normalised',  True)
+    out_dir    = kwargs.get('out_dir',     None)
 
     if obj1 == 'delta_vs1' and obj2 == 'hold_time':
         plt.figure(dpi=800)
@@ -57,7 +78,8 @@ def plot_objective_space(fitness_history, obj1, obj2, **kwargs):
         plt.scatter(delta_vs_history,       hold_time_history,       facecolors='none', edgecolors='lightblue')
         plt.scatter(delta_vs_history[-MU:], hold_time_history[-MU:], facecolors='none', edgecolors='green')
 
-        plt.savefig(f"cma_es_mo_fpd_{sim_type}_1_{gen}.png")
+        filename = f"pareto_dvs1_holdtime_gen_{gen:04d}.png"
+        plt.savefig(_resolve_path(filename, out_dir))
         plt.close()
 
     elif obj1 == 'delta_vs1' and obj2 == 'impact_speed':
@@ -78,7 +100,8 @@ def plot_objective_space(fitness_history, obj1, obj2, **kwargs):
         plt.scatter(delta_vs_history,       impact_speed_history,       facecolors='none', edgecolors='lightblue')
         plt.scatter(delta_vs_history[-MU:], impact_speed_history[-MU:], facecolors='none', edgecolors='orange')
 
-        plt.savefig(f"cma_es_mo_fpd_{sim_type}_2_{gen}.png")
+        filename = f"pareto_dvs1_impactspeed_gen_{gen:04d}.png"
+        plt.savefig(_resolve_path(filename, out_dir))
         plt.close()
 
     elif obj1 == 'hold_time' and obj2 == 'impact_speed':
@@ -99,7 +122,8 @@ def plot_objective_space(fitness_history, obj1, obj2, **kwargs):
         plt.scatter(hold_time_history,       impact_speed_history,       facecolors='none', edgecolors='lightblue')
         plt.scatter(hold_time_history[-MU:], impact_speed_history[-MU:], facecolors='none', edgecolors='purple')
 
-        plt.savefig(f"cma_es_mo_fpd_{sim_type}_3_{gen}.png")
+        filename = f"pareto_holdtime_impactspeed_gen_{gen:04d}.png"
+        plt.savefig(_resolve_path(filename, out_dir))
         plt.close()
 
 
@@ -109,23 +133,26 @@ def plot_objective_space_3d(fitness_history, **kwargs):
     All sampled individuals are drawn as translucent grey points; the last
     MU entries (current Pareto front) are over-plotted in opaque green.
 
+    The camera is positioned in the (-x, -y, +z) octant so that the
+    (0, 0, 0) ideal corner is closest to the viewer.
+
     Parameters
     ----------
     fitness_history : list of tuples
         Each entry is (delta_vs1, hold_time, impact_speed), normalised.
     MU : int, optional
         Population size — the last MU entries are the current front.
-    sim_type : str, optional
-        Used in the output filename.
     gen : int, optional
         Generation number for the filename.
     normalised : bool, optional
         If True, axes are clamped to [0, 1.1].
+    out_dir : Path or str, optional
+        Directory to save the plot in.
     """
     MU         = kwargs.get('MU',         10)
-    sim_type   = kwargs.get('sim_type',   'Parent_Value')
     gen        = kwargs.get('gen',         0)
     normalised = kwargs.get('normalised',  True)
+    out_dir    = kwargs.get('out_dir',     None)
 
     delta_vs_history     = [entry[0] for entry in fitness_history]
     hold_time_history    = [entry[1] for entry in fitness_history]
@@ -143,12 +170,16 @@ def plot_objective_space_3d(fitness_history, **kwargs):
         ax.set_ylim((0, 1.1))
         ax.set_zlim((0, 1.1))
 
+    # Camera in (-x, -y, +z) octant places (0, 0, 0) closest to the viewer.
+    ax.view_init(elev=25, azim=-135)
+
     ax.scatter(delta_vs_history,       hold_time_history,       impact_speed_history,
                c='grey', alpha=0.15, s=10, depthshade=False)
     ax.scatter(delta_vs_history[-MU:], hold_time_history[-MU:], impact_speed_history[-MU:],
                c='green', alpha=1.0,  s=25, depthshade=False)
 
-    plt.savefig(f"cma_es_mo_fpd_{sim_type}_3d_{gen}.png")
+    filename = f"pareto_3d_gen_{gen:04d}.png"
+    plt.savefig(_resolve_path(filename, out_dir))
     plt.close()
 
 
@@ -156,7 +187,7 @@ def plot_objective_space_heatmap(fitness_history, **kwargs):
     """2D scatter of hold_time vs impact_speed, coloured by delta_vs1.
 
     delta_vs1 (residual of shock speed) is encoded as the marker colour
-    via a perceptually uniform colormap (viridis). Final-population
+    via a perceptually uniform colormap (viridis).  Final-population
     individuals are outlined in black to keep with the convention of
     distinguishing the current front.
 
@@ -166,17 +197,17 @@ def plot_objective_space_heatmap(fitness_history, **kwargs):
         Each entry is (delta_vs1, hold_time, impact_speed), normalised.
     MU : int, optional
         Population size — the last MU entries are the current front.
-    sim_type : str, optional
-        Used in the output filename.
     gen : int, optional
         Generation number for the filename.
     normalised : bool, optional
         If True, axes are clamped to [0, 1.1].
+    out_dir : Path or str, optional
+        Directory to save the plot in.
     """
     MU         = kwargs.get('MU',         10)
-    sim_type   = kwargs.get('sim_type',   'Parent_Value')
     gen        = kwargs.get('gen',         0)
     normalised = kwargs.get('normalised',  True)
+    out_dir    = kwargs.get('out_dir',     None)
 
     delta_vs_history     = np.array([entry[0] for entry in fitness_history])
     hold_time_history    = np.array([entry[1] for entry in fitness_history])
@@ -206,5 +237,6 @@ def plot_objective_space_heatmap(fitness_history, **kwargs):
     cbar = plt.colorbar(sc)
     cbar.set_label("Normalised Residual of Shock Speed")
 
-    plt.savefig(f"cma_es_mo_fpd_{sim_type}_heatmap_{gen}.png")
+    filename = f"pareto_heatmap_gen_{gen:04d}.png"
+    plt.savefig(_resolve_path(filename, out_dir))
     plt.close()
