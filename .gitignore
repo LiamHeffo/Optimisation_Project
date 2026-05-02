@@ -1,6 +1,11 @@
 # Runtime simulation outputs
 PITOT3_Outputs/
 
+# Legacy results folder (replaced by capital-R Results/, which is
+# self-ignored via Results/.gitignore).  Kept here as a safety net so
+# the dead path can never be accidentally re-tracked.
+results/
+
 # CEA temporary files
 thermo.inp
 thermo.lib
