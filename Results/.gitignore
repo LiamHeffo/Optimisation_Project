@@ -1,0 +1,4 @@
+# Ignore all generated run outputs.  The folder itself is preserved by
+# tracking this .gitignore file.
+*
+!.gitignore
