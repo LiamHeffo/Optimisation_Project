@@ -321,6 +321,12 @@ def main(experiment_type):
     toolbox.logbook.add("No. individuals that produced no hold time",  0)
     toolbox.logbook.add("No. individuals that failed constraint tests", 0)
     toolbox.logbook.add("hypervolume",         [0 for _ in range(1, NGEN + 1)])
+    # Per-generation count of offspring that passed the feasibility check
+    # (and were therefore evaluated by SPARK + PITOT3).  A persistently
+    # low number signals stagnation — the search ellipsoid is wider than
+    # the feasible region so almost every offspring is rejected.  Index
+    # is zero-based on generation (slot k holds gen k+1's count).
+    toolbox.logbook.add("feasible_offspring_count", [0 for _ in range(1, NGEN + 1)])
 
     # Give the evaluate module a reference to the logbook so it can update
     # counters without accessing a global toolbox.
@@ -505,6 +511,17 @@ def main(experiment_type):
                 ind.fitness.values = fit
                 fitness_history.append(fit)
 
+        # Per-generation feasibility count.  This is the diagnostic that
+        # tells stagnation ("HV constant because zero offspring made it
+        # through") apart from "rare improvements".  Recorded into the
+        # logbook so the convergence_data.txt / summary writers can
+        # surface it later.
+        n_feasible = sum(
+            1 for ind in population if getattr(ind, "_feasible", False)
+        )
+        print(f"feasible offspring this gen = {n_feasible} / {len(population)}")
+        toolbox.logbook.bookshelf['feasible_offspring_count'][gen] = n_feasible
+
         # Snapshot the just-evaluated population for this generation.
         sigmas_per_slot     = list(sigmas_at_generate)
         parent_idx_per_slot = []
@@ -551,6 +568,13 @@ def main(experiment_type):
         file.write(f"Hypervolume per generation:\n")
         for gen in range(NGEN):
             file.write(f"Generation {gen + 1}: {toolbox.logbook.bookshelf['hypervolume'][gen]}\n")
+
+        file.write(f"\nFeasible offspring per generation (out of {LAMBDA}):\n")
+        for gen in range(NGEN):
+            file.write(
+                f"Generation {gen + 1}: "
+                f"{toolbox.logbook.bookshelf['feasible_offspring_count'][gen]}\n"
+            )
 
     # ── Hypervolume convergence plot ──────────────────────────────────────
     x_range = NGEN
