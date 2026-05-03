@@ -73,15 +73,19 @@ def constraint_function(x1, bounds):
     ind_number = x1.ind_number
     test_name = f"DEAP_tests_{ind_number}"
 
-    # Rather than os.getcwd(), I should use: 
-    # script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    starting_working_directory = os.getcwd()
-    if starting_working_directory[-1] in [f'{i}' for i in range(0, 12)]:
-        starting_working_directory = starting_working_directory[:35]
-
-    project_root = os.path.abspath(os.path.join(starting_working_directory, ".."))
-    os.chdir(project_root + '/results/PITOT3_Outputs/' + test_name)
+    # Anchor the working-directory paths on __file__ rather than on
+    # os.getcwd().  Workers chdir into PITOT3 test directories during
+    # their evaluations, so cwd is unreliable across calls in the same
+    # worker — the previous getcwd-then-string-slice hack only happened
+    # to work when the project path was exactly 35 chars long.  Using
+    # __file__ resolves the same path every call and matches where
+    # parallelization_setup() (utils.py) creates the directories:
+    # <src/>/PITOT3_Outputs/DEAP_tests_<i>.
+    starting_working_directory = os.getcwd()              # for cwd restore at exit
+    src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    target_dir = os.path.join(src_dir, "PITOT3_Outputs", test_name)
+    os.makedirs(target_dir, exist_ok=True)                # defensive: create if missing
+    os.chdir(target_dir)
 
     x = variable_untransformation(x1, bounds)
 
