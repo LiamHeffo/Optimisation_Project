@@ -335,7 +335,11 @@ def main(experiment_type):
     for ind in population:
         ind.sim_type   = sim_type
         ind.normalised = normalised
-        ind.fitness.values = toolbox.evaluate(ind)
+        fit, g = toolbox.evaluate(ind)
+        ind._g = g
+        ind._feasible = fit is not None
+        if ind._feasible:
+            ind.fitness.values = fit
 
     # ── Strategy and multiprocessing setup ────────────────────────────────
     strategy = StrategyMultiObjective(
@@ -410,19 +414,34 @@ def main(experiment_type):
                     fitnesses = toolbox.map(toolbox.evaluate, population)
 
         fixed = False
-        for i, (ind, fit) in enumerate(zip(population, fitnesses)):
+        for i, (ind, result) in enumerate(zip(population, fitnesses)):
+            fit, g = result
+            ind._g = g
+
+            if fit is None:
+                # Skipped by feasibility short-circuit.  Leave fitness
+                # unset so DEAP's selection treats this individual as
+                # invalid.  The CHT consumes ind._g to update covariance.
+                ind._feasible = False
+                continue
+
+            ind._feasible = True
             normalised_shock_speed = fit[0]
 
             if normalised_shock_speed == 1.0:
-                # Evaluation failed — substitute the parent
+                # PITOT3 / SPARK reported the failure sentinel even though
+                # the candidate was feasible — substitute the parent (same
+                # transient-failure recovery as before).
                 replacement = parents[ind.ind_number]
                 new_fitness = replacement.fitness.values
                 population[i] = replacement
                 population[i].fitness.values = new_fitness
-                # Keep ind_number consistent with the slot index in the
-                # current population (the substituted parent retained its
-                # old ind_number from the gen it was generated in).
                 population[i].ind_number = i
+                # Carry the parent's prior _g/_feasible forward if present;
+                # otherwise mark feasible (replacement was a parent in
+                # strategy.parents, so it must have been feasible).
+                population[i]._g = getattr(replacement, "_g", g)
+                population[i]._feasible = True
                 fixed = True
                 fitness_history.append(new_fitness)
             else:

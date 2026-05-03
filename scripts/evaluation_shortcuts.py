@@ -38,4 +38,8 @@ candidate.normalised = True
 candidate.ind_number = 0       # required by constraint_function for its working directory
 candidate.bounds     = bounds  # required by evaluate() → constraint/objective functions
 
-print(unnormalise_fitness(evaluate(candidate), APPROX_IDEAL, APPROX_NADIR))
+fit, g = evaluate(candidate)
+if fit is None:
+    print(f"infeasible: g = {g}")
+else:
+    print(unnormalise_fitness(fit, APPROX_IDEAL, APPROX_NADIR))

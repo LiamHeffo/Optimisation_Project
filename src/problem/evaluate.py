@@ -33,6 +33,7 @@ from problem.config import (
     base_config_dict, base_driver_dict, APPROX_IDEAL, APPROX_NADIR, BOUNDS,
 )
 from problem.transforms import variable_untransformation, normalise_fitness
+from problem.feasibility import evaluate_constraints, is_feasible
 from utils import valid
 from algorithm.penalty import ClosestValidPenalty
 
@@ -333,22 +334,47 @@ def objective_function(x, bounds):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate(x):
-    """Evaluate and normalise fitness for a single individual.
+    """Evaluate constraints and (if feasible) fitness for one individual.
 
-    Returns a tuple of three normalised objective values:
-        (normalised_delta_vs1, normalised_hold_time, normalised_impact_speed)
+    Returns
+    -------
+    (fit, g) : tuple
+        fit : tuple of three normalised objective values, or None.
+              None means the individual is infeasible and SPARK + PITOT3
+              were not run.  For the 'Penalty' sim_type, fit is always
+              not-None (penalty handler returns a degraded fitness).
+        g   : np.ndarray, the signed constraint vector (see
+              problem.feasibility).  Always returned regardless of
+              feasibility — the CHT consumes g for the covariance update.
 
-    For the 'Penalty' sim_type, infeasible individuals are handled via
-    ClosestValidPenalty.wrapper (currently incomplete — see algorithm/penalty.py).
+    Behaviour change (Phase 1 of CHT work)
+    --------------------------------------
+    Constraints are now evaluated before SPARK + PITOT3.  Infeasible
+    candidates short-circuit and never spend a heavy evaluation.  The
+    'Penalty' sim_type retains its original always-evaluate semantics.
     """
+    g = evaluate_constraints(x, x.bounds)
+
     if x.sim_type == "Penalty":
+        # Penalty mode keeps its existing behaviour: always produce a
+        # fitness, using the closest-valid penalty for box-violators.
         if valid(x):
             delta_vs = constraint_function(x, x.bounds)
             hold_time, impact_speed = objective_function(x, x.bounds)
-            return normalise_fitness((delta_vs, hold_time, impact_speed), APPROX_IDEAL, APPROX_NADIR)
+            fit = normalise_fitness(
+                (delta_vs, hold_time, impact_speed), APPROX_IDEAL, APPROX_NADIR,
+            )
         else:
-            return ClosestValidPenalty.wrapper(x)
-    else:
-        delta_vs = constraint_function(x, x.bounds)
-        hold_time, impact_speed = objective_function(x, x.bounds)
-        return normalise_fitness((delta_vs, hold_time, impact_speed), APPROX_IDEAL, APPROX_NADIR)
+            fit = ClosestValidPenalty.wrapper(x)
+        return fit, g
+
+    # Non-Penalty path: skip the heavy evaluators when infeasible.
+    if not is_feasible(g):
+        return None, g
+
+    delta_vs = constraint_function(x, x.bounds)
+    hold_time, impact_speed = objective_function(x, x.bounds)
+    fit = normalise_fitness(
+        (delta_vs, hold_time, impact_speed), APPROX_IDEAL, APPROX_NADIR,
+    )
+    return fit, g
