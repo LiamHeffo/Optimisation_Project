@@ -1,6 +1,19 @@
 # Runtime simulation outputs
 PITOT3_Outputs/
 
+# Legacy results folder (replaced by capital-R Results/, which is
+# self-ignored via Results/.gitignore).  Kept here as a safety net so
+# the dead path can never be accidentally re-tracked.
+results/
+
+# Large reference data and simulation outputs.  These were excised from
+# git history via git-filter-repo to bring the repo from 4 GB to under
+# 250 MB.  Restore from external backup if needed for local work; never
+# commit them again.
+reference/Jaiden Hodson Master's Thesis/L1D/
+reference/Jaiden Hodson Master's Thesis/jaiden-shots/
+simulations/
+
 # CEA temporary files
 thermo.inp
 thermo.lib

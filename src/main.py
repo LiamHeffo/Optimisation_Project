@@ -17,6 +17,16 @@ p4_treatment options:
     'hard_bounds_on_p4' – enforce the upper p4 bound via retransformation
     None                – no special treatment
 
+Output layout
+-------------
+Each invocation creates a fresh, numbered run folder under
+
+    <repo>/Results/<RESULTS_CATEGORY>/<RUN_PREFIX>_NNNN/
+
+with one subfolder per output type (per-gen plots, per-gen CSVs,
+convergence, summary).  Auto-numbering uses the largest existing
+NNNN + 1.
+
 Module-level setup
 ------------------
 The DEAP creator types (FitnessMulti, Individual) are registered here.
@@ -50,7 +60,16 @@ from problem.config      import (
 )
 from problem.transforms  import variable_transformation, variable_untransformation, unnormalise_fitness
 from problem.evaluate    import evaluate, set_logbook
-from plotting            import plot_objective_space
+from plotting            import (
+    plot_objective_space,
+    plot_objective_space_3d,
+    plot_objective_space_heatmap,
+)
+from results_io          import (
+    setup_run_directory,
+    setup_subfolders,
+    write_population_csv,
+)
 from utils               import parallelization_setup
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,6 +98,163 @@ pop_hypervolumes = HyperVolume(np.array((0, 0, 0)))
 normalised = True
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Output structure
+# ─────────────────────────────────────────────────────────────────────────────
+
+RESULTS_CATEGORY = "parent_value_with_recomb"
+RUN_PREFIX       = "pv_w_rec"
+SAVE_INTERVAL    = 10
+
+OUTPUT_FOLDERS = [
+    "pareto_3d",
+    "pareto_heatmap",
+    "pareto_dvs1_holdtime",
+    "pareto_dvs1_impactspeed",
+    "pareto_holdtime_impactspeed",
+    "population",
+    "convergence",
+    "summary",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Snapshot helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _hv_contributions(population, ref=np.array((0.0, 0.0, 0.0))):
+    """Per-individual HV contribution = HV(pop) − HV(pop ∖ {i}).
+
+    The HyperVolume class expects "to maximise" inputs, so we negate the
+    fitness values (which are all to-minimise) before passing them in.
+    """
+    if len(population) == 0:
+        return []
+    fits_neg = np.array([list(ind.fitness.values) for ind in population]) * -1
+    hv = HyperVolume(ref)
+    full = hv.compute(fits_neg)
+    out = []
+    for i in range(len(population)):
+        partial = hv.compute(np.delete(fits_neg, i, axis=0))
+        out.append(full - partial)
+    return out
+
+
+def _build_pop_row(ind, gen, slot_idx, sigma_used, parent_idx, hv_contribution, bounds):
+    """One CSV row for one individual."""
+    raw_vars    = variable_untransformation(ind, bounds)
+    scaled_vars = list(ind)
+    scaled_objs = list(ind.fitness.values)
+    raw_objs    = list(unnormalise_fitness(ind.fitness.values, APPROX_IDEAL, APPROX_NADIR))
+    return {
+        "generation":            gen,
+        "ind_number":            slot_idx,
+        "parent_idx":            parent_idx,
+        "chosen":                False,
+        "offspring_ind_number":  None,
+        "sigma":                 sigma_used,
+        "hv_contribution":       hv_contribution,
+        "raw_pct_he":            raw_vars[0],
+        "raw_driver_p":          raw_vars[1],
+        "raw_p4":                raw_vars[2],
+        "raw_d_throat":          raw_vars[3],
+        "raw_reservoir_p":       raw_vars[4],
+        "raw_buffer_length":     raw_vars[5],
+        "scaled_pct_he":         scaled_vars[0],
+        "scaled_driver_p":       scaled_vars[1],
+        "scaled_p4":             scaled_vars[2],
+        "scaled_d_throat":       scaled_vars[3],
+        "scaled_reservoir_p":    scaled_vars[4],
+        "scaled_buffer_length":  scaled_vars[5],
+        "raw_delta_vs1":         raw_objs[0],
+        "raw_hold_time":         raw_objs[1],
+        "raw_impact_speed":      raw_objs[2],
+        "scaled_delta_vs1":      scaled_objs[0],
+        "scaled_hold_time":      scaled_objs[1],
+        "scaled_impact_speed":   scaled_objs[2],
+    }
+
+
+def _make_snapshot(gen, population, sigmas_per_slot, parent_idx_per_slot, bounds):
+    """Build snapshot rows for one generation.
+
+    Each individual is also tagged with (_origin_gen, _snapshot_idx) so that
+    later generations can locate this row when they need to fill in the
+    'offspring_ind_number' or 'chosen' columns.
+    """
+    contributions = _hv_contributions(population)
+    rows = []
+    for i, ind in enumerate(population):
+        row = _build_pop_row(
+            ind, gen, i,
+            sigmas_per_slot[i],
+            parent_idx_per_slot[i],
+            contributions[i],
+            bounds,
+        )
+        ind._origin_gen   = gen
+        ind._snapshot_idx = i
+        rows.append(row)
+    return rows
+
+
+def _mark_chosen(gen_snapshots, chosen):
+    """Set chosen=True for every snapshot row whose individual survived
+    selection.  Idempotent — once True, stays True."""
+    for ind in chosen:
+        if hasattr(ind, '_origin_gen') and hasattr(ind, '_snapshot_idx'):
+            snap = gen_snapshots.get(ind._origin_gen)
+            if snap is not None and 0 <= ind._snapshot_idx < len(snap):
+                snap[ind._snapshot_idx]["chosen"] = True
+
+
+def _fill_offspring(gen_snapshots, parents_at_generate, offspring):
+    """Write each new offspring's ind_number into its parent's snapshot row.
+
+    Only the *first* offspring is recorded per row.  A long-surviving parent
+    that produces one offspring per generation will have its first-gen
+    offspring recorded; subsequent ones are tracked instead in any snapshot
+    that captures the parent again (e.g. via failure-substitution).
+    """
+    for off in offspring:
+        if not hasattr(off, '_ps'):
+            continue
+        tag, p_idx = off._ps
+        if tag != "o" or p_idx is None or p_idx >= len(parents_at_generate):
+            continue
+        parent = parents_at_generate[p_idx]
+        if not (hasattr(parent, '_origin_gen') and hasattr(parent, '_snapshot_idx')):
+            continue
+        snap = gen_snapshots.get(parent._origin_gen)
+        if snap is None or not (0 <= parent._snapshot_idx < len(snap)):
+            continue
+        row = snap[parent._snapshot_idx]
+        if row.get("offspring_ind_number") is None:
+            row["offspring_ind_number"] = off.ind_number
+
+
+def _save_outputs(bookshelf_gen, gen_snapshots, fitness_history, MU, folders):
+    """Write per-generation plots and population CSVs.
+
+    All known snapshots are re-written every save trigger so that lazily-
+    filled fields (chosen, offspring_ind_number) propagate to disk as the
+    information becomes available.
+    """
+    pop_dir = folders["population"]
+    for g, rows in gen_snapshots.items():
+        write_population_csv(pop_dir / f"population_gen_{g:04d}.csv", rows)
+
+    plot_objective_space(fitness_history, 'delta_vs1', 'hold_time',
+                         MU=MU, gen=bookshelf_gen, out_dir=folders["pareto_dvs1_holdtime"])
+    plot_objective_space(fitness_history, 'delta_vs1', 'impact_speed',
+                         MU=MU, gen=bookshelf_gen, out_dir=folders["pareto_dvs1_impactspeed"])
+    plot_objective_space(fitness_history, 'hold_time', 'impact_speed',
+                         MU=MU, gen=bookshelf_gen, out_dir=folders["pareto_holdtime_impactspeed"])
+    plot_objective_space_3d(fitness_history,
+                            MU=MU, gen=bookshelf_gen, out_dir=folders["pareto_3d"])
+    plot_objective_space_heatmap(fitness_history,
+                                 MU=MU, gen=bookshelf_gen, out_dir=folders["pareto_heatmap"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main evolution loop
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -89,13 +265,18 @@ def main(experiment_type):
     N           = 6
     pop_size    = experiment_type[1]
     MU, LAMBDA  = pop_size, pop_size
-    NGEN        = 10
+    NGEN        = 500
     sim_type    = experiment_type[0]
     p4_treatment = experiment_type[3]
     step_size   = experiment_type[2]
 
     print(f"Step Size = {step_size}")
-    print(f'Pop Size = {pop_size}')
+    print(f'Pop Size = {pop_size}\n')
+
+    # ── Output directory layout ───────────────────────────────────────────
+    run_dir = setup_run_directory(RESULTS_CATEGORY, RUN_PREFIX)
+    folders = setup_subfolders(run_dir, OUTPUT_FOLDERS)
+    print(f"Run directory: {run_dir}")
 
     # ── Logbook initialisation ────────────────────────────────────────────
     gen_counter = 0
@@ -170,18 +351,41 @@ def main(experiment_type):
     pool = multiprocessing.Pool()
     toolbox.register("map", pool.map)
 
-    fitness_history = []
+    # ── Snapshot bookkeeping ──────────────────────────────────────────────
+    gen_snapshots = {}
+    gen_snapshots[0] = _make_snapshot(
+        0, population,
+        sigmas_per_slot=[step_size] * MU,
+        parent_idx_per_slot=[None] * MU,
+        bounds=bounds,
+    )
+
+    # Seed fitness_history with the initial population so the "every individual
+    # ever sampled" plots include the starting points, not just offspring.
+    fitness_history = [tuple(ind.fitness.values) for ind in population]
 
     # ── Evolution ─────────────────────────────────────────────────────────
     for gen in range(NGEN):
         toolbox.logbook.bookshelf['generation'] += 1
+        bookshelf_gen = toolbox.logbook.bookshelf['generation']
         print('\n')
         print('*' * 30)
-        print(f"Generation {toolbox.logbook.bookshelf['generation']}")
+        print(f"Generation {bookshelf_gen}")
         print('*' * 30)
+
+        # Snapshot strategy state BEFORE generate(): update() mutates
+        # self.sigmas in-place, so we need a frozen view of which step size
+        # was used to mutate each parent into its offspring this generation.
+        sigmas_at_generate  = list(strategy.sigmas)
+        parents_at_generate = list(strategy.parents)
 
         parents    = population
         population = toolbox.generate()
+
+        # Each new offspring's _ps now points at its parent.  Walk back to
+        # the parent's earlier snapshot row and record the offspring's
+        # ind_number there.
+        _fill_offspring(gen_snapshots, parents_at_generate, population)
 
         i = 0
         for ind in population:
@@ -215,66 +419,60 @@ def main(experiment_type):
                 new_fitness = replacement.fitness.values
                 population[i] = replacement
                 population[i].fitness.values = new_fitness
+                # Keep ind_number consistent with the slot index in the
+                # current population (the substituted parent retained its
+                # old ind_number from the gen it was generated in).
+                population[i].ind_number = i
                 fixed = True
                 fitness_history.append(new_fitness)
             else:
                 ind.fitness.values = fit
                 fitness_history.append(fit)
 
+        # Snapshot the just-evaluated population for this generation.
+        sigmas_per_slot     = list(sigmas_at_generate)
+        parent_idx_per_slot = []
+        for ind in population:
+            if hasattr(ind, '_ps') and ind._ps[0] == "o":
+                parent_idx_per_slot.append(ind._ps[1])
+            else:
+                parent_idx_per_slot.append(None)
+        gen_snapshots[bookshelf_gen] = _make_snapshot(
+            bookshelf_gen, population,
+            sigmas_per_slot, parent_idx_per_slot, bounds,
+        )
+
         toolbox.update(population)
 
-        fitness_copy = list(fitnesses)
-        fitness_copy = [fit for fit in fitness_copy if fit[0] != 1.0]
+        # Mark every snapshot row whose individual is still in
+        # strategy.parents.  This catches both freshly-chosen offspring and
+        # surviving older parents.
+        _mark_chosen(gen_snapshots, strategy.parents)
 
-        avg_hypervolume = pop_hypervolumes.compute(np.array(fitness_copy) * -1)
-        print(f'average hypervolume = {avg_hypervolume}')
-        toolbox.logbook.bookshelf['hypervolume'][gen] = avg_hypervolume
+        # HV is computed on the elitist parent set (size = mu, constant across
+        # generations) rather than raw offspring. This removes the cardinality
+        # noise that produced the discrete-plateau jumps in the convergence trace.
+        parent_fitnesses = np.array([ind.fitness.values for ind in strategy.parents])
+        hypervolume = pop_hypervolumes.compute(parent_fitnesses * -1)
+        print(f'hypervolume = {hypervolume}')
+        toolbox.logbook.bookshelf['hypervolume'][gen] = hypervolume
 
-        # Intermediate Pareto scatter plots every 50 generations (200–750)
-        if gen % 50 == 0 and 200 <= gen <= 750:
-            starting_working_directory = os.getcwd()
-            if starting_working_directory[-1] in [f'{i}' for i in range(0, 12)]:
-                starting_working_directory = starting_working_directory[:35]
-
-            os.chdir(starting_working_directory + '/Scatter_Plots')
-            plot_objective_space(fitness_history, 'delta_vs1',  'hold_time',    MU=MU, sim_type=sim_type, gen=gen)
-            plot_objective_space(fitness_history, 'delta_vs1',  'impact_speed', MU=MU, sim_type=sim_type, gen=gen)
-            plot_objective_space(fitness_history, 'hold_time',  'impact_speed', MU=MU, sim_type=sim_type, gen=gen)
-            os.chdir(starting_working_directory)
-
-    # ── Post-processing ───────────────────────────────────────────────────
-    starting_working_directory = os.getcwd()
-    title_string = f'MOO_CMA_ES_{sim_type}'
-
-    if title_string not in os.listdir(starting_working_directory):
-        os.mkdir(title_string)
-    os.chdir(starting_working_directory + '/' + title_string)
-
-    new_working_directory = os.getcwd()
-    previous_experiment_list = [
-        d for d in os.listdir()
-        if d[:-2] == title_string
-    ]
-
-    if len(previous_experiment_list) == 0:
-        test_name = f'MOO_CMA_ES_{sim_type}_1'
-        os.mkdir(test_name)
-    else:
-        experiment_number = np.max([int(d[-1]) for d in previous_experiment_list]) + 1
-        test_name = f'MOO_CMA_ES_{sim_type}_{experiment_number}'
-        os.mkdir(test_name)
-
-    os.chdir(new_working_directory + '/' + test_name)
+        # Periodic outputs every SAVE_INTERVAL generations.
+        if bookshelf_gen % SAVE_INTERVAL == 0:
+            _save_outputs(bookshelf_gen, gen_snapshots, fitness_history, MU, folders)
 
     # ── Convergence data ──────────────────────────────────────────────────
-    with open('convergence_data.txt', 'w') as file:
+    convergence_dir = folders["convergence"]
+    summary_dir     = folders["summary"]
+
+    with open(convergence_dir / "convergence_data.txt", "w") as file:
         file.write(f"Simulation Type = {sim_type}\n")
         file.write(f"Step Size = {step_size}\n")
         file.write(f'Pop Size = {pop_size}\n')
         file.write(f'p4 treatment = {p4_treatment}\n')
         file.write(f'Number of generations = {NGEN}\n')
         file.write(f'Current Time = {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}\n')
-        file.write(f"Average Hypervolume per generation:\n")
+        file.write(f"Hypervolume per generation:\n")
         for gen in range(NGEN):
             file.write(f"Generation {gen + 1}: {toolbox.logbook.bookshelf['hypervolume'][gen]}\n")
 
@@ -291,13 +489,8 @@ def main(experiment_type):
     gen_axis = list(range(1, NGEN + 1))
     avg_hv_list = [toolbox.logbook.bookshelf['hypervolume'][g - 1] for g in gen_axis]
     plt.plot(gen_axis, avg_hv_list)
-    plt.savefig(f"convergence_{sim_type}.png")
+    plt.savefig(convergence_dir / f"convergence_{sim_type}.png")
     plt.close()
-
-    # ── Final Pareto scatter plots ────────────────────────────────────────
-    plot_objective_space(fitness_history, 'delta_vs1', 'hold_time',    MU=MU, sim_type=sim_type, gen=NGEN)
-    plot_objective_space(fitness_history, 'delta_vs1', 'impact_speed', MU=MU, sim_type=sim_type, gen=NGEN)
-    plot_objective_space(fitness_history, 'hold_time', 'impact_speed', MU=MU, sim_type=sim_type, gen=NGEN)
 
     # ── Fixer count plot (non-Penalty runs only) ──────────────────────────
     fixer_count = []
@@ -318,7 +511,7 @@ def main(experiment_type):
         plt.ylabel("Number of Individuals Fixed")
         plt.plot(generation, fixer_count)
         plt.gca().xaxis.set_major_locator(MultipleLocator(tick_interval))
-        plt.savefig(f"cma_es_mo_fpd_{sim_type}RunningTotal.png")
+        plt.savefig(summary_dir / f"cma_es_mo_fpd_{sim_type}RunningTotal.png")
         plt.close()
 
     # ── Output summary text file ──────────────────────────────────────────
@@ -345,7 +538,7 @@ def main(experiment_type):
         sep = '|' if index in [1, 3, 4] else ''
         return sep + ' ' * white_space + f'{variable}' + ' ' * white_space
 
-    with open('output.txt', 'w') as file:
+    with open(summary_dir / "output.txt", "w") as file:
         file.write(f"Simulation Type = {sim_type}\n")
         file.write(f"step size = {experiment_type[2]}\n")
         file.write(f'pop size = {pop_size}\n')
@@ -404,7 +597,11 @@ def main(experiment_type):
                 row.append(f'{obj}')
             file.write('  '.join(row) + '\n')
 
-    os.chdir(starting_working_directory)
+    # Final save catches any in-flight snapshots (e.g. when NGEN is not a
+    # multiple of SAVE_INTERVAL) and re-writes earlier CSVs with any newly
+    # available chosen / offspring data.
+    _save_outputs(toolbox.logbook.bookshelf['generation'],
+                  gen_snapshots, fitness_history, MU, folders)
 
     print('\n\nEND OF SIM')
     print('*' * 60)
