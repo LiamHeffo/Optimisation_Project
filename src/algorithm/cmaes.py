@@ -303,6 +303,117 @@ class StrategyMultiObjective(object):
         self.psucc       = [psucc[i]       if ind._ps[0] == "o" else self.psucc[ind._ps[1]]       for i, ind in enumerate(chosen)]
 
     # ─────────────────────────────────────────────────────────────────────────
+    # CHT resample loop (Chocat 2015 Algorithm 3 step 3-2)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def resample_infeasibles(self, population, feasibility_check,
+                              max_iterations=5):
+        """Iteratively shrink covariance and resample infeasible offspring.
+
+        Implements Chocat 2015 Algorithm 3 step 3-2's resample branch:
+        when a generation produces infeasible offspring, the constraint
+        violation directions are fed into the CHT covariance update,
+        which shrinks each parent's Cᵢ along those directions.  The
+        infeasible slots are then resampled from the new (tighter)
+        distribution.  Repeat until all feasible or max_iterations is
+        reached.
+
+        Each iteration's CHT operates on a *fresh* set of offspring (the
+        previous infeasibles were resampled), so there is no
+        double-counting of constraint signal across iterations.  After
+        this loop returns, update()'s post-evaluation CHT call will
+        operate on whatever infeasibles remain — also a unique signal,
+        not a re-application of the loop's data.
+
+        Parameters
+        ----------
+        population : list of Individual
+            Output of generate(): one offspring per parent (lambda_=mu).
+            Mutated in place.
+        feasibility_check : callable(ind) -> (feasible_bool, g_vector)
+            Cheap check that does NOT call SPARK / PITOT3.  Closure over
+            `bounds` provided by the caller, so the strategy stays
+            domain-agnostic about the contents of g.
+        max_iterations : int, default 5
+            Hard cap on resample passes per generation.  At λ=12 and
+            modest cht_gamma, 1–3 iterations typically suffice; the cap
+            bounds wall-clock cost in pathological cases.
+
+        Returns
+        -------
+        n_iterations : int
+            How many CHT-and-resample passes were performed before
+            either every offspring became feasible or the cap was hit.
+            Useful as a per-generation diagnostic.
+
+        Side effects
+        ------------
+        - self.A[i] and self.invCholesky[i] are mutated by each
+          iteration's CHT call (in place).
+        - Each individual in `population` has ind._g and ind._feasible
+          set on every iteration — the final values reflect the post-
+          loop state.
+        """
+        n = self.dim
+
+        # First pass: tag every offspring with feasibility info so the
+        # caller can rely on _g / _feasible regardless of whether we
+        # actually iterate.
+        for ind in population:
+            feasible, g = feasibility_check(ind)
+            ind._g = g
+            ind._feasible = feasible
+
+        for iteration in range(max_iterations):
+            infeasible_slots = [
+                i for i, ind in enumerate(population)
+                if not ind._feasible
+            ]
+            if not infeasible_slots:
+                return iteration
+
+            # Build the CHT pool from the CURRENT infeasibles.
+            infeasible_pool = [
+                (population[i]._ps[1], np.array(population[i]), population[i]._g)
+                for i in infeasible_slots
+            ]
+
+            # Snapshot parent positions and sigmas (they don't change in
+            # the loop, but _chtCovarianceUpdate expects snapshots).
+            parents_snapshot = [np.array(p) for p in self.parents]
+            sigmas_snapshot  = list(self.sigmas)
+
+            # Apply CHT to every parent's Cholesky factor.  Adaptation-B
+            # pooling: each parent learns from every infeasible across
+            # the swarm, weighted by Mahalanobis closeness.
+            for parent_idx in range(len(self.parents)):
+                self.A[parent_idx], self.invCholesky[parent_idx] = (
+                    self._chtCovarianceUpdate(
+                        self.A[parent_idx], self.invCholesky[parent_idx],
+                        parent_idx, parents_snapshot, sigmas_snapshot,
+                        infeasible_pool,
+                    )
+                )
+
+            # Resample only the infeasible slots from the now-tighter
+            # distribution.  Mutate the existing Individual objects in
+            # place so ind_number / _ps / DEAP fitness slot survive.
+            for i in infeasible_slots:
+                p_idx = population[i]._ps[1]
+                z = np.random.randn(n)
+                mutation = self.sigmas[p_idx] * np.dot(self.A[p_idx], z)
+                new_x = self.parents[p_idx] + mutation
+                for k in range(n):
+                    population[i][k] = float(new_x[k])
+                # Re-check feasibility for this slot.
+                feasible, g = feasibility_check(population[i])
+                population[i]._g = g
+                population[i]._feasible = feasible
+
+        # Cap reached; return how many iterations were spent.
+        return max_iterations
+
+    # ─────────────────────────────────────────────────────────────────────────
     # X2-specific feasibility repair (p4 pressure constraint)
     # ─────────────────────────────────────────────────────────────────────────
 

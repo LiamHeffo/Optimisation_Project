@@ -65,6 +65,7 @@ from problem.config      import (
 )
 from problem.transforms  import variable_transformation, variable_untransformation, unnormalise_fitness
 from problem.evaluate    import evaluate, set_logbook
+from problem.feasibility import evaluate_constraints, is_feasible
 from plotting            import (
     plot_objective_space,
     plot_objective_space_3d,
@@ -327,6 +328,11 @@ def main(experiment_type):
     # the feasible region so almost every offspring is rejected.  Index
     # is zero-based on generation (slot k holds gen k+1's count).
     toolbox.logbook.add("feasible_offspring_count", [0 for _ in range(1, NGEN + 1)])
+    # CovarianceCHT only: how many CHT-and-resample iterations were
+    # needed each generation before either every offspring became
+    # feasible or the cap was hit.  0 means the first batch was already
+    # all-feasible; max_iterations means the cap was reached.
+    toolbox.logbook.add("resample_iterations", [0 for _ in range(1, NGEN + 1)])
 
     # Give the evaluate module a reference to the logbook so it can update
     # counters without accessing a global toolbox.
@@ -461,6 +467,24 @@ def main(experiment_type):
             ind.bounds     = bounds
             i += 1
 
+        # CHT-and-resample loop (Chocat 2015 Algorithm 3 step 3-2): for
+        # CovarianceCHT, infeasible offspring drive a covariance shrinkage
+        # of each parent's Cholesky factor and are then resampled from
+        # the tighter distribution.  Cheap because the feasibility check
+        # does NOT call SPARK / PITOT3 — it only evaluates the constraint
+        # vector via problem.feasibility.  Mutates population in place
+        # and tags every Individual with ._g and ._feasible so the post-
+        # eval loop and update()'s post-resample CHT can both consume them.
+        if sim_type == 'CovarianceCHT':
+            def _check(ind):
+                g = evaluate_constraints(ind, bounds)
+                return is_feasible(g), g
+            n_iter = strategy.resample_infeasibles(
+                population, feasibility_check=_check, max_iterations=5,
+            )
+            print(f"resample iterations this gen = {n_iter}")
+            toolbox.logbook.bookshelf['resample_iterations'][gen] = n_iter
+
         # Retry logic for transient evaluation failures
         try:
             fitnesses = toolbox.map(toolbox.evaluate, population)
@@ -575,6 +599,14 @@ def main(experiment_type):
                 f"Generation {gen + 1}: "
                 f"{toolbox.logbook.bookshelf['feasible_offspring_count'][gen]}\n"
             )
+
+        if sim_type == 'CovarianceCHT':
+            file.write("\nCHT resample iterations per generation:\n")
+            for gen in range(NGEN):
+                file.write(
+                    f"Generation {gen + 1}: "
+                    f"{toolbox.logbook.bookshelf['resample_iterations'][gen]}\n"
+                )
 
     # ── Hypervolume convergence plot ──────────────────────────────────────
     x_range = NGEN
