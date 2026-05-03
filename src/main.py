@@ -579,8 +579,13 @@ def main(experiment_type):
     e1 = time.time()
     toolbox.logbook.bookshelf["time taken"] = e1 - s1
 
-    if sim_type != "Penalty":
-        generation = list(range(1, NGEN + 1))
+    # Skip the "cumulative fixes" plot for any sim_type that doesn't run
+    # the repair while-loop in generate().  Penalty was already excluded
+    # by name; CovarianceCHT also bypasses repair (the CHT shrinkage
+    # replaces it).  The empty-data check covers both cases and any
+    # future no-repair sim_type without needing a name list.
+    if fixer_count:
+        generation = list(range(1, len(fixer_count) + 1))
         plt.figure(dpi=800)
         plt.title("Cumulative Number of Individuals Fixed")
         plt.xlabel("Generation")
