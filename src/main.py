@@ -12,6 +12,11 @@ sim_type options:
     'ElitistCrossover' – the most hypervolume-contributing parent donates
     'RandomCrossover'  – a randomly selected parent donates
     'Penalty'          – infeasible individuals receive a fitness penalty
+    'CovarianceCHT'    – infeasibles are NOT repaired and NOT evaluated; their
+                         constraint vectors feed Chocat 2015's eigenvalue
+                         shrinkage of each parent's Cholesky factor (with
+                         Adaptation-B Mahalanobis pooling).  See
+                         StrategyMultiObjective._chtCovarianceUpdate.
 
 p4_treatment options:
     'hard_bounds_on_p4' – enforce the upper p4 bound via retransformation

@@ -7,6 +7,18 @@
 #                    'ElitistCrossover' – HV-best parent donates the violating attribute
 #                    'RandomCrossover'  – random parent donates the violating attribute
 #                    'Penalty'          – infeasible individuals receive a fitness penalty
+#                    'CovarianceCHT'    – Chocat 2015 / Arnold-Hansen 2012 covariance
+#                                          shrinkage along violation directions.
+#                                          Infeasible offspring are NOT repaired
+#                                          and NOT evaluated by SPARK / PITOT3;
+#                                          their constraint vectors feed an
+#                                          eigendecompose-shrink-rescale update
+#                                          of each parent's Cholesky factor.
+#                                          Per-parent Adaptation-B Mahalanobis
+#                                          pooling: each parent's C is updated
+#                                          from every infeasible across the swarm,
+#                                          weighted by closeness in that parent's
+#                                          metric.  See _chtCovarianceUpdate.
 #
 #   pop_size     : population size  (MU = LAMBDA = pop_size)
 #
@@ -14,7 +26,9 @@
 #
 #   p4_treatment : how to enforce the upper p4 bound after mutation
 #                    'hard_bounds_on_p4' – re-transform to stay within the physical p4 limit
-#                    null                – no special treatment
+#                    null                – no special treatment.  Mandatory for
+#                                          'CovarianceCHT' since the CHT replaces
+#                                          repair entirely.
 
 experiments:
   - sim_type: ParentValue
@@ -31,3 +45,8 @@ experiments:
     pop_size: 36
     step_size: 0.5
     p4_treatment: hard_bounds_on_p4
+
+  - sim_type: CovarianceCHT
+    pop_size: 12
+    step_size: 0.5
+    p4_treatment: null
