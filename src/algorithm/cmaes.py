@@ -80,6 +80,20 @@ class StrategyMultiObjective(object):
         print(f'self.p4_treatment = {self.p4_treatment}')
         print(f"bounds = {self.bounds}")
 
+        # Defensive: every initial parent must be feasible (have a valid
+        # fitness).  If not, _select() will filter it out, the per-parent
+        # state arrays will shrink below mu, and a subsequent generate()
+        # will IndexError on the missing slot.  Failing loudly here is
+        # vastly easier to debug than that downstream symptom.
+        for i, p in enumerate(population):
+            if not getattr(p, "_feasible", True):
+                raise ValueError(
+                    f"StrategyMultiObjective received an infeasible initial "
+                    f"parent at index {i}.  Every parent must satisfy the "
+                    f"problem's feasibility check before being passed to the "
+                    f"strategy — resample or repair it first."
+                )
+
         self.parents = population
         self.dim = len(self.parents[0])
 

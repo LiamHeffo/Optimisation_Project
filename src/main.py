@@ -298,7 +298,7 @@ def main(experiment_type):
     N           = 6
     pop_size    = experiment_type[1]
     MU, LAMBDA  = pop_size, pop_size
-    NGEN        = 500
+    NGEN        = 5
     sim_type    = experiment_type[0]
     p4_treatment = experiment_type[3]
     step_size   = experiment_type[2]
@@ -354,6 +354,30 @@ def main(experiment_type):
     i = 0
     init_pop_untransformed = pop_init(MU)
     init_pop_transformed   = variable_transformation(init_pop_untransformed, bounds)
+
+    # The strategy assumes every parent it starts with is feasible — Pareto
+    # selection later relies on every parent having a valid fitness, and
+    # length(self.parents) must equal mu so per-parent state arrays don't
+    # shrink and break later generate() calls.  pop_init enforces some
+    # constraints by construction (driver_p < reservoir_p, p4 within
+    # bounds) but not the compression-ratio range, so a small fraction
+    # (~1%) of initial individuals fail the feasibility check.  Resample
+    # any infeasible slots one at a time until the whole pop is feasible.
+    from problem.feasibility import evaluate_constraints, is_feasible
+    _MAX_RESAMPLE_ATTEMPTS = 1000
+    for slot in range(MU):
+        attempt = 0
+        while not is_feasible(evaluate_constraints(init_pop_transformed[slot], bounds)):
+            attempt += 1
+            if attempt > _MAX_RESAMPLE_ATTEMPTS:
+                raise RuntimeError(
+                    f"Could not generate a feasible initial individual for slot "
+                    f"{slot} after {_MAX_RESAMPLE_ATTEMPTS} attempts.  Check "
+                    f"that pop_init's sampling ranges are consistent with "
+                    f"problem.feasibility.evaluate_constraints."
+                )
+            # pop_init(1) returns a length-1 list; replace just this slot.
+            init_pop_transformed[slot] = variable_transformation(pop_init(1), bounds)[0]
 
     population = [creator.Individual(x) for x in init_pop_transformed]
     initial_population = population
