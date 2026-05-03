@@ -139,7 +139,11 @@ class StrategyMultiObjective(object):
                 new_individual = self.parents[i] + mutation
                 repaired = False
 
-                if self.sim_type != 'Penalty':
+                # CovarianceCHT replaces the repair while-loop: infeasible
+                # offspring pass through and feed the CHT covariance update
+                # (Phase 3).  Penalty mode also bypasses repair (its handler
+                # is in evaluate.py).
+                if self.sim_type not in ('Penalty', 'CovarianceCHT'):
                     s = time.time()
                     while True:
                         if not self.check_feasibility(new_individual)[0]:
@@ -214,12 +218,37 @@ class StrategyMultiObjective(object):
             and not getattr(ind, "_repaired", False)
         ]
 
+        # Infeasible-offspring pool for the CHT update.  Built once from
+        # the full offspring population (not 'chosen', which excludes
+        # them).  Each entry is (donor_parent_idx, x_offspring, g_vector).
+        # For non-CHT sim_types the pool is empty (all offspring are
+        # feasible by repair construction or have no _g), so the CHT
+        # call below is a no-op and existing behaviour is preserved.
+        infeasible_pool = [
+            (ind._ps[1], np.array(ind), ind._g)
+            for ind in population
+            if ind._ps[0] == "o"
+            and hasattr(ind, "_g")
+            and np.any(np.asarray(ind._g) > 0)
+        ]
+
         for i, ind in enumerate(chosen):
             t, p_idx = ind._ps
             if t == "o":
                 psucc[i] = (1.0 - cp) * psucc[i] + cp
                 sigmas[i] = sigmas[i] * np.exp((psucc[i] - ptarg) / (d * (1.0 - ptarg)))
                 print(f"sigmas: {sigmas[i]}")
+
+                # CHT covariance shrinkage (Chocat 2015) — slot in BEFORE
+                # rank-mu_succ and rank-one so subsequent updates operate
+                # on the constraint-aware geometry.  Matches Chocat
+                # Algorithm 3 step-3-2 -> step-3-4 ordering.  Only fires
+                # when the sim_type opts in AND there are infeasibles.
+                if self.sim_type == 'CovarianceCHT' and infeasible_pool:
+                    A[i], invCholesky[i] = self._chtCovarianceUpdate(
+                        A[i], invCholesky[i], p_idx,
+                        parents_snapshot, sigmas_snapshot, infeasible_pool,
+                    )
 
                 # Rank-mu_MO,succ recombination (Voss 2009): blend in
                 # information from neighbouring successful offspring before
@@ -332,15 +361,30 @@ class StrategyMultiObjective(object):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _select(self, candidates):
-        """Select mu individuals from candidates using Pareto ranking + hypervolume."""
-        if len(candidates) <= self.mu:
-            return candidates, []
+        """Select mu individuals from candidates using Pareto ranking + hypervolume.
 
-        pareto_fronts = tools.sortLogNondominated(candidates, len(candidates))
+        Infeasible candidates (those with ``_feasible == False``, set by the
+        evaluation pipeline when the constraint vector is violated and no
+        fitness was computed) are filtered out before the Pareto sort.
+        DEAP's ``tools.sortLogNondominated`` requires every individual to
+        have a valid fitness — including infeasibles would crash the sort.
+
+        Filtered infeasibles are appended directly to ``not_chosen`` so they
+        still surface to ``update()`` via the population it received, and
+        their ``_g`` vectors feed the CHT covariance update.
+        """
+        # Partition: feasibles drive selection; infeasibles bypass it.
+        feasible    = [ind for ind in candidates if getattr(ind, "_feasible", True)]
+        infeasibles = [ind for ind in candidates if not getattr(ind, "_feasible", True)]
+
+        if len(feasible) <= self.mu:
+            return feasible, infeasibles
+
+        pareto_fronts = tools.sortLogNondominated(feasible, len(feasible))
 
         chosen = []
         mid_front = None
-        not_chosen = []
+        not_chosen = list(infeasibles)
         full = False
 
         for front in pareto_fronts:
@@ -355,7 +399,7 @@ class StrategyMultiObjective(object):
         k = self.mu - len(chosen)
 
         if k > 0:
-            ref = np.array([ind.fitness.wvalues for ind in candidates]) * -1
+            ref = np.array([ind.fitness.wvalues for ind in feasible]) * -1
             ref = np.max(ref, axis=0) + 1
 
             for _ in range(len(mid_front) - k):

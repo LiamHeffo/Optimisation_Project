@@ -125,25 +125,51 @@ def _hv_contributions(population, ref=np.array((0.0, 0.0, 0.0))):
 
     The HyperVolume class expects "to maximise" inputs, so we negate the
     fitness values (which are all to-minimise) before passing them in.
+
+    Infeasible individuals (fitness.valid is False) have no fitness and
+    therefore no HV contribution; they appear in the returned list as
+    None and are omitted from the HV computation entirely.
     """
     if len(population) == 0:
         return []
-    fits_neg = np.array([list(ind.fitness.values) for ind in population]) * -1
+    feasible_idx = [i for i, ind in enumerate(population) if ind.fitness.valid]
+    if not feasible_idx:
+        return [None] * len(population)
+    fits_neg = np.array([list(population[i].fitness.values) for i in feasible_idx]) * -1
     hv = HyperVolume(ref)
     full = hv.compute(fits_neg)
-    out = []
-    for i in range(len(population)):
-        partial = hv.compute(np.delete(fits_neg, i, axis=0))
-        out.append(full - partial)
+    contribs_feasible = []
+    for k in range(len(feasible_idx)):
+        partial = hv.compute(np.delete(fits_neg, k, axis=0))
+        contribs_feasible.append(full - partial)
+    out = [None] * len(population)
+    for k, i in enumerate(feasible_idx):
+        out[i] = contribs_feasible[k]
     return out
 
 
 def _build_pop_row(ind, gen, slot_idx, sigma_used, parent_idx, hv_contribution, bounds):
-    """One CSV row for one individual."""
+    """One CSV row for one individual.
+
+    Infeasible individuals (no valid fitness) emit None for every objective
+    column so downstream analysis can distinguish "not evaluated" from a
+    real zero.  The 'feasible' and 'max_g' columns surface the constraint
+    state for post-hoc CHT diagnostics.
+    """
     raw_vars    = variable_untransformation(ind, bounds)
     scaled_vars = list(ind)
-    scaled_objs = list(ind.fitness.values)
-    raw_objs    = list(unnormalise_fitness(ind.fitness.values, APPROX_IDEAL, APPROX_NADIR))
+
+    if ind.fitness.valid:
+        scaled_objs = list(ind.fitness.values)
+        raw_objs    = list(unnormalise_fitness(ind.fitness.values, APPROX_IDEAL, APPROX_NADIR))
+    else:
+        scaled_objs = [None, None, None]
+        raw_objs    = [None, None, None]
+
+    g = getattr(ind, "_g", None)
+    feasible = getattr(ind, "_feasible", None)
+    max_g = float(np.max(g)) if g is not None else None
+
     return {
         "generation":            gen,
         "ind_number":            slot_idx,
@@ -152,6 +178,8 @@ def _build_pop_row(ind, gen, slot_idx, sigma_used, parent_idx, hv_contribution, 
         "offspring_ind_number":  None,
         "sigma":                 sigma_used,
         "hv_contribution":       hv_contribution,
+        "feasible":              feasible,
+        "max_g":                 max_g,
         "raw_pct_he":            raw_vars[0],
         "raw_driver_p":          raw_vars[1],
         "raw_p4":                raw_vars[2],
