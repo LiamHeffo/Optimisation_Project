@@ -287,6 +287,12 @@ def _save_outputs(bookshelf_gen, gen_snapshots, fitness_history, MU, folders):
     plot_objective_space_heatmap(fitness_history,
                                  MU=MU, gen=bookshelf_gen, out_dir=folders["pareto_heatmap"])
 
+    # Belt-and-braces: each plot_* function calls plt.close() but only
+    # on the current figure.  plt.close('all') guarantees no pyplot
+    # state survives a save burst, which over hundreds of generations
+    # would otherwise compound into a noticeable RSS drift.
+    plt.close('all')
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main evolution loop
@@ -299,7 +305,7 @@ def main(experiment_type):
     N           = 6
     pop_size    = experiment_type[1]
     MU, LAMBDA  = pop_size, pop_size
-    NGEN        = 5
+    NGEN        = 500
     sim_type    = experiment_type[0]
     p4_treatment = experiment_type[3]
     step_size   = experiment_type[2]
@@ -421,7 +427,21 @@ def main(experiment_type):
     toolbox.register("generate", strategy.generate, creator.Individual)
     toolbox.register("update",   strategy.update)
 
-    pool = multiprocessing.Pool()
+    # maxtasksperchild caps the number of evaluations a worker handles
+    # before the Pool kills and respawns it.  This bounds per-worker
+    # memory creep from PITOT3 / SPARK / gdtk.gas, all of which retain
+    # state across calls (Lua VMs, cached gas-model objects, GasState /
+    # Driver / Tube instances).  Without this, after a few hundred
+    # generations the workers' RSS sums up to all available system RAM
+    # and the kernel OOM-killer terminates the parent process — visible
+    # as "Killed" followed by a flood of worker BrokenPipeErrors.
+    #
+    # 50 is a balance: large enough that the worker startup cost
+    # (loading PITOT3, gdtk, etc.) doesn't dominate the per-eval cost,
+    # small enough that any single worker's heap stays bounded.  At
+    # pop_size=12, each worker handles ~4 generations before being
+    # recycled.
+    pool = multiprocessing.Pool(maxtasksperchild=50)
     toolbox.register("map", pool.map)
 
     # ── Snapshot bookkeeping ──────────────────────────────────────────────
