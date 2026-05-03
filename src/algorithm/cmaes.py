@@ -25,6 +25,7 @@ Note on X2-specific coupling:
 
 import time
 import numpy as np
+import scipy.linalg
 from deap import tools
 
 from problem.transforms import variable_untransformation
@@ -99,6 +100,12 @@ class StrategyMultiObjective(object):
         # Rank-mu_MO,succ recombination (Voss 2009).
         # d_steps controls the Mahalanobis neighbourhood radius (eq. 13–17).
         self.d_steps = params.get("d_steps", self.dim + 3)
+
+        # CHT (Chocat 2015) covariance shrinkage strength.  Analogous to
+        # beta in the (1+1)-CMA-ES paper (Arnold & Hansen 2012, Table 1):
+        # beta = 0.1 / (n + 2).  Higher values shrink more aggressively
+        # along violating directions.
+        self.cht_gamma = params.get("cht_gamma", 0.1 / (self.dim + 2.0))
 
         # Per-parent internal state
         self.sigmas      = [sigma] * len(population)
@@ -444,6 +451,190 @@ class StrategyMultiObjective(object):
             # with degenerate Z).  Skip the rank-mu step this generation.
             return A, invCholesky
         invCholesky_new = np.linalg.solve(A_new, np.eye(n))
+        return A_new, invCholesky_new
+
+    def _chtCovarianceUpdate(self, A, invCholesky, parent_idx,
+                              parents_snapshot, sigmas_snapshot,
+                              infeasible_offspring, gamma=None):
+        """Chocat 2015 CHT covariance update with Adaptation-B pooling.
+
+        For parent ``parent_idx`` with current Cholesky factor ``A``,
+        shrink the search ellipsoid along eigenvectors that point into
+        directions where infeasible offspring landed.  Hypervolume of the
+        ellipsoid is preserved by an explicit determinant rescale, so
+        only the *shape* of the search distribution changes.
+
+        Adaptation-B pooling
+        --------------------
+        Chocat assumes one global (m, C); we have per-parent (xᵢ, σᵢ, Cᵢ).
+        Each parent updates from *all* infeasible offspring across the
+        swarm, weighted by Mahalanobis closeness in this parent's metric
+        (same trick as ``_rankMuSuccUpdate``).  Distant offspring
+        contribute ~0; the parent's own offspring contributes most.
+
+        Algorithm (mapping to Chocat eq. numbers)
+        -----------------------------------------
+        1.  Eigendecompose Cᵢ = P D² Pᵀ (eq. 8–9).
+        2.  Mahalanobis pool weight per offspring: exp(-d_M / scale).
+        3.  Per-constraint rank weights wᵢⱼ from eq. 13, multiplied by the
+            pool weight.
+        4.  Eigenvalue shrinkage along violation projections (eq. 12),
+            clamped at ε·vp_i to keep S strictly positive-definite.
+        5.  Hypervolume rescale [det(C)/det(S)]^(1/n) computed in
+            log-space for numerical safety (eq. 11).
+        6.  Re-Cholesky with PSD-failure fallback (matches the existing
+            try/except pattern in _rankMuSuccUpdate).
+
+        Parameters
+        ----------
+        A, invCholesky : (n, n) ndarray
+            Current Cholesky factor of Cᵢ and its inverse.
+        parent_idx : int
+            Index of the parent whose Cholesky is being updated.
+        parents_snapshot, sigmas_snapshot : list
+            Frozen views of self.parents and self.sigmas at update-entry,
+            so values are not corrupted by mid-loop mutation.
+        infeasible_offspring : list of (donor_idx, x_offspring, g_vector)
+            Every infeasible offspring this generation, regardless of
+            which parent generated it.
+        gamma : float, optional
+            Shrinkage strength.  Defaults to self.cht_gamma.
+
+        Returns
+        -------
+        A_new, invCholesky_new : (n, n) ndarray
+            Updated Cholesky and its inverse.  Returns (A, invCholesky)
+            unchanged if there are no violators or if the update would
+            yield a non-PSD matrix.
+        """
+        n = self.dim
+        if not infeasible_offspring:
+            return A, invCholesky
+        if gamma is None:
+            gamma = self.cht_gamma
+
+        x_i = np.asarray(parents_snapshot[parent_idx], dtype=float)
+        sigma_i = sigmas_snapshot[parent_idx]
+        m = len(infeasible_offspring[0][2])      # number of constraints
+
+        # ── Step 1: eigendecompose C_i ────────────────────────────────────
+        C = A @ A.T
+        C = 0.5 * (C + C.T)                       # symmetrise for numerical safety
+        vp, P = np.linalg.eigh(C)                 # ascending eigenvalues
+        vp = np.maximum(vp, 0.0)                  # any tiny negatives -> 0
+        sqrt_vp = np.sqrt(vp)
+
+        # ── Step 2: Mahalanobis pool weight per offspring ────────────────
+        scale = np.sqrt(self.d_steps * n)
+        n_off = len(infeasible_offspring)
+        pool_w = np.zeros(n_off)
+        steps  = np.zeros((n_off, n))
+        for k, (_donor_idx, x_off, _g_off) in enumerate(infeasible_offspring):
+            x_off = np.asarray(x_off, dtype=float)
+            steps[k] = x_off - x_i
+            d_M = np.linalg.norm(invCholesky @ steps[k]) / sigma_i
+            pool_w[k] = np.exp(-d_M / scale)
+
+        # ── Steps 3–4: per-constraint shrinkage along eigenvectors ───────
+        sqrt_vp_new = sqrt_vp.copy()
+        for j in range(m):
+            # Find offspring that violate constraint j (g_off[j] > 0).
+            violators = []
+            for k, (_donor_idx, _x_off, g_off) in enumerate(infeasible_offspring):
+                gj = g_off[j]
+                # +inf marks "physical constraint short-circuited because box
+                # violated" — those still count as violations of j, but we
+                # rank by the box violation magnitude instead via pool_w.
+                if np.isfinite(gj) and gj > 0.0:
+                    violators.append((k, gj))
+                elif np.isinf(gj) and gj > 0.0:
+                    violators.append((k, np.finfo(float).max))
+
+            if not violators:
+                continue
+
+            # Sort worst-violator-first (largest g_j gets the highest rank
+            # weight w_1j per Chocat eq. 13).
+            violators.sort(key=lambda kt: -kt[1])
+            mu_cj = len(violators)
+
+            # Chocat eq. 13: w_ij = (ln(mu_cj + 1) - ln(rank+1))
+            # / (mu_cj·ln(mu_cj+1) - sum_k ln(k+1))
+            # Reduces to a logarithmically-decaying weight; sums to 1.
+            ranks = np.arange(mu_cj)
+            num   = np.log(mu_cj + 1) - np.log(ranks + 1)
+            denom = num.sum()
+            if denom <= 0:
+                continue
+            w_rank = num / denom
+
+            # Modulate by pool weight (Adaptation B): an offspring far
+            # from this parent in C_i's metric contributes less.
+            w = w_rank * np.array([pool_w[kt[0]] for kt in violators])
+            w_sum = w.sum()
+            if w_sum <= 0:
+                continue
+
+            # For each eigenvector, shrink the corresponding eigenvalue
+            # by the weighted projection of the unit step direction onto
+            # that eigenvector.
+            #
+            # Why the unit-direction normalisation
+            # ------------------------------------
+            # Chocat uses raw Proj_{e_i}[z_l - m] in their eq. 12, but
+            # they have one global (m, C) so there is no Adaptation-B
+            # pooling to worry about.  Here, with per-parent Cᵢ and pool
+            # weighting, raw projections grow linearly with step
+            # magnitude while pool_w decays only exponentially: distant
+            # offspring would dominate the update for any moderate
+            # distance, defeating the "parent learns most from its own
+            # neighbourhood" intent.  Using the unit step direction
+            # bounds projection magnitude in [0, 1] so pool_w controls
+            # the absolute contribution.  The "bigger violations get
+            # more signal" property is already captured by w_rank from
+            # eq. 13 (worst violator gets the largest rank weight).
+            for i_eig in range(n):
+                e = P[:, i_eig]
+                proj_sum = 0.0
+                for wk, (k, _gj) in zip(w, violators):
+                    step = steps[k]
+                    step_norm = np.linalg.norm(step)
+                    if step_norm < 1e-15:
+                        continue
+                    proj_sum += wk * abs(e @ step) / step_norm
+                # Numerical floor: never drive an eigenvalue below
+                # epsilon * its prior magnitude.  Without this, large
+                # projections can push sqrt_vp_new[i_eig] negative,
+                # which would make S not PSD.
+                sqrt_vp_new[i_eig] = max(
+                    sqrt_vp_new[i_eig] - gamma * proj_sum * sqrt_vp[i_eig],
+                    1e-10 * max(sqrt_vp[i_eig], 1e-30),
+                )
+
+        # If nothing changed, skip the rest.
+        if np.allclose(sqrt_vp_new, sqrt_vp):
+            return A, invCholesky
+
+        # ── Step 5: hypervolume-preserving rescale (eq. 11) ──────────────
+        vp_new = sqrt_vp_new ** 2
+        # log-space division avoids overflow / divide-by-zero when any
+        # eigenvalue is at the numerical floor.
+        eps = 1e-300
+        log_factor = (np.sum(np.log(vp + eps))
+                      - np.sum(np.log(vp_new + eps))) / n
+        S = (P * vp_new) @ P.T
+        S = 0.5 * (S + S.T)
+        C_new = np.exp(log_factor) * S
+        C_new = 0.5 * (C_new + C_new.T)
+
+        # ── Step 6: re-Cholesky with PSD-failure fallback ───────────────
+        try:
+            A_new = np.linalg.cholesky(C_new)
+        except np.linalg.LinAlgError:
+            return A, invCholesky
+        invCholesky_new = scipy.linalg.solve_triangular(
+            A_new, np.eye(n), lower=True,
+        )
         return A_new, invCholesky_new
 
     def _rankOneUpdate(self, invCholesky, A, alpha, beta, v):
