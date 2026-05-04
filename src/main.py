@@ -537,16 +537,41 @@ def main(experiment_type):
 
             if normalised_shock_speed == 1.0:
                 # PITOT3 / SPARK reported the failure sentinel even though
-                # the candidate was feasible — substitute the parent (same
-                # transient-failure recovery as before).
-                replacement = parents[ind.ind_number]
+                # the candidate passed our feasibility check.  Recover by
+                # substituting the strategy parent that this offspring
+                # was generated from.
+                #
+                # The original recovery used `parents[ind.ind_number]`
+                # (the previous generation's offspring batch), which
+                # worked when every offspring was guaranteed feasible by
+                # repair.  In CovarianceCHT mode infeasibles are kept
+                # unevaluated, so an arbitrary previous-gen offspring may
+                # have no fitness — DEAP then returns () for fitness.values
+                # and the length-3 assignment below crashes.
+                #
+                # strategy.parents are guaranteed feasible by selection,
+                # so they always have a length-3 fitness tuple.  Index
+                # via ind._ps[1] (the donor parent recorded in generate()).
+                p_idx = ind._ps[1] if hasattr(ind, "_ps") else None
+                replacement = (
+                    strategy.parents[p_idx]
+                    if (p_idx is not None
+                        and 0 <= p_idx < len(strategy.parents)
+                        and strategy.parents[p_idx].fitness.valid)
+                    else None
+                )
+                if replacement is None:
+                    # Genuine corner case: we couldn't find a feasible
+                    # replacement.  Fall back to marking this slot as
+                    # infeasible so the CHT consumes its violation info
+                    # and selection ignores it.
+                    ind._feasible = False
+                    continue
+
                 new_fitness = replacement.fitness.values
                 population[i] = replacement
                 population[i].fitness.values = new_fitness
                 population[i].ind_number = i
-                # Carry the parent's prior _g/_feasible forward if present;
-                # otherwise mark feasible (replacement was a parent in
-                # strategy.parents, so it must have been feasible).
                 population[i]._g = getattr(replacement, "_g", g)
                 population[i]._feasible = True
                 fixed = True
