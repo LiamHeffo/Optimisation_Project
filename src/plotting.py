@@ -61,7 +61,7 @@ def plot_objective_space(fitness_history, obj1, obj2, **kwargs):
     out_dir    = kwargs.get('out_dir',     None)
 
     if obj1 == 'delta_vs1' and obj2 == 'hold_time':
-        plt.figure(dpi=800)
+        plt.figure(dpi=200)
         plt.title("Pareto Frontier")
         plt.xlabel("Normalised Residual of Shock Speed")
         plt.ylabel("Normalised Hold Time")
@@ -83,7 +83,7 @@ def plot_objective_space(fitness_history, obj1, obj2, **kwargs):
         plt.close()
 
     elif obj1 == 'delta_vs1' and obj2 == 'impact_speed':
-        plt.figure(dpi=800)
+        plt.figure(dpi=200)
         plt.title("Pareto Frontier")
         plt.xlabel("Normalised Residual of Shock Speed")
         plt.ylabel("Normalised Impact Speed")
@@ -105,7 +105,7 @@ def plot_objective_space(fitness_history, obj1, obj2, **kwargs):
         plt.close()
 
     elif obj1 == 'hold_time' and obj2 == 'impact_speed':
-        plt.figure(dpi=800)
+        plt.figure(dpi=200)
         plt.title("Pareto Frontier")
         plt.xlabel("Normalised Hold Time")
         plt.ylabel("Normalised Impact Speed")
@@ -158,7 +158,9 @@ def plot_objective_space_3d(fitness_history, **kwargs):
     hold_time_history    = [entry[1] for entry in fitness_history]
     impact_speed_history = [entry[2] for entry in fitness_history]
 
-    fig = plt.figure(dpi=800)
+    fig = plt.figure(dpi=200)  # paper-quality is dpi 300+, but per-gen plots
+    # are regenerated 100s of times in long runs so memory cost matters; bump
+    # this up if you need higher fidelity for a specific publication figure.
     ax  = fig.add_subplot(111, projection='3d')
     ax.set_title("Pareto Frontier (3D)")
     ax.set_xlabel("Normalised Residual of Shock Speed")
@@ -213,7 +215,7 @@ def plot_objective_space_heatmap(fitness_history, **kwargs):
     hold_time_history    = np.array([entry[1] for entry in fitness_history])
     impact_speed_history = np.array([entry[2] for entry in fitness_history])
 
-    plt.figure(dpi=800)
+    plt.figure(dpi=200)
     plt.title("Pareto Frontier (Hold Time vs Impact Speed, coloured by Shock Speed)")
     plt.xlabel("Normalised Hold Time")
     plt.ylabel("Normalised Impact Speed")

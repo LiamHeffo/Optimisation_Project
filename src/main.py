@@ -40,8 +40,10 @@ so it must run exactly once per process.  Both this file and
 evaluation_shortcuts.py rely on those types being registered.
 """
 
+import gc
 import os
 import pathlib
+import resource
 import time
 import multiprocessing
 import yaml
@@ -622,6 +624,18 @@ def main(experiment_type):
         # Periodic outputs every SAVE_INTERVAL generations.
         if bookshelf_gen % SAVE_INTERVAL == 0:
             _save_outputs(bookshelf_gen, gen_snapshots, fitness_history, MU, folders)
+            # Force a full GC pass: matplotlib's render buffers and the
+            # transient numpy arrays in the CHT covariance update can
+            # accumulate as uncollected garbage between gc cycles, and
+            # over hundreds of generations that drift adds up to hundreds
+            # of MB.  Doing this just after each save burst is the
+            # natural pause point in the loop.
+            gc.collect()
+            # Surface RSS for this Python process so memory growth is
+            # visible in real time, not only after an OOM.  ru_maxrss is
+            # in KiB on Linux.
+            rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            print(f"parent RSS (peak) = {rss_mb:.1f} MB")
 
     # ── Convergence data ──────────────────────────────────────────────────
     convergence_dir = folders["convergence"]
@@ -657,7 +671,7 @@ def main(experiment_type):
     x_range = NGEN
     tick_interval = x_range / 5
 
-    plt.figure(dpi=800)
+    plt.figure(dpi=200)
     plt.title("Convergence")
     plt.xlabel("Generation")
     plt.ylabel("Hypervolume")
@@ -687,7 +701,7 @@ def main(experiment_type):
     # future no-repair sim_type without needing a name list.
     if fixer_count:
         generation = list(range(1, len(fixer_count) + 1))
-        plt.figure(dpi=800)
+        plt.figure(dpi=200)
         plt.title("Cumulative Number of Individuals Fixed")
         plt.xlabel("Generation")
         plt.ylabel("Number of Individuals Fixed")
