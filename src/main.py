@@ -44,6 +44,8 @@ import gc
 import os
 import pathlib
 import resource
+import subprocess
+import sys
 import time
 import multiprocessing
 import yaml
@@ -820,5 +822,39 @@ if __name__ == "__main__":
         for exp in _config["experiments"]
     ]
 
-    for experiment_type in experiment_types:
-        solutions = main(experiment_type)
+    if "--experiment-index" in sys.argv:
+        # ── Worker mode ───────────────────────────────────────────────────
+        # This branch runs when the dispatcher below launched us as a child
+        # subprocess.  We execute exactly one experiment and then exit,
+        # letting the OS reclaim every byte of RAM the run accumulated.
+        idx = int(sys.argv[sys.argv.index("--experiment-index") + 1])
+        solutions = main(experiment_types[idx])
+
+    else:
+        # ── Dispatcher mode ───────────────────────────────────────────────
+        # Run each experiment in a fresh Python interpreter so that memory
+        # (PITOT3 Lua VMs, matplotlib caches, gdtk gas-model objects, the
+        # multiprocessing worker pool) is fully reclaimed between experiments.
+        # Without this, successive runs in the same process accumulate RSS
+        # until the kernel OOM-kills the parent (~3× slowdown by run 4).
+        #
+        # sys.executable   — same interpreter that is running this script,
+        #                    so virtual-environment / conda paths are preserved.
+        # Path(__file__).resolve() — absolute path to main.py, works
+        #                    regardless of the working directory the user
+        #                    invoked us from.
+        _script = pathlib.Path(__file__).resolve()
+
+        for i, experiment_type in enumerate(experiment_types):
+            print(f"\n{'=' * 60}")
+            print(f"Experiment {i + 1} / {len(experiment_types)}: {experiment_type}")
+            print(f"{'=' * 60}\n")
+            result = subprocess.run(
+                [sys.executable, str(_script), "--experiment-index", str(i)],
+                check=False,           # don't raise — report and continue
+            )
+            if result.returncode != 0:
+                print(
+                    f"\nWARNING: experiment {i + 1} exited with code "
+                    f"{result.returncode}.  Continuing with the next one.\n"
+                )
