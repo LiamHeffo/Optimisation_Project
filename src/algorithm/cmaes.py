@@ -131,6 +131,12 @@ class StrategyMultiObjective(object):
         self.indicator = params.get("indicator", tools.hypervolume)
         self.time_spent_fixing = 0
 
+        # CHT diagnostics: per-call records appended by _chtCovarianceUpdate
+        # and drained by main.py once per generation.  Each entry is one dict
+        # describing one (parent_idx, phase) invocation.  See
+        # _chtCovarianceUpdate for the schema.
+        self.cht_diag_buffer = []
+
     # ─────────────────────────────────────────────────────────────────────────
     # Public interface
     # ─────────────────────────────────────────────────────────────────────────
@@ -262,6 +268,7 @@ class StrategyMultiObjective(object):
                     A[i], invCholesky[i] = self._chtCovarianceUpdate(
                         A[i], invCholesky[i], p_idx,
                         parents_snapshot, sigmas_snapshot, infeasible_pool,
+                        diag_phase="post_eval",
                     )
 
                 # Rank-mu_MO,succ recombination (Voss 2009): blend in
@@ -392,6 +399,7 @@ class StrategyMultiObjective(object):
                         self.A[parent_idx], self.invCholesky[parent_idx],
                         parent_idx, parents_snapshot, sigmas_snapshot,
                         infeasible_pool,
+                        diag_phase=f"resample_iter_{iteration}",
                     )
                 )
 
@@ -624,7 +632,8 @@ class StrategyMultiObjective(object):
 
     def _chtCovarianceUpdate(self, A, invCholesky, parent_idx,
                               parents_snapshot, sigmas_snapshot,
-                              infeasible_offspring, gamma=None):
+                              infeasible_offspring, gamma=None,
+                              diag_phase=None):
         """Chocat 2015 CHT covariance update with Adaptation-B pooling.
 
         For parent ``parent_idx`` with current Cholesky factor ``A``,
@@ -678,6 +687,9 @@ class StrategyMultiObjective(object):
         """
         n = self.dim
         if not infeasible_offspring:
+            # No work to do; emit a no-op record so the per-gen totals stay
+            # honest about how often CHT was called with an empty pool.
+            self._record_cht_diag(parent_idx, diag_phase, n_violators=0)
             return A, invCholesky
         if gamma is None:
             gamma = self.cht_gamma
@@ -692,6 +704,10 @@ class StrategyMultiObjective(object):
         vp, P = np.linalg.eigh(C)                 # ascending eigenvalues
         vp = np.maximum(vp, 0.0)                  # any tiny negatives -> 0
         sqrt_vp = np.sqrt(vp)
+        # Snapshot pre-update spectrum for the diagnostics record.  np.eigh
+        # returns eigenvalues ascending, so vp[-1] is largest.
+        vp_before  = vp.copy()
+        principal_axis_before = P[:, -1].copy()
 
         # ── Step 2: Mahalanobis pool weight per offspring ────────────────
         scale = np.sqrt(self.d_steps * n)
@@ -706,6 +722,7 @@ class StrategyMultiObjective(object):
 
         # ── Steps 3–4: per-constraint shrinkage along eigenvectors ───────
         sqrt_vp_new = sqrt_vp.copy()
+        per_constraint_active_count = [0] * m   # diagnostic: who drove shrinkage
         for j in range(m):
             # Find offspring that violate constraint j (g_off[j] > 0).
             violators = []
@@ -719,6 +736,7 @@ class StrategyMultiObjective(object):
                 elif np.isinf(gj) and gj > 0.0:
                     violators.append((k, np.finfo(float).max))
 
+            per_constraint_active_count[j] = len(violators)
             if not violators:
                 continue
 
@@ -780,8 +798,19 @@ class StrategyMultiObjective(object):
                     1e-10 * max(sqrt_vp[i_eig], 1e-30),
                 )
 
-        # If nothing changed, skip the rest.
+        # If nothing changed, skip the rest.  Still record a diag entry so
+        # we can see how often shrinkage was a no-op.
         if np.allclose(sqrt_vp_new, sqrt_vp):
+            self._record_cht_diag(
+                parent_idx, diag_phase,
+                n_violators=n_off,
+                vp_before=vp_before, vp_after=vp_before,
+                principal_axis_before=principal_axis_before,
+                principal_axis_after=principal_axis_before,
+                pool_w=pool_w, steps=steps, infeasible_offspring=infeasible_offspring,
+                per_constraint_active_count=per_constraint_active_count,
+                shrink_applied=False, psd_fallback=False,
+            )
             return A, invCholesky
 
         # ── Step 5: hypervolume-preserving rescale (eq. 11) ──────────────
@@ -800,11 +829,120 @@ class StrategyMultiObjective(object):
         try:
             A_new = np.linalg.cholesky(C_new)
         except np.linalg.LinAlgError:
+            self._record_cht_diag(
+                parent_idx, diag_phase,
+                n_violators=n_off,
+                vp_before=vp_before, vp_after=vp_before,
+                principal_axis_before=principal_axis_before,
+                principal_axis_after=principal_axis_before,
+                pool_w=pool_w, steps=steps, infeasible_offspring=infeasible_offspring,
+                per_constraint_active_count=per_constraint_active_count,
+                shrink_applied=False, psd_fallback=True,
+            )
             return A, invCholesky
         invCholesky_new = scipy.linalg.solve_triangular(
             A_new, np.eye(n), lower=True,
         )
+
+        # Post-update spectrum (the rescaled C_new) for the diag record.
+        vp_after, P_after = np.linalg.eigh(C_new)
+        vp_after = np.maximum(vp_after, 0.0)
+        principal_axis_after = P_after[:, -1]
+
+        self._record_cht_diag(
+            parent_idx, diag_phase,
+            n_violators=n_off,
+            vp_before=vp_before, vp_after=vp_after,
+            principal_axis_before=principal_axis_before,
+            principal_axis_after=principal_axis_after,
+            pool_w=pool_w, steps=steps, infeasible_offspring=infeasible_offspring,
+            per_constraint_active_count=per_constraint_active_count,
+            shrink_applied=True, psd_fallback=False,
+        )
         return A_new, invCholesky_new
+
+    def _record_cht_diag(self, parent_idx, phase, n_violators,
+                          vp_before=None, vp_after=None,
+                          principal_axis_before=None, principal_axis_after=None,
+                          pool_w=None, steps=None, infeasible_offspring=None,
+                          per_constraint_active_count=None,
+                          shrink_applied=False, psd_fallback=False):
+        """Append one CHT diagnostic record to ``self.cht_diag_buffer``.
+
+        Computes the derived Tier 1 / Tier 2 quantities (log-det,
+        condition number, mean violation direction, principal-axis vs
+        violation-direction angle) from the raw inputs.  Centralising the
+        derivation here keeps the algebra in one place and the
+        _chtCovarianceUpdate body readable.
+
+        All array inputs are stored as plain Python lists so the buffer
+        is JSON/CSV-friendly.
+        """
+        eps = 1e-300
+
+        def _safe_logdet(vp):
+            return float(np.sum(np.log(np.maximum(vp, eps)))) if vp is not None else None
+
+        def _cond(vp):
+            if vp is None or len(vp) == 0:
+                return None
+            vmax = float(np.max(vp))
+            vmin = float(np.min(vp[vp > 0])) if np.any(vp > 0) else eps
+            return vmax / max(vmin, eps)
+
+        # Mean violation direction: weighted average of unit step vectors,
+        # weighted by pool_w * max(g_off).  Captures "which direction did
+        # the violations come from" so we can compare against the
+        # post-CHT principal axis (Tier 2 mechanism check).
+        mean_violation_direction = None
+        violation_axis_angle_deg = None
+        effective_pool_weight = None
+        if (pool_w is not None and steps is not None
+                and infeasible_offspring is not None and len(steps) > 0):
+            effective_pool_weight = float(np.mean(pool_w))
+            v_acc = np.zeros(self.dim)
+            for k, (_donor_idx, _x_off, g_off) in enumerate(infeasible_offspring):
+                step = steps[k]
+                norm = np.linalg.norm(step)
+                if norm < 1e-15:
+                    continue
+                # Severity: largest finite violation, fall back to 1.0 if
+                # only +inf box-violations are present.
+                finite_g = [g for g in g_off if np.isfinite(g) and g > 0]
+                severity = max(finite_g) if finite_g else 1.0
+                v_acc += pool_w[k] * severity * (step / norm)
+            v_norm = np.linalg.norm(v_acc)
+            if v_norm > 1e-15:
+                mean_violation_direction = (v_acc / v_norm).tolist()
+                if principal_axis_after is not None:
+                    cos_t = float(np.clip(
+                        np.abs(np.dot(v_acc / v_norm, principal_axis_after)),
+                        0.0, 1.0,
+                    ))
+                    violation_axis_angle_deg = float(np.degrees(np.arccos(cos_t)))
+
+        rec = {
+            "phase":                   phase,
+            "parent_idx":              int(parent_idx),
+            "n_violators":             int(n_violators),
+            "shrink_applied":          bool(shrink_applied),
+            "psd_fallback":            bool(psd_fallback),
+            "log_det_C_before":        _safe_logdet(vp_before),
+            "log_det_C_after":         _safe_logdet(vp_after),
+            "condition_number_before": _cond(vp_before),
+            "condition_number_after":  _cond(vp_after),
+            "min_eigenvalue_after":    float(np.min(vp_after)) if vp_after is not None else None,
+            "max_eigenvalue_after":    float(np.max(vp_after)) if vp_after is not None else None,
+            "eigenvalues_before":      vp_before.tolist() if vp_before is not None else None,
+            "eigenvalues_after":       vp_after.tolist()  if vp_after  is not None else None,
+            "principal_axis_before":   principal_axis_before.tolist() if principal_axis_before is not None else None,
+            "principal_axis_after":    principal_axis_after.tolist()  if principal_axis_after  is not None else None,
+            "mean_violation_direction": mean_violation_direction,
+            "violation_axis_angle_deg": violation_axis_angle_deg,
+            "effective_pool_weight":   effective_pool_weight,
+            "per_constraint_active_count": list(per_constraint_active_count) if per_constraint_active_count is not None else None,
+        }
+        self.cht_diag_buffer.append(rec)
 
     def _rankOneUpdate(self, invCholesky, A, alpha, beta, v):
         """Rank-one update of the Cholesky factor and its inverse."""

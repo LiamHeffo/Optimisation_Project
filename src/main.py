@@ -80,6 +80,8 @@ from results_io          import (
     setup_subfolders,
     write_population_csv,
 )
+from cht_diagnostics     import drain_and_persist as _cht_drain_and_persist
+from cht_diagnostics     import plot_cht_diagnostics as _cht_plot
 from utils               import parallelization_setup
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -124,6 +126,9 @@ OUTPUT_FOLDERS = [
     "population",
     "convergence",
     "summary",
+    # CHT diagnostics (CSVs + per-SAVE_INTERVAL summary plots).  Created
+    # for every run; only populated when sim_type == 'CovarianceCHT'.
+    "cht_diagnostics",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -610,6 +615,21 @@ def main(experiment_type):
 
         toolbox.update(population)
 
+        # Drain CHT diagnostics for this generation.  Must happen AFTER
+        # update(), because update()'s post-eval CHT pass also appends to
+        # the buffer.  drain_and_persist clears the buffer in place, so
+        # next generation starts clean.  Cheap when sim_type isn't
+        # CovarianceCHT (buffer is always empty).
+        if sim_type == 'CovarianceCHT':
+            _cht_drain_and_persist(
+                strategy,
+                gen=bookshelf_gen,
+                out_dir=folders["cht_diagnostics"],
+                n_resample_iterations=toolbox.logbook.bookshelf['resample_iterations'][gen],
+                n_infeasible_post_resample=(LAMBDA - n_feasible),
+                n_lambda=LAMBDA,
+            )
+
         # Mark every snapshot row whose individual is still in
         # strategy.parents.  This catches both freshly-chosen offspring and
         # surviving older parents.
@@ -626,6 +646,8 @@ def main(experiment_type):
         # Periodic outputs every SAVE_INTERVAL generations.
         if bookshelf_gen % SAVE_INTERVAL == 0:
             _save_outputs(bookshelf_gen, gen_snapshots, fitness_history, MU, folders)
+            if sim_type == 'CovarianceCHT':
+                _cht_plot(folders["cht_diagnostics"], current_gen=bookshelf_gen)
             # Force a full GC pass: matplotlib's render buffers and the
             # transient numpy arrays in the CHT covariance update can
             # accumulate as uncollected garbage between gc cycles, and
