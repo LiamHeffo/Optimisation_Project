@@ -18,11 +18,21 @@ level _logbook variable.  Call set_logbook(logbook) from main.py after the
 Toolbox is constructed.
 """
 
+import contextlib
 import os
+import sys
 import yaml
 import numpy as np
 
 import spark
+
+
+# SPARK's sim.run() prints a "t_hold = ..." line per evaluation, which
+# floods the terminal at λ ~ 12 × hundreds of generations.  We silence
+# its stdout below.  stderr is left untouched so real errors still
+# surface, and the genuine exception-handler print() inside
+# objective_function() is routed to stderr explicitly.
+_DEVNULL = open(os.devnull, "w")
 from gdtk.gas import GasModel, GasState
 from pitot3_utils.pitot3_classes import (
     Facility, Driver, Tube,
@@ -318,12 +328,15 @@ def objective_function(x, bounds):
     diaphragm_rupture_flag = False
     impact_flag = False
     try:
-        sim.run()
+        with contextlib.redirect_stdout(_DEVNULL):
+            sim.run()
         diaphragm_rupture_flag = sim.flags.diaphragm_ruptured
         impact_flag = sim.flags.impact_occurred
     except Exception as e:
-        print(f"{e}")
-        print(f"x = {x}")
+        # Route to stderr so real failures aren't swallowed by the
+        # stdout redirect above.
+        print(f"{e}", file=sys.stderr)
+        print(f"x = {x}", file=sys.stderr)
 
     if diaphragm_rupture_flag and impact_flag:
         t_hold = sim.t_hold

@@ -129,6 +129,10 @@ OUTPUT_FOLDERS = [
     # CHT diagnostics (CSVs + per-SAVE_INTERVAL summary plots).  Created
     # for every run; only populated when sim_type == 'CovarianceCHT'.
     "cht_diagnostics",
+    # Per-generation strategy state (σ and psucc per parent slot).
+    # Populated for ALL sim_types so the σ death-spiral hypothesis
+    # can be verified independently of constraint-handling choice.
+    "strategy_diagnostics",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -301,6 +305,63 @@ def _save_outputs(bookshelf_gen, gen_snapshots, fitness_history, MU, folders):
     # state survives a save burst, which over hundreds of generations
     # would otherwise compound into a noticeable RSS drift.
     plt.close('all')
+
+
+def _append_strategy_per_gen_row(out_dir, gen, strategy):
+    """Append one row of σ, psucc and lineage state to strategy_per_gen.csv.
+
+    Called once per generation immediately after toolbox.update(), so
+    self.sigmas / self.psucc reflect the post-update parent set (i.e.
+    the parents that will seed the *next* generate() call).
+
+    Schema: generation, mu, summary stats (mean/min/max for σ and
+    psucc), then per-slot lineage_<i>, sigma_<i>, psucc_<i>.  μ is
+    constant within a run, so the header is fixed at first write.
+    """
+    import csv
+    from pathlib import Path
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "strategy_per_gen.csv"
+
+    sigmas = list(strategy.sigmas)
+    psucc  = list(strategy.psucc)
+    mu     = len(sigmas)
+    lineage_ids = [
+        getattr(p, "_lineage_id", None) for p in strategy.parents
+    ]
+
+    fieldnames = (
+        ["generation", "mu",
+         "mean_sigma", "min_sigma", "max_sigma",
+         "mean_psucc", "min_psucc", "max_psucc"]
+        + [f"lineage_{i}" for i in range(mu)]
+        + [f"sigma_{i}"   for i in range(mu)]
+        + [f"psucc_{i}"   for i in range(mu)]
+    )
+
+    row = {
+        "generation": gen,
+        "mu":         mu,
+        "mean_sigma": float(np.mean(sigmas)),
+        "min_sigma":  float(np.min(sigmas)),
+        "max_sigma":  float(np.max(sigmas)),
+        "mean_psucc": float(np.mean(psucc)),
+        "min_psucc":  float(np.min(psucc)),
+        "max_psucc":  float(np.max(psucc)),
+    }
+    for i in range(mu):
+        row[f"lineage_{i}"] = lineage_ids[i]
+        row[f"sigma_{i}"]   = float(sigmas[i])
+        row[f"psucc_{i}"]   = float(psucc[i])
+
+    is_new = not csv_path.exists()
+    with csv_path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if is_new:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -615,6 +676,16 @@ def main(experiment_type):
 
         toolbox.update(population)
 
+        # Persist post-update strategy state (σ, psucc, lineage per slot)
+        # for every sim_type.  Cheap (~one CSV row per gen) and lets us
+        # see the σ trajectory directly — needed to test the
+        # death-spiral hypothesis from the CHT analysis.
+        _append_strategy_per_gen_row(
+            folders["strategy_diagnostics"],
+            gen=bookshelf_gen,
+            strategy=strategy,
+        )
+
         # Drain CHT diagnostics for this generation.  Must happen AFTER
         # update(), because update()'s post-eval CHT pass also appends to
         # the buffer.  drain_and_persist clears the buffer in place, so
@@ -646,6 +717,10 @@ def main(experiment_type):
         # Periodic outputs every SAVE_INTERVAL generations.
         if bookshelf_gen % SAVE_INTERVAL == 0:
             _save_outputs(bookshelf_gen, gen_snapshots, fitness_history, MU, folders)
+            # Refresh the CHT diagnostic figure from the CSVs the drain
+            # block has been appending to every generation.  The plot is
+            # stateless (read-from-disk), so this is a pure side-effect
+            # that doesn't need to share state with the main loop.
             if sim_type == 'CovarianceCHT':
                 _cht_plot(folders["cht_diagnostics"], current_gen=bookshelf_gen)
             # Force a full GC pass: matplotlib's render buffers and the

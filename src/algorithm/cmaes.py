@@ -137,6 +137,15 @@ class StrategyMultiObjective(object):
         # _chtCovarianceUpdate for the schema.
         self.cht_diag_buffer = []
 
+        # Lineage tracking: each individual carries a stable, monotonically
+        # increasing ID from the moment it is created.  Plotting per-lineage
+        # gives smooth trajectories that end when the lineage is displaced
+        # by selection — vastly more interpretable than per-slot trajectories
+        # which silently switch identities at every reassignment event.
+        for i, p in enumerate(self.parents):
+            p._lineage_id = i
+        self._next_lineage_id = len(self.parents)
+
     # ─────────────────────────────────────────────────────────────────────────
     # Public interface
     # ─────────────────────────────────────────────────────────────────────────
@@ -191,6 +200,8 @@ class StrategyMultiObjective(object):
                 individuals.append(ind_init(new_individual))
                 individuals[-1]._ps = "o", i
                 individuals[-1]._repaired = repaired
+                individuals[-1]._lineage_id = self._next_lineage_id
+                self._next_lineage_id += 1
 
         else:
             # Random-parent variant: pick parents from the first Pareto front
@@ -206,6 +217,8 @@ class StrategyMultiObjective(object):
                 )
                 individuals[-1]._ps = "o", p_idx
                 individuals[-1]._repaired = False
+                individuals[-1]._lineage_id = self._next_lineage_id
+                self._next_lineage_id += 1
 
         return individuals
 
@@ -257,7 +270,9 @@ class StrategyMultiObjective(object):
             if t == "o":
                 psucc[i] = (1.0 - cp) * psucc[i] + cp
                 sigmas[i] = sigmas[i] * np.exp((psucc[i] - ptarg) / (d * (1.0 - ptarg)))
-                print(f"sigmas: {sigmas[i]}")
+                # σ is now logged per-generation to strategy_per_gen.csv;
+                # see _append_strategy_per_gen_row in main.py.
+                # print(f"sigmas: {sigmas[i]}")
 
                 # CHT covariance shrinkage (Chocat 2015) — slot in BEFORE
                 # rank-mu_succ and rank-one so subsequent updates operate
@@ -265,10 +280,14 @@ class StrategyMultiObjective(object):
                 # Algorithm 3 step-3-2 -> step-3-4 ordering.  Only fires
                 # when the sim_type opts in AND there are infeasibles.
                 if self.sim_type == 'CovarianceCHT' and infeasible_pool:
+                    # The C being updated belongs to chosen[i] — the new
+                    # occupant of slot i.  Record by *its* lineage so the
+                    # diagnostic trace tracks the right individual.
                     A[i], invCholesky[i] = self._chtCovarianceUpdate(
                         A[i], invCholesky[i], p_idx,
                         parents_snapshot, sigmas_snapshot, infeasible_pool,
                         diag_phase="post_eval",
+                        lineage_id=getattr(ind, "_lineage_id", None),
                     )
 
                 # Rank-mu_MO,succ recombination (Voss 2009): blend in
@@ -400,6 +419,9 @@ class StrategyMultiObjective(object):
                         parent_idx, parents_snapshot, sigmas_snapshot,
                         infeasible_pool,
                         diag_phase=f"resample_iter_{iteration}",
+                        lineage_id=getattr(
+                            self.parents[parent_idx], "_lineage_id", None,
+                        ),
                     )
                 )
 
@@ -633,7 +655,7 @@ class StrategyMultiObjective(object):
     def _chtCovarianceUpdate(self, A, invCholesky, parent_idx,
                               parents_snapshot, sigmas_snapshot,
                               infeasible_offspring, gamma=None,
-                              diag_phase=None):
+                              diag_phase=None, lineage_id=None):
         """Chocat 2015 CHT covariance update with Adaptation-B pooling.
 
         For parent ``parent_idx`` with current Cholesky factor ``A``,
@@ -689,7 +711,8 @@ class StrategyMultiObjective(object):
         if not infeasible_offspring:
             # No work to do; emit a no-op record so the per-gen totals stay
             # honest about how often CHT was called with an empty pool.
-            self._record_cht_diag(parent_idx, diag_phase, n_violators=0)
+            self._record_cht_diag(parent_idx, diag_phase, n_violators=0,
+                                   lineage_id=lineage_id)
             return A, invCholesky
         if gamma is None:
             gamma = self.cht_gamma
@@ -725,16 +748,25 @@ class StrategyMultiObjective(object):
         per_constraint_active_count = [0] * m   # diagnostic: who drove shrinkage
         for j in range(m):
             # Find offspring that violate constraint j (g_off[j] > 0).
+            #
+            # Note on +inf entries: src/problem/feasibility.py sets the
+            # six physical-space constraints (j=0..5) to +inf whenever
+            # ANY box bound is violated, because the un-transformation
+            # has driver_p-coupled divisions that aren't well-defined
+            # outside the box.  An earlier version of this loop treated
+            # those +inf entries as genuine violations of j=0..5, which
+            # caused the SAME box-violating offspring's step direction
+            # to be shrunk seven times (once for each cascaded j=0..5
+            # entry plus once for the actual box constraint), producing
+            # ~5x over-shrinkage of the corresponding eigenvalue.  The
+            # actual box constraint already carries the directional
+            # signal — we don't need the cascade to amplify it — so we
+            # skip +inf entries.
             violators = []
             for k, (_donor_idx, _x_off, g_off) in enumerate(infeasible_offspring):
                 gj = g_off[j]
-                # +inf marks "physical constraint short-circuited because box
-                # violated" — those still count as violations of j, but we
-                # rank by the box violation magnitude instead via pool_w.
                 if np.isfinite(gj) and gj > 0.0:
                     violators.append((k, gj))
-                elif np.isinf(gj) and gj > 0.0:
-                    violators.append((k, np.finfo(float).max))
 
             per_constraint_active_count[j] = len(violators)
             if not violators:
@@ -810,6 +842,7 @@ class StrategyMultiObjective(object):
                 pool_w=pool_w, steps=steps, infeasible_offspring=infeasible_offspring,
                 per_constraint_active_count=per_constraint_active_count,
                 shrink_applied=False, psd_fallback=False,
+                lineage_id=lineage_id,
             )
             return A, invCholesky
 
@@ -838,6 +871,7 @@ class StrategyMultiObjective(object):
                 pool_w=pool_w, steps=steps, infeasible_offspring=infeasible_offspring,
                 per_constraint_active_count=per_constraint_active_count,
                 shrink_applied=False, psd_fallback=True,
+                lineage_id=lineage_id,
             )
             return A, invCholesky
         invCholesky_new = scipy.linalg.solve_triangular(
@@ -858,6 +892,7 @@ class StrategyMultiObjective(object):
             pool_w=pool_w, steps=steps, infeasible_offspring=infeasible_offspring,
             per_constraint_active_count=per_constraint_active_count,
             shrink_applied=True, psd_fallback=False,
+            lineage_id=lineage_id,
         )
         return A_new, invCholesky_new
 
@@ -866,7 +901,8 @@ class StrategyMultiObjective(object):
                           principal_axis_before=None, principal_axis_after=None,
                           pool_w=None, steps=None, infeasible_offspring=None,
                           per_constraint_active_count=None,
-                          shrink_applied=False, psd_fallback=False):
+                          shrink_applied=False, psd_fallback=False,
+                          lineage_id=None):
         """Append one CHT diagnostic record to ``self.cht_diag_buffer``.
 
         Computes the derived Tier 1 / Tier 2 quantities (log-det,
@@ -924,6 +960,7 @@ class StrategyMultiObjective(object):
         rec = {
             "phase":                   phase,
             "parent_idx":              int(parent_idx),
+            "lineage_id":              int(lineage_id) if lineage_id is not None else None,
             "n_violators":             int(n_violators),
             "shrink_applied":          bool(shrink_applied),
             "psd_fallback":            bool(psd_fallback),

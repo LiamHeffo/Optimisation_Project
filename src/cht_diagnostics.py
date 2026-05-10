@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 # ─────────────────────────────────────────────────────────────────────────────
 
 PER_CALL_FIELDS = [
-    "generation", "phase", "parent_idx",
+    "generation", "phase", "parent_idx", "lineage_id",
     "n_violators", "shrink_applied", "psd_fallback",
     "log_det_C_before", "log_det_C_after",
     "condition_number_before", "condition_number_after",
@@ -218,6 +218,85 @@ def _to_list(s):
         return None
 
 
+def _displayed_constraints(n_constraints: int) -> tuple[list[int], list[str]]:
+    """Pick the subset of the raw g vector to show on the heatmap, with labels.
+
+    The raw constraint vector built by src/problem/feasibility.py for n=6
+    design variables has length 18:
+
+      j=0..5   physical-space constraints
+      j=6..11  lower box bounds  (x[i] ≥ 1)
+      j=12..17 upper box bounds  (x[i] ≤ 2)
+
+    Mapping the 12 displayed rows onto the raw g vector requires care
+    because the normalised→physical un-transformation in
+    src/problem/transforms.py is *coupled* for two variables:
+
+      p4   (i=2):   p4 = (x[2]-1)·1176.01·driver_p + 14.62·driver_p
+      res_p (i=4): res_p = (x[4]-1)·(bounds[4][1] - driver_p) + driver_p
+
+    For p4 the box upper x[2] ≤ 2 corresponds to p4 ≤ 1190.63·driver_p
+    (i.e. compression_ratio ≤ 70), which is NOT the hard physical
+    ceiling p4 ≤ bounds[2][1].  At high driver_p, p4 can blow past the
+    hard ceiling while x[2] is still well within [1, 2].  Sourcing the
+    "p4 ≤ p4_max" row from j=14 would therefore log it as never
+    violated even though j=5 (the actual ceiling check) fires
+    thousands of times.  We source from j=5 instead.
+
+    For p4 and res_p there is also no *fixed* lower bound — the lower
+    limit is coupled to driver_p.  We label those rows accordingly
+    instead of the misleading "var ≥ var_min".
+
+    All other variables (%He, driver_p, D_throat, L_buffer) have linear
+    decoupled un-transformations, so their box bounds *are* equivalent
+    to their physical bounds.  res_p's *upper* bound is similarly fixed
+    (= bounds[4][1] = 8 MPa).
+
+    Caveat — what gets dropped: comp_ratio upper (j=4 / j=14) is the
+    only constraint that fires under x[2] > 2 specifically; we don't
+    show it as a separate row.  Since j=4/j=14 has 0 firings in
+    practice (the algorithm never pushes x[2] past 2 in normalised
+    space), this is a non-issue, but worth knowing if a future run
+    behaves differently.
+
+    Returns
+    -------
+    indices : list of int
+        Indices into the raw g vector to include, in display order.
+    labels : list of str
+        Human-readable labels matching `indices` row-for-row.
+
+    Falls back to `(range(n), str(i))` for any length other than 18 so
+    this module stays decoupled from the specific problem if the
+    constraint layout ever changes.
+    """
+    if n_constraints != 18:
+        return list(range(n_constraints)), [str(i) for i in range(n_constraints)]
+    # Lower-bound rows: box-lower j=6..11, except where a more honest
+    # physical label exists for coupled variables.
+    lower_indices = [6, 7, 8, 9, 10, 11]
+    lower_labels  = [
+        "%He ≥ %He_min",
+        "driver_p ≥ driver_p_min",
+        "p4 ≥ 14.62·driver_p",      # coupled — no fixed p4_min
+        "D_throat ≥ D_throat_min",
+        "res_p ≥ driver_p",         # coupled — no fixed res_p_min
+        "L_buf ≥ L_buf_min",
+    ]
+    # Upper-bound rows: box-upper j=12..17, except j=14 → j=5 because
+    # the box upper for p4 is driver-coupled, not the hard ceiling.
+    upper_indices = [12, 13, 5, 15, 16, 17]
+    upper_labels  = [
+        "%He ≤ %He_max",
+        "driver_p ≤ driver_p_max",
+        "p4 ≤ p4_max",              # j=5: hard physical ceiling
+        "D_throat ≤ D_throat_max",
+        "res_p ≤ res_p_max",
+        "L_buf ≤ L_buf_max",
+    ]
+    return lower_indices + upper_indices, lower_labels + upper_labels
+
+
 def plot_cht_diagnostics(out_dir: Path, current_gen: int) -> Path | None:
     """Generate the six-panel CHT diagnostic figure from the on-disk CSVs.
 
@@ -236,39 +315,73 @@ def plot_cht_diagnostics(out_dir: Path, current_gen: int) -> Path | None:
         return None
 
     # ── Build per-(gen, parent) tidy arrays ──────────────────────────────
-    gens_pc, parents_pc = [], []
+    gens_pc, parents_pc, lineages_pc = [], [], []
     log_det_after, cond_after, angle_pc, pool_w_pc = [], [], [], []
-    eigs_after_one_parent_by_gen = {}   # {gen: vp_after} for parent 0 only
-    constraint_counts_by_gen = {}       # {gen: [counts...]} aggregated across parents
+    # Eigenvalue spectrum snapshots for parent 0.  We pull from
+    # resample_iter_0 (not post_eval) because post_eval only fires in the
+    # rare gens where the resample loop did not feasibilise the full
+    # offspring batch — that's an order of magnitude fewer records and
+    # they cluster in the early run.  resample_iter_0 fires every gen
+    # that has any infeasible at all, so it covers the bulk of the run.
+    eigs_after_one_parent_by_gen = {}   # {gen: vp_after} for parent 0
+    # Per-constraint counts keyed by gen.  We only keep one snapshot per
+    # gen, taken from the resample_iter_0 phase: at that phase every
+    # parent's CHT call sees the *same* pool of original infeasibles, so
+    # any one parent's count is the per-gen ground truth.  This avoids
+    # the mu-fold double-counting that summing across parents/phases
+    # produces, and gives a clean denominator (n_lambda) for percentages.
+    constraint_counts_iter0_by_gen = {}
     for r in per_call_rows:
         g = int(r["generation"])
         p = int(r["parent_idx"])
-        gens_pc.append(g); parents_pc.append(p)
+        # Lineage column is optional for backward compatibility with
+        # CSVs written before lineage tracking was added.  When missing
+        # we fall through to colouring by parent_idx, preserving the
+        # prior plot behaviour for legacy data.
+        lid_raw = r.get("lineage_id")
+        lid = int(lid_raw) if lid_raw not in (None, "") else None
+        gens_pc.append(g); parents_pc.append(p); lineages_pc.append(lid)
         log_det_after.append(_to_float(r["log_det_C_after"]))
         cond_after.append(_to_float(r["condition_number_after"]))
         angle_pc.append(_to_float(r["violation_axis_angle_deg"]))
         pool_w_pc.append(_to_float(r["effective_pool_weight"]))
-        if p == 0 and r.get("phase") == "post_eval":
+        if p == 0 and r.get("phase") == "resample_iter_0":
             ev = _to_list(r["eigenvalues_after"])
             if ev is not None:
                 eigs_after_one_parent_by_gen[g] = ev
-        cc = _to_list(r["per_constraint_active_count"])
-        if cc is not None:
-            agg = constraint_counts_by_gen.setdefault(g, np.zeros(len(cc)))
-            constraint_counts_by_gen[g] = agg + np.array(cc)
+        if (r.get("phase") == "resample_iter_0"
+                and g not in constraint_counts_iter0_by_gen):
+            cc = _to_list(r["per_constraint_active_count"])
+            if cc is not None:
+                constraint_counts_iter0_by_gen[g] = np.array(cc, dtype=float)
 
     gens_pc = np.array(gens_pc); parents_pc = np.array(parents_pc)
     log_det_after = np.array(log_det_after, dtype=float)
     cond_after    = np.array(cond_after,    dtype=float)
     angle_pc      = np.array(angle_pc,      dtype=float)
 
+    # Per-lineage grouping for trajectory panels (1, 2).  When the CSV has
+    # the lineage_id column (post-instrumentation runs), group by lineage
+    # so each curve tracks one individual from creation to displacement.
+    # Legacy CSVs (no lineage_id) fall back to parent_idx so old runs
+    # still render — just with the slot-reassignment artefacts you'd
+    # already expect.
+    has_lineage = all(lid is not None for lid in lineages_pc) and len(lineages_pc) > 0
+    lineage_pc = (np.array(lineages_pc, dtype=int) if has_lineage
+                  else parents_pc)
+
     # ── Per-gen series ───────────────────────────────────────────────────
     pg_gens, pg_infeas, pg_resample, pg_psd = [], [], [], []
+    lambda_by_gen = {}
     for r in per_gen_rows:
-        pg_gens.append(int(r["generation"]))
+        gen = int(r["generation"])
+        pg_gens.append(gen)
         pg_infeas.append(_to_float(r["infeasibility_rate"]))
         pg_resample.append(_to_float(r["n_resample_iterations"]))
         pg_psd.append(_to_float(r["n_psd_fallback"]))
+        nl = _to_float(r["n_lambda"])
+        if nl is not None and nl > 0:
+            lambda_by_gen[gen] = nl
     pg_gens = np.array(pg_gens)
     pg_infeas = np.array(pg_infeas, dtype=float)
     pg_resample = np.array(pg_resample, dtype=float)
@@ -277,26 +390,60 @@ def plot_cht_diagnostics(out_dir: Path, current_gen: int) -> Path | None:
     fig, axes = plt.subplots(2, 3, figsize=(18, 10), dpi=120)
     fig.suptitle(f"CHT diagnostics through generation {current_gen}", fontsize=14)
 
-    unique_parents = sorted(set(parents_pc.tolist()))
+    unique_lineages = sorted(set(lineage_pc.tolist()))
 
-    # 1) Volume preservation — log_det per parent
+    # Pick a colormap: tab10 cycles for slot-id (≤ ~12 distinct hues),
+    # viridis varies smoothly for lineage IDs (potentially hundreds, and
+    # creation-order is meaningful — older lineages on one end, newer on
+    # the other).
+    if has_lineage:
+        cmap = plt.get_cmap("viridis")
+        # Normalise lineage IDs onto [0, 1] by their position in creation
+        # order so the colour scale is uniform regardless of how many
+        # lineages survived.
+        n_lineages = max(len(unique_lineages), 1)
+        colour_for = lambda k: cmap(k / max(n_lineages - 1, 1))
+        group_label = "lineage"
+    else:
+        cmap = plt.get_cmap("tab10")
+        colour_for = lambda k: cmap(k % 10)
+        group_label = "parent slot"
+
+    def _plot_per_lineage(ax, y):
+        """Draw one polyline per lineage, sorted by generation within each.
+
+        Sorting matters: per-call rows can interleave gens across phases,
+        so unsorted plotting would draw zig-zag lines that visually
+        misrepresent the trajectory.
+        """
+        for k, lid in enumerate(unique_lineages):
+            mask = lineage_pc == lid
+            if not np.any(mask):
+                continue
+            xs = gens_pc[mask]; ys = y[mask]
+            order = np.argsort(xs)
+            ax.plot(xs[order], ys[order], lw=0.7, alpha=0.7,
+                    color=colour_for(k))
+
+    # 1) log det(C) trajectory per lineage (post-CHT)
+    # Each curve tracks one individual: it starts when the lineage was
+    # created, ends when selection displaced it.  Step 5 of
+    # _chtCovarianceUpdate preserves det(C) within a single call, so any
+    # gradual decline along a curve is the rank-mu_MO,succ update doing
+    # its job between generations (not a CHT-side bug).  See
+    # cht_per_gen.csv columns mean_log_det_drift / max_abs_log_det_drift
+    # for the per-call invariance diagnostic.
     ax = axes[0, 0]
-    for p in unique_parents:
-        mask = parents_pc == p
-        ax.plot(gens_pc[mask], log_det_after[mask], lw=0.7, alpha=0.7,
-                label=f"parent {p}")
-    ax.set_title("log det(C) — volume should be approximately preserved")
+    _plot_per_lineage(ax, log_det_after)
+    ax.set_title(f"log det(C) trajectory (post-CHT, by {group_label})")
     ax.set_xlabel("Generation"); ax.set_ylabel("log det(C) after CHT")
     ax.grid(alpha=0.3)
 
-    # 2) Condition number per parent
+    # 2) Condition number per lineage
     ax = axes[0, 1]
-    for p in unique_parents:
-        mask = parents_pc == p
-        ax.plot(gens_pc[mask], cond_after[mask], lw=0.7, alpha=0.7,
-                label=f"parent {p}")
+    _plot_per_lineage(ax, cond_after)
     ax.set_yscale("log")
-    ax.set_title("Condition number λ_max/λ_min — rising = anisotropy growing")
+    ax.set_title(f"Condition number κ(C) (by {group_label})")
     ax.set_xlabel("Generation"); ax.set_ylabel("κ(C)")
     ax.grid(alpha=0.3, which="both")
 
@@ -311,7 +458,7 @@ def plot_cht_diagnostics(out_dir: Path, current_gen: int) -> Path | None:
                        extent=[gs[0], gs[-1], 0, spectrum.shape[0]],
                        cmap="viridis")
         plt.colorbar(im, ax=ax, label="log10(eigenvalue)")
-        ax.set_title("Eigenvalue spectrum (parent 0, post_eval)")
+        ax.set_title("Eigenvalue spectrum (parent 0, resample_iter_0)")
         ax.set_xlabel("Generation"); ax.set_ylabel("Eigenvalue index")
     else:
         ax.text(0.5, 0.5, "no parent-0 post_eval data yet",
@@ -328,18 +475,32 @@ def plot_cht_diagnostics(out_dir: Path, current_gen: int) -> Path | None:
     ax2.set_ylabel("# resample iterations", color="C0")
     ax.set_title("Infeasibility & resample iterations")
 
-    # 5) Per-constraint activity heatmap
+    # 5) Per-constraint activity heatmap (% of LAMBDA initial offspring)
+    # Counts come from the resample_iter_0 phase, normalised by n_lambda
+    # so each cell reads as "% of this generation's initial offspring
+    # that violated constraint j".  _displayed_constraints() collapses
+    # the raw 18-element g vector to 12 physical-variable bounds.
     ax = axes[1, 1]
-    if constraint_counts_by_gen:
-        gs = sorted(constraint_counts_by_gen.keys())
-        n_constraints = len(constraint_counts_by_gen[gs[0]])
-        mat = np.array([constraint_counts_by_gen[g] for g in gs]).T  # (m, n_gen)
-        im = ax.imshow(mat, aspect="auto", origin="lower",
-                       extent=[gs[0], gs[-1], 0, n_constraints],
-                       cmap="magma")
-        plt.colorbar(im, ax=ax, label="# violators (summed across parents/calls)")
-        ax.set_title("Per-constraint activity")
-        ax.set_xlabel("Generation"); ax.set_ylabel("Constraint index")
+    if constraint_counts_iter0_by_gen:
+        gs = sorted(constraint_counts_iter0_by_gen.keys())
+        n_raw = len(constraint_counts_iter0_by_gen[gs[0]])
+        indices, labels = _displayed_constraints(n_raw)
+        n_displayed = len(indices)
+        pct = np.zeros((n_displayed, len(gs)), dtype=float)
+        for col, gn in enumerate(gs):
+            denom = lambda_by_gen.get(gn)
+            if denom:
+                full_counts = constraint_counts_iter0_by_gen[gn]
+                pct[:, col] = 100.0 * full_counts[indices] / denom
+        im = ax.imshow(pct, aspect="auto", origin="lower",
+                       extent=[gs[0], gs[-1], -0.5, n_displayed - 0.5],
+                       cmap="magma", vmin=0.0)
+        plt.colorbar(im, ax=ax,
+                     label="% of LAMBDA offspring violating constraint")
+        ax.set_yticks(np.arange(n_displayed))
+        ax.set_yticklabels(labels, fontsize=7)
+        ax.set_title("Per-constraint activity (resample_iter_0)")
+        ax.set_xlabel("Generation"); ax.set_ylabel("Constraint")
     else:
         ax.text(0.5, 0.5, "no per-constraint data yet",
                 ha="center", va="center", transform=ax.transAxes)
