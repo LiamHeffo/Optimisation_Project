@@ -413,22 +413,22 @@ def evaluate(x):
         if not is_feasible(g):
             return None, g, None
 
+        # Heavy-evaluator failures are encoded via the existing sentinel
+        # returns rather than rejected as infeasible:
+        #   - PITOT3 failure  ⇒ delta_vs1 = 3500 m/s
+        #                       ⇒ g_al = 3500 - al_tol ≈ +3400  (a large
+        #                         positive, which the AL will penalise as
+        #                         a major constraint violation)
+        #   - SPARK  failure  ⇒ (hold_time, impact_speed) = (0, 350)
+        #                       ⇒ fit_2d normalises to (1, 1)  (worst
+        #                         possible values on both axes; Pareto-
+        #                         dominated by every successful candidate)
+        # Letting these flow through the AL machinery is more robust than
+        # rejecting them outright, since random initial points often hit
+        # numerical-failure regions before the search converges to the
+        # well-behaved part of the design space.
         delta_vs = constraint_function(x, x.bounds)
-
-        # Treat any PITOT3 failure (sentinel return) as infeasible.  Per
-        # user choice: don't feed the sentinel into AL coefficient
-        # adaptation — it isn't a real constraint reading.
-        if delta_vs >= _PITOT3_FAILURE_SENTINEL:
-            return None, g, None
-
         hold_time, impact_speed = objective_function(x, x.bounds)
-        # SPARK failure also yields _feasible=False and no AL data.
-        # objective_function returns (0, 350) on failure; detect via the
-        # hold_time==0 sentinel (impact_speed==350 alone could be a real
-        # but bad outcome at the upper bound, hold_time==0 cannot).
-        if hold_time == 0:
-            return None, g, None
-
         fit_2d = normalise_fitness(
             (hold_time, impact_speed), APPROX_IDEAL_2D, APPROX_NADIR_2D,
         )

@@ -46,13 +46,189 @@
 #                  (≈ 2% of the 4900 m/s shock-speed target).  Smaller values
 #                  drive the AL toward a tighter delta_vs1 at the cost of
 #                  longer convergence; larger values relax the constraint.
+#
+#   cht_gamma    : (CovarianceCHT / CHT_AL) shrinkage strength applied to
+#                  each parent's Cholesky factor along violation directions
+#                  in _chtCovarianceUpdate.  Higher ⇒ more aggressive
+#                  collapse along infeasible directions, faster feasibility
+#                  recovery, but risk of over-shrinking and starving
+#                  exploration.  Omit the field to use the strategy's
+#                  dimension-dependent default 0.5 / (n+2)  (= 0.0625 at n=6).
+#                  Reference points along the sweep axis at n=6:
+#                    0.00417 = 0.0125/3   (1/3 of Arnold-Hansen 2012 default)
+#                    0.0125  = 0.1 / (n+2) (Arnold-Hansen 2012 default)
+#                    0.0375  = 0.0125·3   (3× the Arnold-Hansen default)
+#                    0.0625  = 0.5 / (n+2) (current strategy default, 5×)
+#
+#   features     : (optional) dict of anti-degeneration toggles aimed at
+#                  preventing σ-collapse in the CHT/AL pipeline.  Each
+#                  feature is INDEPENDENT and defaults to off — designed so
+#                  any single one can be enabled in isolation to measure
+#                  its effect.  Omit the dict (or set keys to null/false)
+#                  to reproduce baseline behaviour.
+#
+#                  Group A — weaken / relax the CHT
+#                    cht_eigenvalue_floor: float (e.g. 0.5)
+#                        cap per-call shrinkage at (factor·prior_axis).
+#                        0.5 ⇒ no axis loses more than 50% per call.
+#                    cht_isotropy_alpha: float in (0, 1] (e.g. 0.05)
+#                        after CHT shrinkage, pull eigenvalues toward
+#                        their mean by α.  Counteracts anisotropy lock-in
+#                        across many CHT calls.
+#                    cht_gamma_schedule: [start, end, n_gens]
+#                        linear interpolation of cht_gamma over n_gens.
+#                        Aggressive early, gentle late.
+#                    cht_kappa_trigger: float (e.g. 5.0)
+#                        when κ(C) exceeds this threshold, re-isotropise
+#                        even with no infeasibles present.  Escape valve.
+#
+#                  Group B — keep AL engaged
+#                    al_lam_floor_factor: float (e.g. 0.01)
+#                        maintain λ ≥ factor·μ instead of clamping to 0.
+#                        Persistent (mild) attraction toward the boundary.
+#                    al_mu_decay: float in (0, 1) (e.g. 0.99)
+#                        when λ is at its floor, multiply μ by this factor
+#                        each gen.  Lets the AL "forget" the early peak.
+#                    al_tol_schedule: [start_tol, end_tol, n_gens]
+#                        tighten ε over time.  Keeps the constraint active
+#                        when the search would otherwise sit comfortably.
+#
+#                  Group C — redefine / re-treat infeasibility
+#                    cht_resample_tol: float (e.g. 0.02)
+#                        allow this much constraint violation during the
+#                        CHT resample loop.  Reduces CHT-trigger pressure.
+#                    box_reflective_repair: bool (true/false)
+#                        reflect [1,2]-box violations back into the box at
+#                        sampling time, bypassing the CHT for box bounds.
+#                    psucc_exclude_resampled: bool (true/false)
+#                        exclude CHT-resampled offspring from the donor
+#                        parent's σ/psucc adaptation.  Decouples σ from
+#                        CHT-induced "successes".
 
 experiments:
+  # ────────────────────────────────────────────────────────────────────────
+  # Anti-degeneration feature sweep — each entry enables exactly ONE
+  # feature against the same baseline (pop=12, step=0.05, cht_gamma=0.0125,
+  # al_tol=100).  Any HV / σ / κ(C) / lam-trajectory difference vs the
+  # baseline is attributable to the enabled feature.
+  #
+  # Comment out the entries you don't want to run.  Each is ~500
+  # generations and the runs are dispatched as fresh subprocesses, so
+  # the order doesn't matter and you can safely skip any subset.
+  # ────────────────────────────────────────────────────────────────────────
+
+  # Baseline (no features) — reproduces the run analysed in the diagnostic
+  # post-mortem.  Includes for direct comparison against each feature run.
   - sim_type: CHT_AL
     pop_size: 12
     step_size: 0.05
     p4_treatment: null
     al_tol: 100.0
+    cht_gamma: 0.0125
+    features: {}
+
+  # A1 — eigenvalue floor (caps per-call shrinkage at 50% of prior axis).
+  - sim_type: CHT_AL
+    pop_size: 12
+    step_size: 0.05
+    p4_treatment: null
+    al_tol: 100.0
+    cht_gamma: 0.0125
+    features:
+      cht_eigenvalue_floor: 0.5
+
+  # A2 — isotropy relaxation (5% pull toward mean(eigenvalues) per CHT call).
+  - sim_type: CHT_AL
+    pop_size: 12
+    step_size: 0.05
+    p4_treatment: null
+    al_tol: 100.0
+    cht_gamma: 0.0125
+    features:
+      cht_isotropy_alpha: 0.05
+
+  # A3 — gamma schedule (decay 0.0125 → 0.001 over 500 generations).
+  - sim_type: CHT_AL
+    pop_size: 12
+    step_size: 0.05
+    p4_treatment: null
+    al_tol: 100.0
+    cht_gamma: 0.0125
+    features:
+      cht_gamma_schedule: [0.0125, 0.001, 500]
+
+  # A4 — kappa trigger (re-isotropise when κ(C) > 5).
+  - sim_type: CHT_AL
+    pop_size: 12
+    step_size: 0.05
+    p4_treatment: null
+    al_tol: 100.0
+    cht_gamma: 0.0125
+    features:
+      cht_kappa_trigger: 5.0
+      cht_isotropy_alpha: 0.1   # correction strength when trigger fires
+
+  # B1 — lam floor (maintain λ ≥ 0.01·μ instead of clamping to 0).
+  - sim_type: CHT_AL
+    pop_size: 12
+    step_size: 0.05
+    p4_treatment: null
+    al_tol: 100.0
+    cht_gamma: 0.0125
+    features:
+      al_lam_floor_factor: 0.01
+
+  # B2 — mu decay (multiply μ by 0.99 each gen while λ is clamped).
+  - sim_type: CHT_AL
+    pop_size: 12
+    step_size: 0.05
+    p4_treatment: null
+    al_tol: 100.0
+    cht_gamma: 0.0125
+    features:
+      al_mu_decay: 0.99
+
+  # B3 — al_tol decay (tighten 100 → 20 m/s over 500 generations).
+  - sim_type: CHT_AL
+    pop_size: 12
+    step_size: 0.05
+    p4_treatment: null
+    al_tol: 100.0
+    cht_gamma: 0.0125
+    features:
+      al_tol_schedule: [100.0, 20.0, 500]
+
+  # C1 — resample tolerance (allow up to 0.02 violation during resample).
+  - sim_type: CHT_AL
+    pop_size: 12
+    step_size: 0.05
+    p4_treatment: null
+    al_tol: 100.0
+    cht_gamma: 0.0125
+    features:
+      cht_resample_tol: 0.02
+
+  # C2 — reflective box repair (reflect [1,2] violations back into the box).
+  - sim_type: CHT_AL
+    pop_size: 12
+    step_size: 0.05
+    p4_treatment: null
+    al_tol: 100.0
+    cht_gamma: 0.0125
+    features:
+      box_reflective_repair: true
+
+  # C3 — exclude resampled offspring from psucc adaptation.
+  - sim_type: CHT_AL
+    pop_size: 12
+    step_size: 0.05
+    p4_treatment: null
+    al_tol: 100.0
+    cht_gamma: 0.0125
+    features:
+      psucc_exclude_resampled: true
+
+
 
   # Legacy 3-objective comparators — uncomment to A/B against the AL run.
   # - sim_type: CovarianceCHT

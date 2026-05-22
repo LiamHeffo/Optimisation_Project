@@ -513,11 +513,30 @@ def main(experiment_type):
     # per the user-confirmed setting.  experiment_type may be a 4-tuple
     # for legacy YAML entries; fall back to the default in that case.
     al_tol = experiment_type[4] if len(experiment_type) > 4 else 100.0
+    # CHT covariance shrinkage strength.  None ⇒ let the strategy fall
+    # back to its dimension-dependent default (0.5/(n+2)).  Consumed by
+    # both CovarianceCHT and CHT_AL.
+    cht_gamma = experiment_type[5] if len(experiment_type) > 5 else None
+    # Anti-degeneration feature toggles.  Each key in this dict opts in
+    # to one of the experimental fixes for the σ death spiral; all
+    # default off so omitting the field reproduces baseline behaviour.
+    # See the YAML header for the full schema.
+    features = experiment_type[6] if len(experiment_type) > 6 else {}
 
     print(f"Step Size = {step_size}")
     print(f'Pop Size = {pop_size}\n')
     if sim_type == 'CHT_AL':
         print(f'AL tolerance (delta_vs1 ≤): {al_tol} m/s')
+    if sim_type in ('CovarianceCHT', 'CHT_AL'):
+        print(f'cht_gamma = {cht_gamma if cht_gamma is not None else "default (0.5/(n+2))"}')
+    if features:
+        active_features = [k for k, v in features.items() if v not in (None, False, 0)]
+        if active_features:
+            print(f'Active features: {active_features}')
+        else:
+            print('Active features: none (baseline)')
+    else:
+        print('Active features: none (baseline)')
 
     # ── Output directory layout ───────────────────────────────────────────
     # Per-sim_type constants: legacy modes write a 3-objective tree;
@@ -651,6 +670,8 @@ def main(experiment_type):
         sim_type=sim_type, p4_treatment=p4_treatment,
         bounds=bounds,
         al_tol=al_tol,                # consumed only when sim_type=='CHT_AL'
+        cht_gamma=cht_gamma,          # None ⇒ strategy default (0.5/(n+2))
+        features=features,            # anti-degeneration toggles (see YAML header)
         logbook=toolbox.logbook,      # injected — no global access inside cmaes.py
     )
     toolbox.register("generate", strategy.generate, Individual_cls)
@@ -721,10 +742,25 @@ def main(experiment_type):
         _fill_offspring(gen_snapshots, parents_at_generate, population)
 
         i = 0
+        # Feature B3 (al_tol_schedule): read the current AL tolerance
+        # from the strategy (returns the static value when no schedule
+        # is configured).  Per-generation update — offspring need to
+        # see the new tol before evaluate() reads x.al_tol.
+        current_al_tol = (
+            strategy.current_al_tol()
+            if hasattr(strategy, "current_al_tol") else al_tol
+        )
         for ind in population:
             ind.normalised = normalised
             ind.ind_number = i
             ind.bounds     = bounds
+            # Offspring are freshly constructed by strategy.generate() — they
+            # do NOT inherit sim_type or al_tol from the parent.  Without
+            # these, evaluate() falls into its legacy 3-objective branch
+            # for an Individual2D and the length-2-vs-length-3 fitness
+            # assignment later trips DEAP's assertion.
+            ind.sim_type = sim_type
+            ind.al_tol   = current_al_tol
             i += 1
 
         # CHT-and-resample loop (Chocat 2015 Algorithm 3 step 3-2): for
@@ -741,9 +777,22 @@ def main(experiment_type):
         # 18-element vector); delta_vs1 is handled separately by the AL
         # in selection, not via CHT shrinkage.
         if sim_type in ('CovarianceCHT', 'CHT_AL'):
+            # Feature C1 (cht_resample_tol): permit slight constraint
+            # violations during the CHT-resample loop.  Offspring with
+            # max(g) ≤ tol pass through without invoking another CHT
+            # shrinkage.  Reduces feedback pressure that locks in
+            # anisotropy after early generations.  None or 0.0 ⇒
+            # strict feasibility (legacy).  Caveat: the constraint
+            # vector mixes box bounds (∼[−1, 1]) and physical
+            # constraints (∼Pa, m); a scalar tol applies uniformly.
+            # Calibrate tol with the smallest meaningful violation in
+            # mind — see problem/feasibility.py for the layout.
+            resample_tol = (
+                features.get("cht_resample_tol") if isinstance(features, dict) else None
+            ) or 0.0
             def _check(ind):
                 g = evaluate_constraints(ind, bounds)
-                return is_feasible(g), g
+                return is_feasible(g, tol=resample_tol), g
             n_iter = strategy.resample_infeasibles(
                 population, feasibility_check=_check, max_iterations=5,
             )
@@ -945,7 +994,10 @@ def main(experiment_type):
             # block has been appending to every generation.  The plot is
             # stateless (read-from-disk), so this is a pure side-effect
             # that doesn't need to share state with the main loop.
-            if sim_type == 'CovarianceCHT':
+            # Both CovarianceCHT and CHT_AL drain CHT records (the box+
+            # physical constraint handling is identical between them),
+            # so both should regenerate the figure.
+            if sim_type in ('CovarianceCHT', 'CHT_AL'):
                 _cht_plot(folders["cht_diagnostics"], current_gen=bookshelf_gen)
             # Force a full GC pass: matplotlib's render buffers and the
             # transient numpy arrays in the CHT covariance update can
@@ -1152,9 +1204,15 @@ if __name__ == "__main__":
     with open(_config_path) as _f:
         _config = yaml.safe_load(_f)
 
-    # 5-tuple: (sim_type, pop_size, step_size, p4_treatment, al_tol).
-    # ``al_tol`` is consumed only by the CHT_AL sim_type; legacy entries
-    # without the field default to 100 m/s and ignore it.
+    # 7-tuple: (sim_type, pop_size, step_size, p4_treatment, al_tol,
+    #           cht_gamma, features_dict).
+    # ``al_tol``    : (CHT_AL only) constraint tolerance ε (m/s).
+    # ``cht_gamma`` : (CovarianceCHT / CHT_AL) shrinkage strength; None means
+    #                 "use the strategy's dimension-dependent default".
+    # ``features``  : dict of optional anti-degeneration feature toggles
+    #                 (eigenvalue floor, lam floor, etc.).  See the YAML
+    #                 header comment for the full menu.  Empty dict =
+    #                 baseline behaviour (no features enabled).
     experiment_types = [
         (
             exp["sim_type"],
@@ -1162,6 +1220,8 @@ if __name__ == "__main__":
             exp["step_size"],
             exp["p4_treatment"],
             exp.get("al_tol", 100.0),
+            exp.get("cht_gamma", None),
+            exp.get("features", {}) or {},
         )
         for exp in _config["experiments"]
     ]

@@ -179,6 +179,7 @@ def append_per_gen_row(csv_path: Path, gen: int, records: list[dict],
 AL_PER_GEN_FIELDS = [
     "generation",
     "count",                 # pycma's internal AL update counter
+    "is_initialized",        # True once pycma's _initialized array is full
     "f_proxy_scalar",        # cheap-proxy aggregate of f at parent centroid
     "g_al_proxy",            # cheap-proxy g_AL at parent centroid (JSON list)
     "lam",                   # Lagrangian coefficients (JSON list)
@@ -210,14 +211,23 @@ def drain_and_persist_al(strategy, gen: int, out_dir: Path) -> list[dict]:
 
     Mirrors ``drain_and_persist`` for CHT.  Cheap when the buffer is
     empty (sim_type != CHT_AL), so it can be called unconditionally.
+
+    The CSV header is written eagerly on the first call regardless of
+    whether records exist — so post-hoc analysis tools can detect "AL
+    mode was enabled but never produced data" by finding a header-only
+    file, rather than mistaking a missing file for "wrong sim_type".
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     records = list(getattr(strategy, "al_diag_buffer", []))
     if hasattr(strategy, "al_diag_buffer"):
         strategy.al_diag_buffer.clear()
-    if records:
-        append_al_per_gen_rows(out_dir / "al_per_gen.csv", gen, records)
+    csv_path = out_dir / "al_per_gen.csv"
+    # Called unconditionally so the header is written on the first
+    # generation even when records is empty (e.g. the AL hasn't
+    # bootstrapped yet).  append_al_per_gen_rows is a no-op for an
+    # empty records list on subsequent calls.
+    append_al_per_gen_rows(csv_path, gen, records)
     return records
 
 

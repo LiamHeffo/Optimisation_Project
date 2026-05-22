@@ -127,8 +127,20 @@ class StrategyMultiObjective(object):
         # CHT (Chocat 2015) covariance shrinkage strength.  Analogous to
         # beta in the (1+1)-CMA-ES paper (Arnold & Hansen 2012, Table 1):
         # beta = 0.1 / (n + 2).  Higher values shrink more aggressively
-        # along violating directions.
-        self.cht_gamma = params.get("cht_gamma", 0.1 / (self.dim + 2.0))
+        # along violating directions.  The 0.5 prefactor (5× the
+        # Arnold-Hansen default) was chosen empirically for the X2
+        # constrained problem where the box+phys-feasible region is
+        # narrow enough that the default shrinkage was too gentle to
+        # keep up with offspring drift.
+        #
+        # ``cht_gamma=None`` is treated identically to "key missing" so
+        # main.py can pass through whatever the YAML supplies (or omits)
+        # without having to know the dimension-dependent default.
+        _cht_gamma = params.get("cht_gamma")
+        self.cht_gamma = (
+            _cht_gamma if _cht_gamma is not None
+            else 0.5 / (self.dim + 2.0)
+        )
 
         # Per-parent internal state
         self.sigmas      = [sigma] * len(population)
@@ -181,6 +193,54 @@ class StrategyMultiObjective(object):
         # drained by main.py mirroring the CHT pattern).
         self.al_diag_buffer = []
 
+        # ─────────────────────────────────────────────────────────────────
+        # Anti-degeneration feature toggles (each defaults to off)
+        # ─────────────────────────────────────────────────────────────────
+        # Sourced from the ``features`` dict in experiments.yaml.  All
+        # default off so omission == legacy behaviour.  Each feature is
+        # documented at its use-site; the toggles are listed here for a
+        # single grep target.
+        features = params.get("features", {}) or {}
+        # A1: floor each eigenvalue at (factor * pre-CHT eigenvalue) per
+        # call.  None ⇒ legacy 1e-10 floor (effectively unbounded shrink).
+        self.cht_eigenvalue_floor = features.get("cht_eigenvalue_floor")
+        # A2: after CHT shrinkage, pull eigenvalues toward their mean by
+        # this factor.  None ⇒ no isotropy relaxation.
+        self.cht_isotropy_alpha = features.get("cht_isotropy_alpha")
+        # A3: linearly interpolate cht_gamma from start → end over
+        # n_gens generations.  Schema: [start_gamma, end_gamma, n_gens].
+        # None ⇒ static cht_gamma.
+        self.cht_gamma_schedule = features.get("cht_gamma_schedule")
+        # A4: when κ(C) exceeds this threshold, apply an isotropy
+        # correction even if no infeasibles are present.  None ⇒ off.
+        self.cht_kappa_trigger = features.get("cht_kappa_trigger")
+        # B1: maintain self.al.lam ≥ factor * self.al.mu so the AL stays
+        # engaged even after the centroid is comfortably feasible.
+        # None ⇒ legacy clamp-to-zero behaviour.
+        self.al_lam_floor_factor = features.get("al_lam_floor_factor")
+        # B2: multiply self.al.mu by this factor each generation while
+        # self.al.lam is clamped at zero.  None ⇒ no decay (mu frozen).
+        self.al_mu_decay = features.get("al_mu_decay")
+        # B3: linearly interpolate al_tol from start → end over n_gens.
+        # Schema: [start_tol, end_tol, n_gens].  None ⇒ static al_tol.
+        self.al_tol_schedule = features.get("al_tol_schedule")
+        # C1: tolerance for is_feasible() inside the CHT resample loop.
+        # Higher ⇒ more permissive (fewer offspring re-sampled / fewer
+        # CHT calls).  None or 0.0 ⇒ strict feasibility.
+        self.cht_resample_tol = features.get("cht_resample_tol")
+        # C2: when an offspring's design vector lands outside [1, 2]^n,
+        # reflect it back into the box rather than letting the CHT take
+        # the hit.  Box bounds only (physical constraints stay strict).
+        self.box_reflective_repair = bool(features.get("box_reflective_repair", False))
+        # C3: when an offspring was resampled by the CHT loop, do not
+        # let it contribute to its donor parent's psucc / σ update.
+        # Decouples σ adaptation from CHT-induced "successes".
+        self.psucc_exclude_resampled = bool(features.get("psucc_exclude_resampled", False))
+
+        # Generation counter used by schedule-based features (A3, B3).
+        # Incremented by update() once per generation.
+        self._generation = 0
+
     # ─────────────────────────────────────────────────────────────────────────
     # Augmented Lagrangian helpers (CHT_AL sim_type only)
     # ─────────────────────────────────────────────────────────────────────────
@@ -227,6 +287,24 @@ class StrategyMultiObjective(object):
         self.al.set_coefficients(np.asarray(F_pop, dtype=float),
                                  np.asarray(G_AL_pop, dtype=float))
 
+    def current_al_tol(self):
+        """Return the AL tolerance for the current generation.
+
+        Feature B3 (al_tol_schedule): linearly interpolate al_tol from
+        start → end across n_gens generations.  Schema:
+        ``[start_tol, end_tol, n_gens]`` in features dict.  Saturates at
+        ``end_tol`` after ``self._generation >= n_gens``.
+
+        None ⇒ static ``self.al_tol`` (the legacy single value).
+        Called from main.py once per generation to retag each offspring's
+        ``ind.al_tol`` before evaluation.
+        """
+        if self.al_tol_schedule is None:
+            return self.al_tol
+        start_t, end_t, n_gens = self.al_tol_schedule
+        progress = min(1.0, self._generation / max(1, n_gens))
+        return float(start_t * (1.0 - progress) + end_t * progress)
+
     def update_al(self, F_proxy_scalar, g_al_proxy):
         """Per-generation update of γ and μ from the parent-centroid proxy.
 
@@ -235,14 +313,61 @@ class StrategyMultiObjective(object):
         is therefore unused inside pycma's update branch we selected, but
         we still pass it through so the ``self.f`` cached state stays
         consistent for any future algorithm switch.
+
+        Gating rationale: we used to short-circuit on
+        ``not self.al.is_initialized``, but that flag stays False until
+        pycma's empirical sign-average is balanced — which can take many
+        generations in the all-infeasible bootstrap regime.  Skipping the
+        update during that window starves pycma's ``g_history`` deque of
+        data (the CDF-based μ-adaptation reads from it), and also leaves
+        the al_diag_buffer empty so no CSV row ever gets written.  The
+        right gate is ``self.al.lam is None``: once ``set_coefficients``
+        has populated lam/mu, ``al.update`` is safe — pycma handles its
+        own internal short-circuits when mu is still zero.
         """
-        if self.al is None or not self.al.is_initialized:
+        if self.al is None or self.al.lam is None:
             return
         self.al.update(float(F_proxy_scalar),
                        np.asarray(g_al_proxy, dtype=float))
+
+        # Feature B1 (al_lam_floor_factor): prevent λ from clamping to
+        # zero once the centroid drifts inside the feasible region.
+        # pycma's ``update()`` sets λ = max(λ + μ·g/dgamma, 0).  At
+        # convergence λ→0 and the AL contributes nothing to selection
+        # for the rest of the run.  This feature enforces
+        # λ ≥ factor·μ, so a small attractive pressure toward the
+        # constraint boundary persists indefinitely.  None ⇒ legacy
+        # clamp-to-zero.
+        if self.al_lam_floor_factor is not None and self.al.mu is not None:
+            for k in range(len(self.al.lam)):
+                lam_floor = self.al_lam_floor_factor * self.al.mu[k]
+                if self.al.lam[k] < lam_floor:
+                    self.al.lam[k] = lam_floor
+
+        # Feature B2 (al_mu_decay): when λ is at (or below) its clamp
+        # value, multiply μ by this factor each generation.  Lets the
+        # penalty "forget" any early-run peak — otherwise μ stays
+        # frozen at its maximum and any future re-engagement of the
+        # AL fires with disproportionate force.  Skipped when B1 keeps
+        # λ above the threshold.  None ⇒ μ frozen (legacy).
+        if self.al_mu_decay is not None and self.al.mu is not None:
+            # Threshold: legacy behaviour treats λ==0 as "clamped"; with
+            # B1 enabled we use the feature's own floor as the marker.
+            if self.al_lam_floor_factor is not None:
+                threshold = self.al_lam_floor_factor * self.al.mu  # array
+                clamped = np.asarray(self.al.lam) <= np.asarray(threshold) + 1e-12
+            else:
+                clamped = np.asarray(self.al.lam) < 1e-12
+            for k in range(len(self.al.mu)):
+                if clamped[k]:
+                    self.al.mu[k] *= self.al_mu_decay
+
         # Snapshot for diagnostics — captured here rather than at the
         # call site so the format stays consistent across cmaes.py
         # internals.  ``lam`` and ``mu`` are length-m numpy arrays.
+        # Always appended (no is_initialized gate), so the al_per_gen.csv
+        # captures the full lam/mu trajectory including the bootstrap
+        # window where they may legitimately be zero.
         self.al_diag_buffer.append({
             "g_al_proxy":     np.asarray(g_al_proxy, dtype=float).tolist(),
             "f_proxy_scalar": float(F_proxy_scalar),
@@ -250,6 +375,7 @@ class StrategyMultiObjective(object):
             "mu":             self.al.mu.tolist(),
             "al_pen_proxy":   self._al_penalty(g_al_proxy),
             "count":          int(self.al.count),
+            "is_initialized": bool(self.al.is_initialized),
         })
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -274,11 +400,35 @@ class StrategyMultiObjective(object):
                 new_individual = self.parents[i] + mutation
                 repaired = False
 
-                # CovarianceCHT replaces the repair while-loop: infeasible
-                # offspring pass through and feed the CHT covariance update
-                # (Phase 3).  Penalty mode also bypasses repair (its handler
-                # is in evaluate.py).
-                if self.sim_type not in ('Penalty', 'CovarianceCHT'):
+                # Feature C2 (box_reflective_repair): reflect coordinates
+                # back into [1, 2]^n before evaluation, instead of letting
+                # the CHT take the hit.  Preserves the (σ, A) information
+                # that produced the offspring while keeping it inside the
+                # normalised box.  The while-loop handles the rare case
+                # where reflection itself overshoots (very large σ); in
+                # practice 1–2 iterations are sufficient.  Box bounds
+                # only — physical constraints stay strict so the CHT
+                # still adapts to them.
+                if self.box_reflective_repair:
+                    for k in range(self.dim):
+                        reflections = 0
+                        while (new_individual[k] < 1.0
+                               or new_individual[k] > 2.0) and reflections < 8:
+                            if new_individual[k] < 1.0:
+                                new_individual[k] = 2.0 - new_individual[k]
+                            elif new_individual[k] > 2.0:
+                                new_individual[k] = 4.0 - new_individual[k]
+                            reflections += 1
+
+                # CovarianceCHT (and CHT_AL, which layers AL on top of CHT)
+                # replace the repair while-loop: infeasible offspring pass
+                # through and feed the CHT covariance update (Phase 3).
+                # Without this guard, CHT_AL would enter the loop, call
+                # crossover() — which has no CHT_AL branch — get the
+                # individual back unchanged, and spin forever.
+                # Penalty mode also bypasses repair (its handler is in
+                # evaluate.py).
+                if self.sim_type not in ('Penalty', 'CovarianceCHT', 'CHT_AL'):
                     s = time.time()
                     while True:
                         if not self.check_feasibility(new_individual)[0]:
@@ -374,8 +524,20 @@ class StrategyMultiObjective(object):
         for i, ind in enumerate(chosen):
             t, p_idx = ind._ps
             if t == "o":
-                psucc[i] = (1.0 - cp) * psucc[i] + cp
-                sigmas[i] = sigmas[i] * np.exp((psucc[i] - ptarg) / (d * (1.0 - ptarg)))
+                # Feature C3 (psucc_exclude_resampled): an offspring that
+                # only became feasible after CHT resampling shouldn't be
+                # rewarded with a psucc / σ increment — its "success" is
+                # an artefact of the CHT-tightened distribution, not of
+                # the donor parent's σ.  Skip both the σ-up signal and
+                # the rank-one update below.  The CHT itself still
+                # consumes the resample data via the infeasible pool.
+                skip_psucc = (
+                    self.psucc_exclude_resampled
+                    and getattr(ind, "_resampled", False)
+                )
+                if not skip_psucc:
+                    psucc[i] = (1.0 - cp) * psucc[i] + cp
+                    sigmas[i] = sigmas[i] * np.exp((psucc[i] - ptarg) / (d * (1.0 - ptarg)))
                 # σ is now logged per-generation to strategy_per_gen.csv;
                 # see _append_strategy_per_gen_row in main.py.
                 # print(f"sigmas: {sigmas[i]}")
@@ -385,7 +547,7 @@ class StrategyMultiObjective(object):
                 # on the constraint-aware geometry.  Matches Chocat
                 # Algorithm 3 step-3-2 -> step-3-4 ordering.  Only fires
                 # when the sim_type opts in AND there are infeasibles.
-                if self.sim_type == 'CovarianceCHT' and infeasible_pool:
+                if self.sim_type in ('CovarianceCHT', 'CHT_AL') and infeasible_pool:
                     # The C being updated belongs to chosen[i] — the new
                     # occupant of slot i.  Record by *its* lineage so the
                     # diagnostic trace tracks the right individual.
@@ -404,6 +566,17 @@ class StrategyMultiObjective(object):
                     parents_snapshot, sigmas_snapshot, successful_steps,
                 )
 
+                # Feature A4 (cht_kappa_trigger): once the condition
+                # number of C_i exceeds the threshold, re-isotropise
+                # toward a less-anisotropic shape — even if there are
+                # no current infeasibles to feed the regular CHT.
+                # Acts as an escape valve for anisotropy lock-in.
+                if (self.cht_kappa_trigger is not None
+                        and self.sim_type in ('CovarianceCHT', 'CHT_AL')):
+                    A[i], invCholesky[i] = self._chtIsotropyCorrection(
+                        A[i], invCholesky[i],
+                    )
+
                 if psucc[i] < pthresh:
                     xp = np.array(ind)
                     x  = np.array(self.parents[p_idx])
@@ -414,14 +587,23 @@ class StrategyMultiObjective(object):
                     pc_weight = cc * (2.0 - cc)
                     invCholesky[i], A[i] = self._rankOneUpdate(invCholesky[i], A[i], 1 - ccov + pc_weight, ccov, pc[i])
 
-                self.psucc[p_idx] = (1.0 - cp) * self.psucc[p_idx] + cp
-                self.sigmas[p_idx] = self.sigmas[p_idx] * np.exp(
-                    (self.psucc[p_idx] - ptarg) / (d * (1.0 - ptarg))
-                )
+                # Same C3 gate for the global per-parent state update.
+                if not skip_psucc:
+                    self.psucc[p_idx] = (1.0 - cp) * self.psucc[p_idx] + cp
+                    self.sigmas[p_idx] = self.sigmas[p_idx] * np.exp(
+                        (self.psucc[p_idx] - ptarg) / (d * (1.0 - ptarg))
+                    )
 
         for ind in not_chosen:
             t, p_idx = ind._ps
             if t == "o":
+                # Feature C3 also applies to the failure side: a
+                # resampled-then-dominated offspring shouldn't shrink
+                # the donor's σ either.  CHT covariance has already
+                # consumed its constraint signal — that's enough.
+                if (self.psucc_exclude_resampled
+                        and getattr(ind, "_resampled", False)):
+                    continue
                 self.psucc[p_idx] = (1.0 - cp) * self.psucc[p_idx]
                 self.sigmas[p_idx] = self.sigmas[p_idx] * np.exp(
                     (self.psucc[p_idx] - ptarg) / (d * (1.0 - ptarg))
@@ -433,6 +615,12 @@ class StrategyMultiObjective(object):
         self.A           = [A[i]           if ind._ps[0] == "o" else self.A[ind._ps[1]]           for i, ind in enumerate(chosen)]
         self.pc          = [pc[i]          if ind._ps[0] == "o" else self.pc[ind._ps[1]]          for i, ind in enumerate(chosen)]
         self.psucc       = [psucc[i]       if ind._ps[0] == "o" else self.psucc[ind._ps[1]]       for i, ind in enumerate(chosen)]
+
+        # Increment the generation counter once per update() invocation.
+        # Schedule-based features (A3 cht_gamma_schedule, B3 al_tol_schedule)
+        # read this to interpolate their parameters over time.  Counted
+        # here rather than in main.py so the strategy is self-contained.
+        self._generation += 1
 
     # ─────────────────────────────────────────────────────────────────────────
     # CHT resample loop (Chocat 2015 Algorithm 3 step 3-2)
@@ -545,6 +733,12 @@ class StrategyMultiObjective(object):
                 feasible, g = feasibility_check(population[i])
                 population[i]._g = g
                 population[i]._feasible = feasible
+                # Feature C3 (psucc_exclude_resampled): tag the offspring
+                # so update() can later opt-out of feeding it into the
+                # donor parent's psucc / σ adaptation.  Tagging is
+                # unconditional (cheap, just sets a bool); the feature
+                # flag is checked at consumption time.  See update().
+                population[i]._resampled = True
 
         # Cap reached; return how many iterations were spent.
         return max_iterations
@@ -804,6 +998,51 @@ class StrategyMultiObjective(object):
         invCholesky_new = np.linalg.solve(A_new, np.eye(n))
         return A_new, invCholesky_new
 
+    def _chtIsotropyCorrection(self, A, invCholesky):
+        """Pull a covariance Cholesky factor back toward isotropy when
+        its condition number exceeds ``self.cht_kappa_trigger``.
+
+        Feature A4 escape valve.  Independent of infeasibility — fires
+        purely on covariance shape.  Mechanic:
+
+            C = A·Aᵀ ;  C = P diag(vp) Pᵀ  (eigendecompose)
+            if κ(C) > kappa_trigger:
+                vp ← (1-α) vp + α mean(vp)        # blend toward isotropy
+                rescale by exp(log_factor / n)    # preserve det(C)
+                A ← cholesky(C_new)               # re-factor
+
+        Uses ``self.cht_isotropy_alpha`` if set, else defaults to 0.1.
+        Returns ``(A, invCholesky)`` unchanged on a PSD-fallback path
+        (matches the rest of the strategy's defensive style).
+        """
+        n = self.dim
+        C = A @ A.T
+        C = 0.5 * (C + C.T)
+        vp, P = np.linalg.eigh(C)
+        vp = np.maximum(vp, 0.0)
+        vp_min = vp[vp > 0].min() if np.any(vp > 0) else 1e-300
+        kappa = vp[-1] / max(vp_min, 1e-300)
+        if kappa <= self.cht_kappa_trigger:
+            return A, invCholesky
+        alpha = self.cht_isotropy_alpha if self.cht_isotropy_alpha is not None else 0.1
+        vp_mean = float(np.mean(vp))
+        vp_new = (1.0 - alpha) * vp + alpha * vp_mean
+        eps = 1e-300
+        log_factor = (np.sum(np.log(vp + eps))
+                      - np.sum(np.log(vp_new + eps))) / n
+        S = (P * vp_new) @ P.T
+        S = 0.5 * (S + S.T)
+        C_new = np.exp(log_factor) * S
+        C_new = 0.5 * (C_new + C_new.T)
+        try:
+            A_new = np.linalg.cholesky(C_new)
+        except np.linalg.LinAlgError:
+            return A, invCholesky
+        invCholesky_new = scipy.linalg.solve_triangular(
+            A_new, np.eye(n), lower=True,
+        )
+        return A_new, invCholesky_new
+
     def _chtCovarianceUpdate(self, A, invCholesky, parent_idx,
                               parents_snapshot, sigmas_snapshot,
                               infeasible_offspring, gamma=None,
@@ -867,7 +1106,18 @@ class StrategyMultiObjective(object):
                                    lineage_id=lineage_id)
             return A, invCholesky
         if gamma is None:
-            gamma = self.cht_gamma
+            # Feature A3 (cht_gamma_schedule): linearly interpolate γ
+            # from start to end across n_gens generations.  Aggressive
+            # early shrinkage to find feasibility, gentle later
+            # shrinkage to avoid anisotropy lock-in.  Schema:
+            # [start_gamma, end_gamma, n_gens].  Saturates at end_gamma
+            # after self._generation >= n_gens.  None ⇒ static γ.
+            if self.cht_gamma_schedule is not None:
+                start_g, end_g, n_gens = self.cht_gamma_schedule
+                progress = min(1.0, self._generation / max(1, n_gens))
+                gamma = start_g * (1.0 - progress) + end_g * progress
+            else:
+                gamma = self.cht_gamma
 
         x_i = np.asarray(parents_snapshot[parent_idx], dtype=float)
         sigma_i = sigmas_snapshot[parent_idx]
@@ -977,9 +1227,21 @@ class StrategyMultiObjective(object):
                 # epsilon * its prior magnitude.  Without this, large
                 # projections can push sqrt_vp_new[i_eig] negative,
                 # which would make S not PSD.
+                #
+                # Feature A1 (cht_eigenvalue_floor): caps per-call
+                # shrinkage to a configurable fraction of the prior
+                # eigenvalue.  E.g. 0.5 means no axis can lose more than
+                # 50% of its size in a single CHT call.  Hard-bounds
+                # anisotropy build-up.  None ⇒ legacy 1e-10 floor.
+                psd_floor = 1e-10 * max(sqrt_vp[i_eig], 1e-30)
+                if self.cht_eigenvalue_floor is not None:
+                    feature_floor = self.cht_eigenvalue_floor * sqrt_vp[i_eig]
+                    effective_floor = max(psd_floor, feature_floor)
+                else:
+                    effective_floor = psd_floor
                 sqrt_vp_new[i_eig] = max(
                     sqrt_vp_new[i_eig] - gamma * proj_sum * sqrt_vp[i_eig],
-                    1e-10 * max(sqrt_vp[i_eig], 1e-30),
+                    effective_floor,
                 )
 
         # If nothing changed, skip the rest.  Still record a diag entry so
@@ -1000,6 +1262,17 @@ class StrategyMultiObjective(object):
 
         # ── Step 5: hypervolume-preserving rescale (eq. 11) ──────────────
         vp_new = sqrt_vp_new ** 2
+
+        # Feature A2 (cht_isotropy_alpha): pull eigenvalues toward their
+        # mean before the rescale.  Counteracts anisotropy build-up:
+        # vp_relaxed = (1-α) vp + α mean(vp).  α=0 is a no-op; α=1 makes
+        # the covariance fully isotropic in one step (extreme).  The
+        # subsequent log_factor rescale still preserves det(C).
+        if self.cht_isotropy_alpha is not None:
+            alpha = self.cht_isotropy_alpha
+            vp_mean = np.mean(vp_new)
+            vp_new = (1.0 - alpha) * vp_new + alpha * vp_mean
+
         # log-space division avoids overflow / divide-by-zero when any
         # eigenvalue is at the numerical floor.
         eps = 1e-300
