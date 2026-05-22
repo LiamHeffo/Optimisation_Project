@@ -59,7 +59,9 @@ from algorithm.toolbox   import Toolbox
 from algorithm.hypervolume import HyperVolume
 from algorithm.cmaes     import StrategyMultiObjective
 from problem.config      import (
-    APPROX_IDEAL, APPROX_NADIR, BOUNDS,
+    APPROX_IDEAL, APPROX_NADIR,
+    APPROX_IDEAL_2D, APPROX_NADIR_2D,
+    BOUNDS,
     he_lower, he_upper,
     driver_p_lower, driver_p_upper,
     p4_lower, p4_upper,
@@ -74,6 +76,7 @@ from plotting            import (
     plot_objective_space,
     plot_objective_space_3d,
     plot_objective_space_heatmap,
+    plot_holdtime_impactspeed_2d,
 )
 from results_io          import (
     setup_run_directory,
@@ -81,6 +84,7 @@ from results_io          import (
     write_population_csv,
 )
 from cht_diagnostics     import drain_and_persist as _cht_drain_and_persist
+from cht_diagnostics     import drain_and_persist_al as _al_drain_and_persist
 from cht_diagnostics     import plot_cht_diagnostics as _cht_plot
 from utils               import parallelization_setup
 
@@ -97,6 +101,14 @@ creator.create("FitnessMulti", base.Fitness, weights=(-1.0, -1.0, -1.0))
 creator.create("Individual",   list, fitness=creator.FitnessMulti,
                ind_number=int, sim_type=str, bounds=list)
 
+# 2-objective variants used by the CHT_AL sim_type, where delta_vs1 has
+# been moved from a Pareto objective to an Augmented-Lagrangian constraint.
+# Registered unconditionally so the namespace is always populated; main()
+# picks which class to instantiate at run-time based on sim_type.
+creator.create("FitnessMulti2D", base.Fitness, weights=(-1.0, -1.0))
+creator.create("Individual2D",   list, fitness=creator.FitnessMulti2D,
+               ind_number=int, sim_type=str, bounds=list)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Module-level singletons
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,7 +116,9 @@ creator.create("Individual",   list, fitness=creator.FitnessMulti,
 toolbox = Toolbox()
 toolbox.register("evaluate", evaluate)
 
-# Reference point for HV computation: the all-zeros point in normalised space
+# Reference point for HV computation: the all-zeros point in normalised
+# space.  Instantiated as 3-D for legacy sim_types; main() rebinds the
+# name to a 2-D HyperVolume when sim_type == 'CHT_AL'.
 pop_hypervolumes = HyperVolume(np.array((0, 0, 0)))
 
 normalised = True
@@ -117,6 +131,7 @@ RESULTS_CATEGORY = "parent_value_with_recomb"
 RUN_PREFIX       = "pv_w_rec"
 SAVE_INTERVAL    = 10
 
+# Legacy 3-objective output structure (delta_vs1 + hold_time + impact_speed).
 OUTPUT_FOLDERS = [
     "pareto_3d",
     "pareto_heatmap",
@@ -135,15 +150,83 @@ OUTPUT_FOLDERS = [
     "strategy_diagnostics",
 ]
 
+# CHT_AL output structure: 2-objective (no 3-D Pareto plot, no
+# delta_vs1-vs-* plots — delta_vs1 is now a constraint), plus a new
+# al_diagnostics directory mirroring cht_diagnostics for AL telemetry.
+RESULTS_CATEGORY_AL = "al_cht_recomb"
+RUN_PREFIX_AL       = "al_cht"
+OUTPUT_FOLDERS_AL = [
+    "pareto_holdtime_impactspeed",
+    "population",
+    "convergence",
+    "summary",
+    "cht_diagnostics",
+    "strategy_diagnostics",
+    "al_diagnostics",
+]
+
+
+def _run_constants(sim_type):
+    """Resolve sim_type-specific run constants in one place.
+
+    Returns
+    -------
+    (results_category, run_prefix, output_folders, Individual_cls,
+     ideal_point, nadir_point) :
+        Individual_cls is the DEAP class to instantiate for each
+        offspring (Individual for 3-objective, Individual2D for AL).
+        ideal_point / nadir_point are used by the unnormalisation step
+        in the summary writer; they match the dimensionality of the
+        selected Individual_cls.
+    """
+    if sim_type == 'CHT_AL':
+        return (
+            RESULTS_CATEGORY_AL, RUN_PREFIX_AL, OUTPUT_FOLDERS_AL,
+            creator.Individual2D,
+            APPROX_IDEAL_2D, APPROX_NADIR_2D,
+        )
+    return (
+        RESULTS_CATEGORY, RUN_PREFIX, OUTPUT_FOLDERS,
+        creator.Individual,
+        APPROX_IDEAL, APPROX_NADIR,
+    )
+
+
+def _cheap_al_proxy(strategy):
+    """Return the (F̄, ḡ_AL) cheap proxy from the current parent set.
+
+    The AL coefficient adaptation in pycma expects values "at the
+    distribution mean".  In MO-CMA-ES there is no single mean; per the
+    user-confirmed design we average over parents that survived
+    selection.  Zero extra heavy evaluations.
+
+    Returns (None, None) when no parent has both valid fitness and a
+    g_al value (would only happen pathologically — e.g. the entire
+    parent population came from infeasible-on-shock-speed individuals,
+    which selection should have rejected anyway).
+    """
+    Fs, gals = [], []
+    for p in strategy.parents:
+        if p.fitness.valid and getattr(p, "_g_al", None) is not None:
+            Fs.append(sum(p.fitness.values))
+            gals.append(np.asarray(p._g_al, dtype=float))
+    if not Fs:
+        return None, None
+    return float(np.mean(Fs)), np.mean(np.stack(gals, axis=0), axis=0)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Snapshot helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _hv_contributions(population, ref=np.array((0.0, 0.0, 0.0))):
+def _hv_contributions(population, ref=None):
     """Per-individual HV contribution = HV(pop) − HV(pop ∖ {i}).
 
     The HyperVolume class expects "to maximise" inputs, so we negate the
     fitness values (which are all to-minimise) before passing them in.
+
+    The reference point dimensionality is auto-detected from the first
+    feasible individual's fitness tuple — 3-D for legacy sim_types, 2-D
+    for CHT_AL.  Caller may override via ``ref``.
 
     Infeasible individuals (fitness.valid is False) have no fitness and
     therefore no HV contribution; they appear in the returned list as
@@ -155,6 +238,8 @@ def _hv_contributions(population, ref=np.array((0.0, 0.0, 0.0))):
     if not feasible_idx:
         return [None] * len(population)
     fits_neg = np.array([list(population[i].fitness.values) for i in feasible_idx]) * -1
+    if ref is None:
+        ref = np.zeros(fits_neg.shape[1])
     hv = HyperVolume(ref)
     full = hv.compute(fits_neg)
     contribs_feasible = []
@@ -174,13 +259,37 @@ def _build_pop_row(ind, gen, slot_idx, sigma_used, parent_idx, hv_contribution, 
     column so downstream analysis can distinguish "not evaluated" from a
     real zero.  The 'feasible' and 'max_g' columns surface the constraint
     state for post-hoc CHT diagnostics.
+
+    The fitness dimensionality is auto-detected from the individual's
+    fitness tuple.  For CHT_AL (2-D fitness) the legacy delta_vs1 columns
+    are recovered from ``ind._g_al`` (the AL constraint vector, =
+    delta_vs1 - al_tol) so the CSV schema stays stable for downstream
+    analysis tools — the columns are identical, just sourced differently.
     """
     raw_vars    = variable_untransformation(ind, bounds)
     scaled_vars = list(ind)
 
+    is_2d_fitness = (
+        ind.fitness.valid and len(ind.fitness.values) == 2
+    )
+
     if ind.fitness.valid:
-        scaled_objs = list(ind.fitness.values)
-        raw_objs    = list(unnormalise_fitness(ind.fitness.values, APPROX_IDEAL, APPROX_NADIR))
+        scaled_objs_raw = list(ind.fitness.values)
+        if is_2d_fitness:
+            # CHT_AL: fitness is (hold_time, impact_speed) — delta_vs1 is
+            # not in fitness.values but is recoverable from g_al.
+            raw_2d  = list(unnormalise_fitness(ind.fitness.values,
+                                               APPROX_IDEAL_2D, APPROX_NADIR_2D))
+            g_al    = getattr(ind, "_g_al", None)
+            al_tol  = getattr(ind, "al_tol", 100.0)
+            raw_dvs = (float(g_al[0]) + al_tol) if g_al is not None else None
+            raw_objs    = [raw_dvs, raw_2d[0], raw_2d[1]]
+            # delta_vs1 has no normalisation in 2-D mode; emit None.
+            scaled_objs = [None, scaled_objs_raw[0], scaled_objs_raw[1]]
+        else:
+            scaled_objs = scaled_objs_raw
+            raw_objs    = list(unnormalise_fitness(ind.fitness.values,
+                                                   APPROX_IDEAL, APPROX_NADIR))
     else:
         scaled_objs = [None, None, None]
         raw_objs    = [None, None, None]
@@ -284,21 +393,41 @@ def _save_outputs(bookshelf_gen, gen_snapshots, fitness_history, MU, folders):
     All known snapshots are re-written every save trigger so that lazily-
     filled fields (chosen, offspring_ind_number) propagate to disk as the
     information becomes available.
+
+    Plots are routed by fitness dimensionality (auto-detected from
+    fitness_history).  3-D fitness goes to the legacy 5-plot bundle;
+    2-D fitness (CHT_AL) goes to a single hold_time-vs-impact_speed
+    plot — there is no third axis to scatter on.
     """
     pop_dir = folders["population"]
     for g, rows in gen_snapshots.items():
         write_population_csv(pop_dir / f"population_gen_{g:04d}.csv", rows)
 
-    plot_objective_space(fitness_history, 'delta_vs1', 'hold_time',
-                         MU=MU, gen=bookshelf_gen, out_dir=folders["pareto_dvs1_holdtime"])
-    plot_objective_space(fitness_history, 'delta_vs1', 'impact_speed',
-                         MU=MU, gen=bookshelf_gen, out_dir=folders["pareto_dvs1_impactspeed"])
-    plot_objective_space(fitness_history, 'hold_time', 'impact_speed',
-                         MU=MU, gen=bookshelf_gen, out_dir=folders["pareto_holdtime_impactspeed"])
-    plot_objective_space_3d(fitness_history,
-                            MU=MU, gen=bookshelf_gen, out_dir=folders["pareto_3d"])
-    plot_objective_space_heatmap(fitness_history,
-                                 MU=MU, gen=bookshelf_gen, out_dir=folders["pareto_heatmap"])
+    is_2d = (
+        len(fitness_history) > 0
+        and len(fitness_history[0]) == 2
+    )
+
+    if is_2d:
+        # CHT_AL: only one Pareto plot (the 2-D one) — delta_vs1 is no
+        # longer a Pareto axis; it is logged in the AL diagnostics csv.
+        plot_holdtime_impactspeed_2d(
+            fitness_history,
+            MU=MU, gen=bookshelf_gen,
+            out_dir=folders["pareto_holdtime_impactspeed"],
+        )
+    else:
+        # Legacy 3-objective plots (unchanged behaviour).
+        plot_objective_space(fitness_history, 'delta_vs1', 'hold_time',
+                             MU=MU, gen=bookshelf_gen, out_dir=folders["pareto_dvs1_holdtime"])
+        plot_objective_space(fitness_history, 'delta_vs1', 'impact_speed',
+                             MU=MU, gen=bookshelf_gen, out_dir=folders["pareto_dvs1_impactspeed"])
+        plot_objective_space(fitness_history, 'hold_time', 'impact_speed',
+                             MU=MU, gen=bookshelf_gen, out_dir=folders["pareto_holdtime_impactspeed"])
+        plot_objective_space_3d(fitness_history,
+                                MU=MU, gen=bookshelf_gen, out_dir=folders["pareto_3d"])
+        plot_objective_space_heatmap(fitness_history,
+                                     MU=MU, gen=bookshelf_gen, out_dir=folders["pareto_heatmap"])
 
     # Belt-and-braces: each plot_* function calls plt.close() but only
     # on the current figure.  plt.close('all') guarantees no pyplot
@@ -379,14 +508,33 @@ def main(experiment_type):
     sim_type    = experiment_type[0]
     p4_treatment = experiment_type[3]
     step_size   = experiment_type[2]
+    # AL constraint tolerance (m/s on delta_vs1).  Only consumed when
+    # sim_type == 'CHT_AL'; legacy sim_types ignore it.  Default 100 m/s
+    # per the user-confirmed setting.  experiment_type may be a 4-tuple
+    # for legacy YAML entries; fall back to the default in that case.
+    al_tol = experiment_type[4] if len(experiment_type) > 4 else 100.0
 
     print(f"Step Size = {step_size}")
     print(f'Pop Size = {pop_size}\n')
+    if sim_type == 'CHT_AL':
+        print(f'AL tolerance (delta_vs1 ≤): {al_tol} m/s')
 
     # ── Output directory layout ───────────────────────────────────────────
-    run_dir = setup_run_directory(RESULTS_CATEGORY, RUN_PREFIX)
-    folders = setup_subfolders(run_dir, OUTPUT_FOLDERS)
+    # Per-sim_type constants: legacy modes write a 3-objective tree;
+    # CHT_AL writes a 2-objective tree with an extra al_diagnostics dir.
+    (results_category, run_prefix, output_folders,
+     Individual_cls, ideal_point, nadir_point) = _run_constants(sim_type)
+    run_dir = setup_run_directory(results_category, run_prefix)
+    folders = setup_subfolders(run_dir, output_folders)
     print(f"Run directory: {run_dir}")
+
+    # Per-mode HV calculator.  Rebinds the global ``pop_hypervolumes``
+    # name to a local 2-D / 3-D variant — the global lookup at the
+    # bottom of the loop will hit this local instead.  No global access
+    # leaks because no other site in main.py reads pop_hypervolumes.
+    pop_hypervolumes = HyperVolume(
+        np.zeros(2 if sim_type == 'CHT_AL' else 3)
+    )
 
     # ── Logbook initialisation ────────────────────────────────────────────
     gen_counter = 0
@@ -467,12 +615,21 @@ def main(experiment_type):
             # pop_init(1) returns a length-1 list; replace just this slot.
             init_pop_transformed[slot] = variable_transformation(pop_init(1), bounds)[0]
 
-    population = [creator.Individual(x) for x in init_pop_transformed]
+    # Use the dimension-appropriate Individual class — Individual2D for
+    # CHT_AL (2-objective fitness), Individual for the legacy 3-objective
+    # sim_types.  Picked once via _run_constants() above so this is the
+    # only branch needed.
+    population = [Individual_cls(x) for x in init_pop_transformed]
     initial_population = population
 
     for ind in population:
         ind.ind_number = i
         ind.bounds     = bounds
+        # al_tol is read by problem.evaluate.evaluate() when computing
+        # g_al = delta_vs1 - al_tol in CHT_AL mode.  Setting it on every
+        # individual (regardless of sim_type) is harmless: legacy paths
+        # never consult it.
+        ind.al_tol = al_tol
         i += 1
 
     parallelization_setup(population)
@@ -480,8 +637,9 @@ def main(experiment_type):
     for ind in population:
         ind.sim_type   = sim_type
         ind.normalised = normalised
-        fit, g = toolbox.evaluate(ind)
+        fit, g, g_al = toolbox.evaluate(ind)
         ind._g = g
+        ind._g_al = g_al
         ind._feasible = fit is not None
         if ind._feasible:
             ind.fitness.values = fit
@@ -492,10 +650,22 @@ def main(experiment_type):
         mu=MU, lambda_=LAMBDA,
         sim_type=sim_type, p4_treatment=p4_treatment,
         bounds=bounds,
+        al_tol=al_tol,                # consumed only when sim_type=='CHT_AL'
         logbook=toolbox.logbook,      # injected — no global access inside cmaes.py
     )
-    toolbox.register("generate", strategy.generate, creator.Individual)
+    toolbox.register("generate", strategy.generate, Individual_cls)
     toolbox.register("update",   strategy.update)
+
+    # Bootstrap AL coefficients from the initial population's data.
+    # Idempotent: pycma's set_coefficients short-circuits once
+    # _initialized is fully True; we still call it again every generation
+    # below until it is, to refine on additional samples.
+    if sim_type == 'CHT_AL':
+        F_pop  = [sum(ind.fitness.values) for ind in population if ind._feasible]
+        G_AL   = [ind._g_al               for ind in population if ind._feasible]
+        if F_pop:
+            strategy.init_al(F_pop, G_AL)
+            print(f"AL bootstrapped: lam={strategy.al.lam}, mu={strategy.al.mu}")
 
     # maxtasksperchild caps the number of evaluations a worker handles
     # before the Pool kills and respawns it.  This bounds per-worker
@@ -558,14 +728,19 @@ def main(experiment_type):
             i += 1
 
         # CHT-and-resample loop (Chocat 2015 Algorithm 3 step 3-2): for
-        # CovarianceCHT, infeasible offspring drive a covariance shrinkage
-        # of each parent's Cholesky factor and are then resampled from
-        # the tighter distribution.  Cheap because the feasibility check
-        # does NOT call SPARK / PITOT3 — it only evaluates the constraint
-        # vector via problem.feasibility.  Mutates population in place
-        # and tags every Individual with ._g and ._feasible so the post-
-        # eval loop and update()'s post-resample CHT can both consume them.
-        if sim_type == 'CovarianceCHT':
+        # CovarianceCHT and CHT_AL, infeasible offspring drive a covariance
+        # shrinkage of each parent's Cholesky factor and are then
+        # resampled from the tighter distribution.  Cheap because the
+        # feasibility check does NOT call SPARK / PITOT3 — it only
+        # evaluates the constraint vector via problem.feasibility.
+        # Mutates population in place and tags every Individual with
+        # ._g and ._feasible so the post-eval loop and update()'s
+        # post-resample CHT can both consume them.
+        #
+        # In CHT_AL the resample only operates on box+physical g (the
+        # 18-element vector); delta_vs1 is handled separately by the AL
+        # in selection, not via CHT shrinkage.
+        if sim_type in ('CovarianceCHT', 'CHT_AL'):
             def _check(ind):
                 g = evaluate_constraints(ind, bounds)
                 return is_feasible(g), g
@@ -592,18 +767,30 @@ def main(experiment_type):
 
         fixed = False
         for i, (ind, result) in enumerate(zip(population, fitnesses)):
-            fit, g = result
+            fit, g, g_al = result
             ind._g = g
+            ind._g_al = g_al
 
             if fit is None:
                 # Skipped by feasibility short-circuit.  Leave fitness
                 # unset so DEAP's selection treats this individual as
                 # invalid.  The CHT consumes ind._g to update covariance.
+                # In CHT_AL mode, evaluate() already routed PITOT3 / SPARK
+                # failures to fit=None, g_al=None — those individuals are
+                # excluded from AL coefficient adaptation by construction.
                 ind._feasible = False
                 continue
 
             ind._feasible = True
-            normalised_shock_speed = fit[0]
+            # Failure-sentinel detection in legacy 3-objective mode:
+            # fit[0] is normalised delta_vs1 and == 1.0 means PITOT3 hit
+            # its 3500 m/s sentinel.  In CHT_AL mode that path is already
+            # caught inside evaluate() (returns fit=None), so skip the
+            # check rather than indexing a 2-tuple at slot [0] which would
+            # be hold_time, not delta_vs1.
+            normalised_shock_speed = (
+                fit[0] if sim_type != 'CHT_AL' else None
+            )
 
             if normalised_shock_speed == 1.0:
                 # PITOT3 / SPARK reported the failure sentinel even though
@@ -686,12 +873,39 @@ def main(experiment_type):
             strategy=strategy,
         )
 
+        # ── Augmented Lagrangian coefficient update (CHT_AL only) ────
+        # Order matters: this runs AFTER toolbox.update() so the proxy
+        # we feed it is the post-selection parent set — i.e. the search
+        # distribution that will seed the next generate() call.  This is
+        # the closest analogue to the paper's "m^(t+1)" in MOO without
+        # paying for an extra centroid evaluation.
+        #
+        # We also re-call init_al each gen until pycma's set_coefficients
+        # decides it is fully initialised (sign_average balanced, see the
+        # _initialized array) — pycma short-circuits idempotently once
+        # the initial-conditions are met, so the cost is negligible.
+        if sim_type == 'CHT_AL':
+            F_proxy, g_al_proxy = _cheap_al_proxy(strategy)
+            if F_proxy is not None:
+                # Refine bootstrap on additional g_al samples whilst not
+                # yet fully initialised.  No-op once is_initialized=True.
+                if not strategy.al.is_initialized:
+                    F_pop_now = [sum(p.fitness.values) for p in strategy.parents
+                                 if p.fitness.valid and getattr(p, "_g_al", None) is not None]
+                    G_AL_now  = [p._g_al for p in strategy.parents
+                                 if p.fitness.valid and getattr(p, "_g_al", None) is not None]
+                    if F_pop_now:
+                        strategy.init_al(F_pop_now, G_AL_now)
+                strategy.update_al(F_proxy, g_al_proxy)
+                print(f"AL: lam={strategy.al.lam}, mu={strategy.al.mu}, "
+                      f"g_al_proxy={g_al_proxy}")
+
         # Drain CHT diagnostics for this generation.  Must happen AFTER
         # update(), because update()'s post-eval CHT pass also appends to
         # the buffer.  drain_and_persist clears the buffer in place, so
         # next generation starts clean.  Cheap when sim_type isn't
-        # CovarianceCHT (buffer is always empty).
-        if sim_type == 'CovarianceCHT':
+        # CovarianceCHT or CHT_AL (buffer is always empty).
+        if sim_type in ('CovarianceCHT', 'CHT_AL'):
             _cht_drain_and_persist(
                 strategy,
                 gen=bookshelf_gen,
@@ -699,6 +913,16 @@ def main(experiment_type):
                 n_resample_iterations=toolbox.logbook.bookshelf['resample_iterations'][gen],
                 n_infeasible_post_resample=(LAMBDA - n_feasible),
                 n_lambda=LAMBDA,
+            )
+
+        # Drain AL diagnostics (one row per generation) — only writes
+        # anything when sim_type == 'CHT_AL'; for other sim_types the
+        # buffer is empty and this is a no-op write of zero rows.
+        if sim_type == 'CHT_AL':
+            _al_drain_and_persist(
+                strategy,
+                gen=bookshelf_gen,
+                out_dir=folders["al_diagnostics"],
             )
 
         # Mark every snapshot row whose individual is still in
@@ -810,14 +1034,28 @@ def main(experiment_type):
         plt.close()
 
     # ── Output summary text file ──────────────────────────────────────────
+    # ideal_point / nadir_point come from _run_constants() at the top of
+    # main(); they match the dimensionality of fitness_history's tuples
+    # (3-D for legacy, 2-D for CHT_AL) so unnormalise_fitness works
+    # without further branching.
     initial_dimensionalised_fitness = [
-        unnormalise_fitness(ind, APPROX_IDEAL, APPROX_NADIR)
+        unnormalise_fitness(ind, ideal_point, nadir_point)
         for ind in fitness_history[:MU]
     ]
     final_dimensionalised_fitness = [
-        unnormalise_fitness(ind, APPROX_IDEAL, APPROX_NADIR)
+        unnormalise_fitness(ind, ideal_point, nadir_point)
         for ind in fitness_history[-MU:]
     ]
+    # Header used in the per-population objective tables below.  In
+    # CHT_AL mode delta_vs1 has been moved out of fitness_history (it
+    # is a constraint, not an objective) — so the header omits it.
+    objectives_header = (
+        "Driver Hold Time (ms) | Piston Impact Speed (m/s)"
+        if sim_type == 'CHT_AL'
+        else "Residual of Shock Speed (m/s) | Driver Hold Time (ms) | Piston Impact Speed (m/s)"
+    )
+    # ms-conversion column index (hold_time): index 1 in 3-D, index 0 in 2-D.
+    holdtime_col_idx = 0 if sim_type == 'CHT_AL' else 1
 
     sig_figs = 6
 
@@ -858,13 +1096,13 @@ def main(experiment_type):
             file.write(string + '\n')
 
         file.write('\n')
-        file.write("Residual of Shock Speed (m/s) | Driver Hold Time (ms) | Piston Impact Speed (m/s)\n")
+        file.write(objectives_header + "\n")
         for ind in initial_dimensionalised_fitness:
             row = []
             for idx, obj in enumerate(ind):
                 obj = round(obj, sig_figs - str(obj).find('.'))
-                if idx == 1:
-                    obj *= 1e3
+                if idx == holdtime_col_idx:
+                    obj *= 1e3   # seconds → milliseconds
                 row.append(f'{obj}')
             file.write('  '.join(row) + '\n')
 
@@ -882,13 +1120,13 @@ def main(experiment_type):
             file.write(string + '\n')
 
         file.write('\n')
-        file.write("Residual of Shock Speed (m/s) | Driver Hold Time (ms) | Piston Impact Speed (m/s)\n")
+        file.write(objectives_header + "\n")
         for ind in final_dimensionalised_fitness:
             row = []
             for idx, obj in enumerate(ind):
                 obj = round(obj, sig_figs - str(obj).find('.'))
-                if idx == 1:
-                    obj *= 1e3
+                if idx == holdtime_col_idx:
+                    obj *= 1e3   # seconds → milliseconds
                 row.append(f'{obj}')
             file.write('  '.join(row) + '\n')
 
@@ -914,8 +1152,17 @@ if __name__ == "__main__":
     with open(_config_path) as _f:
         _config = yaml.safe_load(_f)
 
+    # 5-tuple: (sim_type, pop_size, step_size, p4_treatment, al_tol).
+    # ``al_tol`` is consumed only by the CHT_AL sim_type; legacy entries
+    # without the field default to 100 m/s and ignore it.
     experiment_types = [
-        (exp["sim_type"], exp["pop_size"], exp["step_size"], exp["p4_treatment"])
+        (
+            exp["sim_type"],
+            exp["pop_size"],
+            exp["step_size"],
+            exp["p4_treatment"],
+            exp.get("al_tol", 100.0),
+        )
         for exp in _config["experiments"]
     ]
 

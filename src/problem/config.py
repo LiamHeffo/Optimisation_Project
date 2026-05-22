@@ -33,6 +33,14 @@ APPROX_IDEAL = (0, 0.01, 0)
 #   (delta_vs1=3500 m/s, hold_time=0 s, impact_speed=350 m/s)
 APPROX_NADIR = (3500, 0, 350)
 
+# 2-objective reference points used by the AL constraint-handling path
+# (CHT_AL sim_type), where delta_vs1 is no longer a Pareto objective but a
+# constraint adapted via Augmented Lagrangian.  These slice off the
+# delta_vs1 entry; their indices match the (hold_time, impact_speed)
+# ordering that evaluate.py emits for AL mode.
+APPROX_IDEAL_2D = (APPROX_IDEAL[1], APPROX_IDEAL[2])
+APPROX_NADIR_2D = (APPROX_NADIR[1], APPROX_NADIR[2])
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Physical design-variable bounds
 # ─────────────────────────────────────────────────────────────────────────────

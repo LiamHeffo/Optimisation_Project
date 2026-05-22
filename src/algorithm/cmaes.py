@@ -30,6 +30,15 @@ from deap import tools
 
 from problem.transforms import variable_untransformation
 
+# pycma's Augmented Lagrangian (Atamna et al 2017 / Dufossé & Hansen 2020).
+# Imported at module level (cheap), but only instantiated when
+# sim_type == 'CHT_AL'.  The class is a single-objective construct; this
+# strategy adapts it to the multi-objective setting by adding the same
+# scalar AL penalty to every objective component (uniform translation in
+# objective space, which preserves Pareto dominance among same-AL
+# individuals while pushing infeasibles uniformly worse).
+from cma.constraints_handler import AugmentedLagrangian
+
 
 class StrategyMultiObjective(object):
     """Multiobjective CMA-ES strategy.
@@ -145,6 +154,103 @@ class StrategyMultiObjective(object):
         for i, p in enumerate(self.parents):
             p._lineage_id = i
         self._next_lineage_id = len(self.parents)
+
+        # ─────────────────────────────────────────────────────────────────
+        # Augmented Lagrangian state (CHT_AL sim_type only)
+        # ─────────────────────────────────────────────────────────────────
+        # AL is layered ON TOP of CHT: CHT shrinks the covariance using the
+        # 18-element box+physical g vector; AL adapts a Lagrangian on the
+        # 1-element g_AL = delta_vs1 - al_tol.  The two never share data.
+        #
+        # set_algorithm(3) selects the g-CDF-based mu-update (muplus3 /
+        # muminus3), which has no scalar-f dependency — making it usable
+        # in multi-objective settings where there is no single fitness.
+        # set_dufosse2020() then overrides chi_domega = 2^(1/sqrt(n)) and
+        # k1 = 10 per Section 4.2 of Dufossé & Hansen 2020.
+        self.al_tol = float(params.get("al_tol", 100.0))
+        if self.sim_type == 'CHT_AL':
+            self.al = AugmentedLagrangian(self.dim, equality=False)
+            self.al.set_algorithm(3)
+            self.al.set_dufosse2020()
+            # Quiet pycma's internal logging — we maintain our own
+            # per-generation diagnostics (see al_diag_buffer below).
+            self.al.logging = 0
+        else:
+            self.al = None
+        # Per-generation AL diagnostic records (appended by update_al,
+        # drained by main.py mirroring the CHT pattern).
+        self.al_diag_buffer = []
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Augmented Lagrangian helpers (CHT_AL sim_type only)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _al_penalty(self, g_al):
+        """Return the scalar AL penalty Σₖ AL(g_AL_k) for one individual.
+
+        For our m=1 case this is a single term.  Returns 0.0 cleanly when
+        AL is disabled or coefficients have not been bootstrapped yet, so
+        callers can use it unconditionally.
+
+        Why we gate on ``lam is not None`` and not ``al.is_initialized``:
+        pycma's ``is_initialized`` flag only flips to True when the
+        empirical sign-average of g (across recent calls) is balanced —
+        which can take ``2 + n`` generations to satisfy in the
+        all-infeasible regime.  But ``set_coefficients`` populates lam/mu
+        immediately on the first call, and pycma's ``al(g)`` callable
+        returns a real penalty as soon as those exist.  Gating on
+        ``is_initialized`` would silently zero out the penalty for the
+        first several generations of a real run.
+        """
+        if (self.al is None
+                or self.al.lam is None
+                or g_al is None):
+            return 0.0
+        return float(sum(self.al(np.asarray(g_al, dtype=float))))
+
+    def init_al(self, F_pop, G_AL_pop):
+        """Bootstrap the AL coefficients from one generation's worth of data.
+
+        ``F_pop`` is a list of scalar fitness aggregates per individual
+        (in MOO, we use ``sum(fitness.values)`` — pycma's
+        ``set_coefficients`` only uses ``iqr(F)`` as a magnitude scale,
+        so any reasonable scalar surrogate works).  ``G_AL_pop`` is a
+        list of g_al vectors (each length 1 for our case).
+
+        No-op if AL is disabled.  Idempotent — pycma's
+        ``set_coefficients`` skips work once coefficients are fully set.
+        """
+        if self.al is None:
+            return
+        if len(F_pop) == 0 or len(G_AL_pop) == 0:
+            return
+        self.al.set_coefficients(np.asarray(F_pop, dtype=float),
+                                 np.asarray(G_AL_pop, dtype=float))
+
+    def update_al(self, F_proxy_scalar, g_al_proxy):
+        """Per-generation update of γ and μ from the parent-centroid proxy.
+
+        With ``set_algorithm(3)`` the μ-update is g-only (muplus3 /
+        muminus3 use the empirical CDF of recent g values).  ``F_proxy_scalar``
+        is therefore unused inside pycma's update branch we selected, but
+        we still pass it through so the ``self.f`` cached state stays
+        consistent for any future algorithm switch.
+        """
+        if self.al is None or not self.al.is_initialized:
+            return
+        self.al.update(float(F_proxy_scalar),
+                       np.asarray(g_al_proxy, dtype=float))
+        # Snapshot for diagnostics — captured here rather than at the
+        # call site so the format stays consistent across cmaes.py
+        # internals.  ``lam`` and ``mu`` are length-m numpy arrays.
+        self.al_diag_buffer.append({
+            "g_al_proxy":     np.asarray(g_al_proxy, dtype=float).tolist(),
+            "f_proxy_scalar": float(F_proxy_scalar),
+            "lam":            self.al.lam.tolist(),
+            "mu":             self.al.mu.tolist(),
+            "al_pen_proxy":   self._al_penalty(g_al_proxy),
+            "count":          int(self.al.count),
+        })
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public interface
@@ -517,6 +623,52 @@ class StrategyMultiObjective(object):
 
     def _select(self, candidates):
         """Select mu individuals from candidates using Pareto ranking + hypervolume.
+
+        In CHT_AL mode the Pareto sort and HV indicator operate on the
+        AL-augmented fitness — i.e. f_i + Σₖ AL(g_AL_k) for every
+        objective component — so infeasibles (in the AL sense) are biased
+        worse but the Pareto structure among same-AL individuals is
+        preserved.  The augmentation is implemented by monkey-swapping
+        ``ind.fitness.values`` for the duration of the sort and restoring
+        afterwards via try/finally.  This pattern keeps DEAP's
+        ``sortLogNondominated`` and the HV indicator untouched.
+
+        For all other sim_types this is a no-op; the original raw fitness
+        is sorted exactly as before.
+        """
+        # ── AL augmentation: enter ───────────────────────────────────────
+        # Build a snapshot of (id(ind) -> original fitness.values) so we
+        # can restore even if downstream code throws.  We only augment in
+        # CHT_AL mode AND only after AL has been initialised (the very
+        # first generation runs raw, since lam=0 and mu=0 make AL == 0
+        # anyway and the bootstrapping happens after gen 0 selection).
+        original_fitness = {}
+        if self.sim_type == 'CHT_AL' and self.al is not None and self.al.is_initialized:
+            for ind in candidates:
+                if not ind.fitness.valid:
+                    continue
+                g_al = getattr(ind, "_g_al", None)
+                pen = self._al_penalty(g_al)
+                if pen == 0.0:
+                    continue
+                original_fitness[id(ind)] = ind.fitness.values
+                ind.fitness.values = tuple(v + pen for v in ind.fitness.values)
+
+        try:
+            return self._select_pareto(candidates)
+        finally:
+            # ── AL augmentation: exit ────────────────────────────────────
+            # Restore original fitness on every path (success or exception).
+            # Without this, downstream HV plots and CSV writers would log
+            # AL-shifted values as if they were raw — wrong.
+            for ind in candidates:
+                key = id(ind)
+                if key in original_fitness:
+                    ind.fitness.values = original_fitness[key]
+
+    def _select_pareto(self, candidates):
+        """The original Pareto + HV selection, factored out so _select can
+        wrap it with the AL augmentation.
 
         Infeasible candidates (those with ``_feasible == False``, set by the
         evaluation pipeline when the constraint vector is violated and no

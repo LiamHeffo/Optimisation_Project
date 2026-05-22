@@ -40,9 +40,19 @@ from pitot3_utils.pitot3_classes import (
 from pitot3 import StrictBoolSafeLoader
 
 from problem.config import (
-    base_config_dict, base_driver_dict, APPROX_IDEAL, APPROX_NADIR, BOUNDS,
+    base_config_dict, base_driver_dict,
+    APPROX_IDEAL, APPROX_NADIR,
+    APPROX_IDEAL_2D, APPROX_NADIR_2D,
+    BOUNDS,
 )
 from problem.transforms import variable_untransformation, normalise_fitness
+
+# PITOT3 returns this sentinel value (m/s) when its shock-speed solver
+# fails or any of the heuristic pre-checks bail.  Any delta_vs1 ==
+# _PITOT3_FAILURE_SENTINEL is treated as a failed evaluation (not a real
+# constraint reading); in CHT_AL mode the individual is _feasible=False
+# and excluded from AL coefficient adaptation.
+_PITOT3_FAILURE_SENTINEL = 3500
 from problem.feasibility import evaluate_constraints, is_feasible
 from utils import valid
 from algorithm.penalty import ClosestValidPenalty
@@ -355,20 +365,32 @@ def evaluate(x):
 
     Returns
     -------
-    (fit, g) : tuple
-        fit : tuple of three normalised objective values, or None.
-              None means the individual is infeasible and SPARK + PITOT3
-              were not run.  For the 'Penalty' sim_type, fit is always
-              not-None (penalty handler returns a degraded fitness).
-        g   : np.ndarray, the signed constraint vector (see
-              problem.feasibility).  Always returned regardless of
-              feasibility — the CHT consumes g for the covariance update.
+    (fit, g, g_al) : 3-tuple
+        fit  : tuple of objective values, or None.
+                 - For legacy sim_types: a 3-tuple
+                   (delta_vs1, hold_time, impact_speed), normalised.
+                 - For 'CHT_AL': a 2-tuple (hold_time, impact_speed),
+                   normalised — delta_vs1 is no longer a Pareto objective.
+                 None means the individual is infeasible (box+phys violated,
+                 or in CHT_AL mode the shock-speed simulation failed).
+                 SPARK / PITOT3 were not run, or were run but produced
+                 the failure sentinel; either way no fitness is recorded.
+        g    : np.ndarray, the box+physical constraint vector (length 18
+                 for n=6).  Always returned regardless of feasibility —
+                 the CHT consumes g for the covariance update.
+        g_al : np.ndarray of length 1, or None.
+                 - For 'CHT_AL': np.array([delta_vs1 - al_tol]) — the
+                   Augmented-Lagrangian constraint vector (one entry).
+                 - For all other sim_types: None.
+                 None when fit is None, since AL coefficient adaptation
+                 only consumes paired (f, g_al) data from successful
+                 evaluations.
 
-    Behaviour change (Phase 1 of CHT work)
-    --------------------------------------
-    Constraints are now evaluated before SPARK + PITOT3.  Infeasible
-    candidates short-circuit and never spend a heavy evaluation.  The
-    'Penalty' sim_type retains its original always-evaluate semantics.
+    Behaviour change (CHT_AL phase)
+    -------------------------------
+    The 3-tuple return is uniform across sim_types so callers can always
+    write ``fit, g, g_al = evaluate(x)``.  Legacy sim_types receive
+    g_al=None and ignore it.
     """
     g = evaluate_constraints(x, x.bounds)
 
@@ -383,15 +405,48 @@ def evaluate(x):
             )
         else:
             fit = ClosestValidPenalty.wrapper(x)
-        return fit, g
+        return fit, g, None
 
-    # Non-Penalty path: skip the heavy evaluators when infeasible.
+    if x.sim_type == "CHT_AL":
+        # AL path: delta_vs1 becomes a constraint; objectives are 2-D.
+        # Box+phys infeasible => no PITOT3 / SPARK, no AL data.
+        if not is_feasible(g):
+            return None, g, None
+
+        delta_vs = constraint_function(x, x.bounds)
+
+        # Treat any PITOT3 failure (sentinel return) as infeasible.  Per
+        # user choice: don't feed the sentinel into AL coefficient
+        # adaptation — it isn't a real constraint reading.
+        if delta_vs >= _PITOT3_FAILURE_SENTINEL:
+            return None, g, None
+
+        hold_time, impact_speed = objective_function(x, x.bounds)
+        # SPARK failure also yields _feasible=False and no AL data.
+        # objective_function returns (0, 350) on failure; detect via the
+        # hold_time==0 sentinel (impact_speed==350 alone could be a real
+        # but bad outcome at the upper bound, hold_time==0 cannot).
+        if hold_time == 0:
+            return None, g, None
+
+        fit_2d = normalise_fitness(
+            (hold_time, impact_speed), APPROX_IDEAL_2D, APPROX_NADIR_2D,
+        )
+        # AL constraint vector: g_AL_k(x) = delta_vs1(x) - al_tol  (≤ 0).
+        # We use the un-normalised delta_vs1 here so the AL coefficients
+        # adapt on the natural scale of the constraint; pycma's
+        # set_coefficients() will derive its own scaling from iqr(F)/iqr(G).
+        al_tol = getattr(x, "al_tol", 100.0)
+        g_al = np.array([delta_vs - al_tol], dtype=float)
+        return fit_2d, g, g_al
+
+    # Non-Penalty, non-AL path (legacy 3-objective sim_types).
     if not is_feasible(g):
-        return None, g
+        return None, g, None
 
     delta_vs = constraint_function(x, x.bounds)
     hold_time, impact_speed = objective_function(x, x.bounds)
     fit = normalise_fitness(
         (delta_vs, hold_time, impact_speed), APPROX_IDEAL, APPROX_NADIR,
     )
-    return fit, g
+    return fit, g, None

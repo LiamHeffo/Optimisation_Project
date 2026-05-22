@@ -19,6 +19,17 @@
 #                                          from every infeasible across the swarm,
 #                                          weighted by closeness in that parent's
 #                                          metric.  See _chtCovarianceUpdate.
+#                    'CHT_AL'           – CovarianceCHT (above) PLUS Augmented
+#                                          Lagrangian handling of delta_vs1.
+#                                          Problem becomes 2-objective
+#                                          (hold_time, impact_speed); delta_vs1
+#                                          is a constraint adapted via pycma's
+#                                          AugmentedLagrangian (algorithm 3,
+#                                          Dufossé & Hansen 2020 χ setting).
+#                                          MUST set p4_treatment: null and is
+#                                          incompatible with the legacy plot
+#                                          and CSV layouts (writes its own
+#                                          al_diagnostics directory).
 #
 #   pop_size     : population size  (MU = LAMBDA = pop_size)
 #
@@ -27,27 +38,45 @@
 #   p4_treatment : how to enforce the upper p4 bound after mutation
 #                    'hard_bounds_on_p4' – re-transform to stay within the physical p4 limit
 #                    null                – no special treatment.  Mandatory for
-#                                          'CovarianceCHT' since the CHT replaces
-#                                          repair entirely.
+#                                          'CovarianceCHT' and 'CHT_AL' since
+#                                          the CHT replaces repair entirely.
+#
+#   al_tol       : (CHT_AL only) tolerance ε in m/s for the AL constraint
+#                  g_AL(x) = delta_vs1(x) - ε ≤ 0.  Default 100 m/s
+#                  (≈ 2% of the 4900 m/s shock-speed target).  Smaller values
+#                  drive the AL toward a tighter delta_vs1 at the cost of
+#                  longer convergence; larger values relax the constraint.
 
 experiments:
-  - sim_type: CovarianceCHT
+  - sim_type: CHT_AL
     pop_size: 12
     step_size: 0.05
     p4_treatment: null
+    al_tol: 100.0
 
-  - sim_type: ParentValue
-    pop_size: 12
-    step_size: 0.5
-    p4_treatment: hard_bounds_on_p4
+  # Legacy 3-objective comparators — uncomment to A/B against the AL run.
+  # - sim_type: CovarianceCHT
+  #   pop_size: 12
+  #   step_size: 0.05
+  #   p4_treatment: null
 
-  - sim_type: ParentValue
-    pop_size: 36
-    step_size: 0.5
-    p4_treatment: hard_bounds_on_p4
+  # - sim_type: CovarianceCHT
+  #   pop_size: 36
+  #   step_size: 0.05
+  #   p4_treatment: null
 
-  - sim_type: ParentValue
-    pop_size: 36
-    step_size: 0.5
-    p4_treatment: hard_bounds_on_p4
+  # - sim_type: CovarianceCHT
+  #   pop_size: 12
+  #   step_size: 0.5
+  #   p4_treatment: null
+
+  # - sim_type: ParentValue
+  #   pop_size: 36
+  #   step_size: 0.5
+  #   p4_treatment: hard_bounds_on_p4
+
+  # - sim_type: ParentValue
+  #   pop_size: 36
+  #   step_size: 0.5
+  #   p4_treatment: hard_bounds_on_p4
 

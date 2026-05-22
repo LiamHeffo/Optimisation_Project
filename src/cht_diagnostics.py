@@ -166,6 +166,61 @@ def append_per_gen_row(csv_path: Path, gen: int, records: list[dict],
     return row
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Augmented Lagrangian diagnostics (CHT_AL sim_type)
+# ─────────────────────────────────────────────────────────────────────────────
+# AL telemetry is structurally simpler than the per-call CHT records: one
+# row per generation, capturing γ, μ and the proxy (f, g_al) used for the
+# update.  We use a separate file (al_per_gen.csv) and a separate drain
+# helper rather than wedging AL columns into cht_per_gen.csv, because AL
+# state is independent of CHT state and we want both visible side-by-side
+# in plots without forcing a join.
+
+AL_PER_GEN_FIELDS = [
+    "generation",
+    "count",                 # pycma's internal AL update counter
+    "f_proxy_scalar",        # cheap-proxy aggregate of f at parent centroid
+    "g_al_proxy",            # cheap-proxy g_AL at parent centroid (JSON list)
+    "lam",                   # Lagrangian coefficients (JSON list)
+    "mu",                    # penalty coefficients      (JSON list)
+    "al_pen_proxy",          # AL penalty at the proxy point
+]
+
+
+def append_al_per_gen_rows(csv_path: Path, gen: int, records: list[dict]) -> None:
+    """Append one CSV row per AL diagnostic record (typically one per gen).
+
+    Writes a header row on first call (when the file does not yet exist).
+    """
+    csv_path = Path(csv_path)
+    is_new = not csv_path.exists()
+    with csv_path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=AL_PER_GEN_FIELDS)
+        if is_new:
+            writer.writeheader()
+        for rec in records:
+            row = {"generation": gen}
+            for k in AL_PER_GEN_FIELDS[1:]:
+                row[k] = _jsonify(rec.get(k))
+            writer.writerow(row)
+
+
+def drain_and_persist_al(strategy, gen: int, out_dir: Path) -> list[dict]:
+    """Drain ``strategy.al_diag_buffer`` and append to al_per_gen.csv.
+
+    Mirrors ``drain_and_persist`` for CHT.  Cheap when the buffer is
+    empty (sim_type != CHT_AL), so it can be called unconditionally.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    records = list(getattr(strategy, "al_diag_buffer", []))
+    if hasattr(strategy, "al_diag_buffer"):
+        strategy.al_diag_buffer.clear()
+    if records:
+        append_al_per_gen_rows(out_dir / "al_per_gen.csv", gen, records)
+    return records
+
+
 def drain_and_persist(strategy, gen: int, out_dir: Path,
                        n_resample_iterations: int,
                        n_infeasible_post_resample: int,

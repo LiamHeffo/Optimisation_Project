@@ -127,6 +127,43 @@ def plot_objective_space(fitness_history, obj1, obj2, **kwargs):
         plt.close()
 
 
+def plot_holdtime_impactspeed_2d(fitness_history, **kwargs):
+    """2-objective Pareto scatter for the CHT_AL run mode.
+
+    In CHT_AL the fitness tuple is 2-D (hold_time, impact_speed) — delta_vs1
+    is no longer a Pareto objective but an Augmented-Lagrangian constraint.
+    This is a focused twin of ``plot_objective_space(... 'hold_time',
+    'impact_speed')`` that reads from the correct slots:
+    entry[0] = hold_time, entry[1] = impact_speed (vs entry[1], entry[2]
+    in the 3-D case).
+    """
+    MU         = kwargs.get('MU',         10)
+    gen        = kwargs.get('gen',         0)
+    normalised = kwargs.get('normalised',  True)
+    out_dir    = kwargs.get('out_dir',     None)
+
+    plt.figure(dpi=200)
+    plt.title("Pareto Frontier (CHT_AL)")
+    plt.xlabel("Normalised Hold Time")
+    plt.ylabel("Normalised Impact Speed")
+
+    hold_time_history    = [entry[0] for entry in fitness_history]
+    impact_speed_history = [entry[1] for entry in fitness_history]
+
+    if normalised:
+        plt.xlim((0, 1.1))
+        plt.ylim((0, 1.1))
+    else:
+        plt.ylim((-0.005, 2 * np.max(impact_speed_history)))
+
+    plt.scatter(hold_time_history,       impact_speed_history,       facecolors='none', edgecolors='lightblue')
+    plt.scatter(hold_time_history[-MU:], impact_speed_history[-MU:], facecolors='none', edgecolors='purple')
+
+    filename = f"pareto_holdtime_impactspeed_gen_{gen:04d}.png"
+    plt.savefig(_resolve_path(filename, out_dir))
+    plt.close()
+
+
 def plot_objective_space_3d(fitness_history, **kwargs):
     """3D scatter of the full normalised objective space.
 
