@@ -1,400 +1,141 @@
 """
-X2 free-piston driver evaluation functions.
+X2 free-piston driver evaluation — L1d4 implementation.
 
-constraint_function(x, bounds)
-    Calls PITOT3 to compute |vs - 4900| (shock speed residual).
+This is the l1d_cht_al branch's replacement for the SPARK + PITOT3
+evaluation path on the parent CHT_AL branch.  All three measured
+quantities now come from a single L1d4 simulation per individual:
 
-objective_function(x, bounds)
-    Calls SPARK to compute (hold_time, impact_speed).
+    hold_time        : duration that the driver pressure at the primary
+                       diaphragm sits within ±10% of p_burst, post-burst.
+    impact_speed     : piston velocity at the moment on_buffer flips.
+    delta_vs1        : |vs1 - 4900| from time-of-flight between two
+                       shock-tube transducers.
 
-evaluate(x)
-    Combines both, applies normalisation, handles the Penalty sim_type.
+The function signatures, sentinel values, and return shapes match the
+SPARK + PITOT3 path so that ``main.py`` (sentinel detection, AL plumbing,
+logbook counters) is untouched.
 
-Logbook injection
------------------
-objective_function() records run-time counters (failed evaluations, etc.)
-into a Logbook bookshelf.  Rather than reading a global, it uses the module-
-level _logbook variable.  Call set_logbook(logbook) from main.py after the
-Toolbox is constructed.
+Sentinel encoding (preserved across the SPARK → L1d port):
+    objectives  : (hold_time, impact_speed) = (0, 350) on failure
+    constraint  : delta_vs1 = 3500 on failure (the _PITOT3_FAILURE_SENTINEL
+                  constant that main._detect_sentinels grep against).
 """
-
-import contextlib
-import os
-import signal
 import sys
-import yaml
+
 import numpy as np
 
-import spark
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-evaluation timeout (Linux SIGALRM).  See memory
-# project_gdtk_exception_leak: gdtk's D→C wrapper catches GasFlowException
-# and prints "Exception message: …" to stderr but does NOT raise on the
-# Python side, so a pathological design can leave SPARK or PITOT3 looping
-# inside the worker forever.  multiprocessing.Pool.map then blocks the
-# whole run.  We wrap both heavy evaluators in an alarm that turns a hang
-# into a Python exception, which the existing try/except routes to the
-# established failure sentinels (3500 for PITOT3, (0, 350) for SPARK).
-# Pure-C deadlocks that never yield to Python cannot be interrupted this
-# way; if that ever bites we'll need to escalate to pool.apply_async with
-# worker termination.
-# ─────────────────────────────────────────────────────────────────────────────
-
-_EVAL_TIMEOUT_S = 15 * 60   # 15 min; healthy SPARK eval is seconds-to-minutes.
-
-
-class EvalTimeout(Exception):
-    """Raised when SPARK or PITOT3 exceeds its per-evaluation budget."""
-
-
-@contextlib.contextmanager
-def _eval_timeout(seconds, label):
-    def _handler(signum, frame):
-        raise EvalTimeout(f"{label} exceeded {seconds}s budget")
-    old_handler = signal.signal(signal.SIGALRM, _handler)
-    signal.alarm(seconds)
-    try:
-        yield
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
-
-
-# SPARK's sim.run() prints a "t_hold = ..." line per evaluation, which
-# floods the terminal at λ ~ 12 × hundreds of generations.  We silence
-# its stdout below.  stderr is left untouched so real errors still
-# surface, and the genuine exception-handler print() inside
-# objective_function() is routed to stderr explicitly.
-_DEVNULL = open(os.devnull, "w")
-from gdtk.gas import GasModel, GasState
-from pitot3_utils.pitot3_classes import (
-    Facility, Driver, Tube,
-)
-from pitot3 import StrictBoolSafeLoader
-
 from problem.config import (
-    base_config_dict, base_driver_dict,
     APPROX_IDEAL, APPROX_NADIR,
     APPROX_IDEAL_2D, APPROX_NADIR_2D,
-    BOUNDS,
+    BOUNDS, base_config_dict,
 )
-from problem.transforms import variable_untransformation, normalise_fitness
-
-# PITOT3 returns this sentinel value (m/s) when its shock-speed solver
-# fails or any of the heuristic pre-checks bail.  Any delta_vs1 ==
-# _PITOT3_FAILURE_SENTINEL is treated as a failed evaluation (not a real
-# constraint reading); in CHT_AL mode the individual is _feasible=False
-# and excluded from AL coefficient adaptation.
-_PITOT3_FAILURE_SENTINEL = 3500
 from problem.feasibility import evaluate_constraints, is_feasible
+from problem.transforms import variable_untransformation, normalise_fitness
+from problem.l1d_job import run_l1d, TRANSDUCER_XS
 from utils import valid
 from algorithm.penalty import ClosestValidPenalty
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Logbook injection — avoids accessing a global toolbox from inside the
-# evaluation functions.  Set this once from main.py after toolbox creation.
+# Sentinel constant — name retained for main._detect_sentinels (which still
+# imports it as _PITOT3_FAILURE_SENTINEL).  Semantically it is now the L1d
+# vs1-failure sentinel, but the numerical value is the same so the rest of
+# the pipeline does not need to change.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PITOT3_FAILURE_SENTINEL = 3500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logbook injection — unchanged
 # ─────────────────────────────────────────────────────────────────────────────
 
 _logbook = None
 
 
 def set_logbook(logbook):
-    """Register the run logbook so that objective_function can update counters."""
+    """Register the run logbook so that evaluate() can update counters."""
     global _logbook
     _logbook = logbook
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Constraint function — PITOT3 shock-speed residual
-# ─────────────────────────────────────────────────────────────────────────────
+def _log_failure():
+    """Increment the SPARK-failure counters when a heavy evaluation fails.
 
-def constraint_function(x1, bounds):
-    """Evaluate the shock-speed constraint via PITOT3.
-
-    Parameters
-    ----------
-    x1 : Individual
-        Normalised-space individual; must carry an .ind_number attribute.
-    bounds : list of (lo, hi)
-        Physical-space bounds (used by variable_untransformation).
-
-    Returns
-    -------
-    float
-        |vs - vs1| in m/s, or 3500 (penalty) on failure.
+    Counter names retained from the SPARK era — they still measure
+    "individual produced no usable objective values" on the L1d branch,
+    so the semantics survive the port.
     """
-    ind_number = x1.ind_number
-    test_name = f"DEAP_tests_{ind_number}"
+    if _logbook is not None:
+        _logbook.bookshelf["No. individuals that failed objective tests"] += 1
+        _logbook.bookshelf["No. individuals that produced no hold time"]  += 1
 
-    # Anchor the working-directory paths on __file__ rather than on
-    # os.getcwd().  Workers chdir into PITOT3 test directories during
-    # their evaluations, so cwd is unreliable across calls in the same
-    # worker — the previous getcwd-then-string-slice hack only happened
-    # to work when the project path was exactly 35 chars long.  Using
-    # __file__ resolves the same path every call and matches where
-    # parallelization_setup() (utils.py) creates the directories:
-    # <src/>/PITOT3_Outputs/DEAP_tests_<i>.
-    starting_working_directory = os.getcwd()              # for cwd restore at exit
-    src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    target_dir = os.path.join(src_dir, "PITOT3_Outputs", test_name)
-    os.makedirs(target_dir, exist_ok=True)                # defensive: create if missing
-    os.chdir(target_dir)
 
-    x = variable_untransformation(x1, bounds)
+# ─────────────────────────────────────────────────────────────────────────────
+# Heuristic pre-checks
+# ─────────────────────────────────────────────────────────────────────────────
+# These guarded the SPARK/PITOT3 pipeline against obviously-broken designs.
+# They are tool-independent (they enforce physical sanity on the design
+# vector itself), so they are preserved verbatim.
 
-    # ── Heuristic pre-checks ──────────────────────────────────────────────
-    driver_dict = base_driver_dict(x)
-
+def _heuristic_passes(driver_dict):
+    """Return True if the design clears the cheap physical pre-checks."""
     if driver_dict['driver_p'] > driver_dict['reservoir_p']:
-        print("bad guess")
-        os.chdir(starting_working_directory)
-        return 3500
-
-    if 0.085 < driver_dict['D_throat'] < 0:
-        print("bad guess")
-        os.chdir(starting_working_directory)
-        return 3500
-
+        return False
+    if 0.0849 < driver_dict['D_throat'] < 0:    # legacy clause; kept for parity
+        return False
     pressure_ratio = driver_dict["p4"] / driver_dict["driver_p"]
     compression_ratio = pressure_ratio ** (1 / 1.667)
     if not (5 < compression_ratio < 70):
-        print("bad guess")
-        os.chdir(starting_working_directory)
-        return 3500
-
-    if driver_dict['p4'] > bounds[2][1]:
-        print("bad guess")
-        os.chdir(starting_working_directory)
-        return 3500
-
-    # ── Build PITOT3 configuration ────────────────────────────────────────
-    config_data = base_config_dict()
-
-    preset_gas_models_folder = '$PITOT3_DATA/preset_gas_models'
-    driver_gmodel_location = '{0}/thermally-perfect-{1}-gas-model.lua'.format(
-        preset_gas_models_folder, driver_dict['driver_fill_gas_name']
-    )
-    gmodel = GasModel(os.path.expandvars(driver_gmodel_location))
-
-    # Isentropic compression to find T4
-    state4i = GasState(gmodel)
-    state4i.p = driver_dict['driver_p']
-    state4i.T = 298.15
-
-    molecular_mass_dict = {'Ar': 39.948, 'He': 4.002602}
-    total_molecular_mass = sum(
-        molecular_mass_dict[sp] * driver_dict['driver_fill_composition'][sp]
-        for sp in driver_dict['driver_speciesList']
-    )
-    state4i.massf = {
-        sp: driver_dict['driver_fill_composition'][sp] * (molecular_mass_dict[sp] / total_molecular_mass)
-        for sp in driver_dict['driver_speciesList']
-    }
-    state4i.update_thermo_from_pT()
-    state4i.update_sound_speed()
-    gamma = state4i.gamma
-
-    driver_dict['T4'] = state4i.T * (driver_dict['p4'] / state4i.p) ** (1.0 - 1.0 / gamma)
-
-    # ── Facility and tube setup ───────────────────────────────────────────
-    facility_yaml_filename = '$PITOT3_DATA/facilities/{0}.yaml'.format(config_data['facility'])
-    facility_yaml_file = open(os.path.expandvars(facility_yaml_filename))
-    facility_input_data = yaml.load(facility_yaml_file, Loader=yaml.FullLoader)
-    facility = Facility(facility_input_data)
-
-    config_data['facility_type'] = facility.get_facility_type()
-    D_shock_tube = facility.shock_tube_diameter
-
-    outputUnits = 'moles'
-    species_molecular_weights_filename = '$PITOT3_DATA/PITOT3_species_molecular_weights.yaml'
-    species_MW_dict = yaml.load(
-        open(os.path.expandvars(species_molecular_weights_filename)),
-        Loader=StrictBoolSafeLoader,
-    )
-
-    T_0, p_0 = 298.15, 101325.0
-
-    driver = Driver(
-        driver_dict, p_0=p_0, T_0=T_0,
-        preset_gas_models_folder=preset_gas_models_folder,
-        outputUnits=outputUnits, species_MW_dict=species_MW_dict,
-        D_shock_tube=D_shock_tube,
-    )
-
-    state3s = driver.get_exit_state()
-
-    shock_tube_length, shock_tube_diameter = facility.get_shock_tube_length_and_diameter()
-
-    shock_tube = Tube(
-        tube_name='shock_tube',
-        tube_length=shock_tube_length,
-        tube_diameter=shock_tube_diameter,
-        fill_pressure=float(config_data['p1']),
-        fill_temperature=298.15,
-        fill_gas_model=config_data['test_gas_gas_model'],
-        fill_gas_name=config_data['test_gas_name'],
-        fill_gas_filename=None,
-        fill_state_name='s1',
-        shocked_fill_state_name='s2',
-        entrance_state_name=driver.get_exit_state_name(),
-        entrance_state=state3s,
-        unsteadily_expanded_entrance_state_name='s3',
-        expand_to='flow_behind_shock',
-        expansion_factor=1.0,
-        preset_gas_models_folder=preset_gas_models_folder,
-        unsteady_expansion_steps=100,
-        vs_guess_1=2000, vs_guess_2=5000,
-        vs_limits=[400, 20000], vs_tolerance=1e-4,
-        outputUnits=outputUnits, species_MW_dict=species_MW_dict,
-    )
-
-    try:
-        with _eval_timeout(_EVAL_TIMEOUT_S, "PITOT3 calculate_shock_speed_and_related_states"):
-            shock_tube.calculate_shock_speed_and_related_states()
-    except Exception as e:
-        print(f"{e}")
-        print(f"x = {x}")
-        os.chdir(starting_working_directory)
-        return 3500
-
-    os.chdir(starting_working_directory)
-    return np.abs(shock_tube.vs - 4900)
+        return False
+    if driver_dict['p4'] > BOUNDS[2][1]:
+        return False
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Objective function — SPARK piston dynamics
+# Single heavy evaluation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def objective_function(x, bounds):
-    """Evaluate hold time and piston impact speed via SPARK.
+def _evaluate_l1d(x_normalised, ind_number, bounds):
+    """Run L1d once for ``x`` and return ``(t_hold, impact, delta_vs)``.
 
-    Parameters
-    ----------
-    x : Individual
-        Normalised-space individual.
-    bounds : list of (lo, hi)
-        Physical-space bounds.
-
-    Returns
-    -------
-    (hold_time, impact_speed) : (float, float)
-        Physical values.  Returns (0, 350) for failed/infeasible evaluations.
+    Returns the SPARK-equivalent sentinel triple on any failure or
+    pre-check rejection, so the caller does not need to distinguish.
     """
-    x = variable_untransformation(x, bounds)
-
-    driver_condition_dict = {
-        'percent_He':    x[0],
-        'driver_p':      x[1],
-        'p4':            x[2],
-        'D_throat':      x[3],
-        'reservoir_p':   x[4],
-        'buffer_length': x[5],
+    x_phys = variable_untransformation(x_normalised, bounds)
+    driver_dict = {
+        'percent_He':    x_phys[0],
+        'driver_p':      x_phys[1],
+        'p4':            x_phys[2],
+        'D_throat':      x_phys[3],
+        'reservoir_p':   x_phys[4],
+        'buffer_length': x_phys[5],
     }
 
-    def _log_failure():
-        if _logbook is not None:
-            _logbook.bookshelf["No. individuals that failed objective tests"] += 1
-            _logbook.bookshelf["No. individuals that produced no hold time"]  += 1
-
-    # ── Heuristic pre-checks ──────────────────────────────────────────────
-    if driver_condition_dict['driver_p'] > driver_condition_dict['reservoir_p']:
+    if not _heuristic_passes(driver_dict):
         _log_failure()
-        return 0, 350
+        return 0.0, 350.0, _PITOT3_FAILURE_SENTINEL
 
-    if 0.0849 < driver_condition_dict['D_throat'] < 0:
-        _log_failure()
-        return 0, 350
+    # Test-gas fill pressure is read from the existing PITOT3 config dict
+    # so the value stays single-source: editing config.base_config_dict()
+    # updates both the SPARK/PITOT3 branch and the L1d branch.
+    test_gas_p1 = float(base_config_dict()['p1'])
 
-    pressure_ratio = driver_condition_dict["p4"] / driver_condition_dict["driver_p"]
-    compression_ratio = pressure_ratio ** (1 / 1.667)
-    if not (5 < compression_ratio < 70):
-        _log_failure()
-        return 0, 350
-
-    if driver_condition_dict['p4'] > bounds[2][1]:
-        print('p4 too high')
-        _log_failure()
-        return 0, 350
-
-    # ── SPARK simulation setup ────────────────────────────────────────────
-    fill_condition = {
-        "p_drvr_0":          driver_condition_dict['driver_p'],
-        "T_drvr_0":          298.15,
-        "composition_drvr":  {
-            'He': float(driver_condition_dict['percent_He'] / 100),
-            'Ar': float(1 - driver_condition_dict['percent_He'] / 100),
-        },
-        "composition_units": 'molef',
-        "p_rsvr_0":          driver_condition_dict['reservoir_p'],
-        "T_rsvr_0":          298.15,
-        "p_rupture":         driver_condition_dict['p4'],
-    }
-
-    facility = {
-        "L_drvr":    4.475,
-        "D_piston":  0.2568,
-        "V_drvr_0":  spark.calculateInitialDriverVolume(
-            4.475, 0.2568, 0.112, 85 / 1000,
-            L_buffer=float(driver_condition_dict['buffer_length']),
-            D_buffer=50 / 1000,
-        ),
-        "m_piston":  10.5,
-        "L_buffer":  float(driver_condition_dict['buffer_length']),
-        "D_star":    driver_condition_dict['D_throat'],
-        "D_driven":  85 / 1000,
-    }
-
-    rupture_model = {
-        "model":      "drewry",
-        "K":          0.93,
-        "rho":        8649,
-        "time_model": "linear",
-        "tau":        2.0 / 1000,
-        "b":          0.06,
-    }
-
-    settings = {
-        "rsvr_gm":                              "ideal_air",
-        "drvr_gm":                              "mixed_he_ar",
-        "max_piston_cycles":                    3,
-        "percent_time_on_buffers_before_halting": 0.05,
-        "effective_inflection_velocity_tolerance": 3,
-        "t_hold_sim":                           True,
-    }
-
-    sim = spark.createSimulation(
-        condition_dict=fill_condition,
-        facility_dict=facility,
-        simulation_settings_dict=settings,
-        diaphragm_model_dict=rupture_model,
+    t_hold, impact_speed, delta_vs, ok = run_l1d(
+        x_phys=x_phys,
+        ind_number=ind_number,
+        test_gas_p1=test_gas_p1,
+        transducer_xs=TRANSDUCER_XS,
     )
-
-    diaphragm_rupture_flag = False
-    impact_flag = False
-    try:
-        with _eval_timeout(_EVAL_TIMEOUT_S, "SPARK sim.run"), \
-             contextlib.redirect_stdout(_DEVNULL):
-            sim.run()
-        diaphragm_rupture_flag = sim.flags.diaphragm_ruptured
-        impact_flag = sim.flags.impact_occurred
-    except Exception as e:
-        # Route to stderr so real failures aren't swallowed by the
-        # stdout redirect above.
-        print(f"{e}", file=sys.stderr)
-        print(f"x = {x}", file=sys.stderr)
-
-    if diaphragm_rupture_flag and impact_flag:
-        t_hold = sim.t_hold
-        impact_speed = round(sim.results.vel_buffer_strike_max, 3)
-        return t_hold, impact_speed
-    else:
-        return 0, 350
+    if not ok:
+        _log_failure()
+        return 0.0, 350.0, _PITOT3_FAILURE_SENTINEL
+    return t_hold, impact_speed, delta_vs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Combined evaluation
+# Combined evaluation — public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate(x):
@@ -403,87 +144,49 @@ def evaluate(x):
     Returns
     -------
     (fit, g, g_al) : 3-tuple
-        fit  : tuple of objective values, or None.
-                 - For legacy sim_types: a 3-tuple
-                   (delta_vs1, hold_time, impact_speed), normalised.
-                 - For 'CHT_AL': a 2-tuple (hold_time, impact_speed),
-                   normalised — delta_vs1 is no longer a Pareto objective.
-                 None means the individual is infeasible (box+phys violated,
-                 or in CHT_AL mode the shock-speed simulation failed).
-                 SPARK / PITOT3 were not run, or were run but produced
-                 the failure sentinel; either way no fitness is recorded.
-        g    : np.ndarray, the box+physical constraint vector (length 18
-                 for n=6).  Always returned regardless of feasibility —
-                 the CHT consumes g for the covariance update.
+        fit  : tuple of normalised objective values, or None.
+                 - For legacy sim_types: 3-tuple (delta_vs, hold_time, impact).
+                 - For 'CHT_AL': 2-tuple (hold_time, impact).
+                 None means infeasible (box+phys violated, or in CHT_AL mode
+                 the L1d simulation failed).
+        g    : np.ndarray, the box+physical constraint vector (length 18).
         g_al : np.ndarray of length 1, or None.
-                 - For 'CHT_AL': np.array([delta_vs1 - al_tol]) — the
-                   Augmented-Lagrangian constraint vector (one entry).
+                 - For 'CHT_AL': np.array([delta_vs - al_tol]).
                  - For all other sim_types: None.
-                 None when fit is None, since AL coefficient adaptation
-                 only consumes paired (f, g_al) data from successful
-                 evaluations.
-
-    Behaviour change (CHT_AL phase)
-    -------------------------------
-    The 3-tuple return is uniform across sim_types so callers can always
-    write ``fit, g, g_al = evaluate(x)``.  Legacy sim_types receive
-    g_al=None and ignore it.
     """
     g = evaluate_constraints(x, x.bounds)
+    ind_number = getattr(x, "ind_number", 0)
 
     if x.sim_type == "Penalty":
-        # Penalty mode keeps its existing behaviour: always produce a
-        # fitness, using the closest-valid penalty for box-violators.
+        # Penalty mode: always produce a fitness; closest-valid penalty
+        # for box-violators.  The L1d evaluation happens only inside the
+        # valid() branch — invalid candidates never reach the simulator.
         if valid(x):
-            delta_vs = constraint_function(x, x.bounds)
-            hold_time, impact_speed = objective_function(x, x.bounds)
+            t_hold, impact, delta_vs = _evaluate_l1d(x, ind_number, x.bounds)
             fit = normalise_fitness(
-                (delta_vs, hold_time, impact_speed), APPROX_IDEAL, APPROX_NADIR,
+                (delta_vs, t_hold, impact), APPROX_IDEAL, APPROX_NADIR,
             )
         else:
             fit = ClosestValidPenalty.wrapper(x)
         return fit, g, None
 
     if x.sim_type == "CHT_AL":
-        # AL path: delta_vs1 becomes a constraint; objectives are 2-D.
-        # Box+phys infeasible => no PITOT3 / SPARK, no AL data.
+        # AL path: delta_vs becomes the constraint; objectives are 2-D.
         if not is_feasible(g):
             return None, g, None
-
-        # Heavy-evaluator failures are encoded via the existing sentinel
-        # returns rather than rejected as infeasible:
-        #   - PITOT3 failure  ⇒ delta_vs1 = 3500 m/s
-        #                       ⇒ g_al = 3500 - al_tol ≈ +3400  (a large
-        #                         positive, which the AL will penalise as
-        #                         a major constraint violation)
-        #   - SPARK  failure  ⇒ (hold_time, impact_speed) = (0, 350)
-        #                       ⇒ fit_2d normalises to (1, 1)  (worst
-        #                         possible values on both axes; Pareto-
-        #                         dominated by every successful candidate)
-        # Letting these flow through the AL machinery is more robust than
-        # rejecting them outright, since random initial points often hit
-        # numerical-failure regions before the search converges to the
-        # well-behaved part of the design space.
-        delta_vs = constraint_function(x, x.bounds)
-        hold_time, impact_speed = objective_function(x, x.bounds)
+        t_hold, impact, delta_vs = _evaluate_l1d(x, ind_number, x.bounds)
         fit_2d = normalise_fitness(
-            (hold_time, impact_speed), APPROX_IDEAL_2D, APPROX_NADIR_2D,
+            (t_hold, impact), APPROX_IDEAL_2D, APPROX_NADIR_2D,
         )
-        # AL constraint vector: g_AL_k(x) = delta_vs1(x) - al_tol  (≤ 0).
-        # We use the un-normalised delta_vs1 here so the AL coefficients
-        # adapt on the natural scale of the constraint; pycma's
-        # set_coefficients() will derive its own scaling from iqr(F)/iqr(G).
         al_tol = getattr(x, "al_tol", 100.0)
         g_al = np.array([delta_vs - al_tol], dtype=float)
         return fit_2d, g, g_al
 
-    # Non-Penalty, non-AL path (legacy 3-objective sim_types).
+    # Legacy 3-objective sim_types (CovarianceCHT etc.).
     if not is_feasible(g):
         return None, g, None
-
-    delta_vs = constraint_function(x, x.bounds)
-    hold_time, impact_speed = objective_function(x, x.bounds)
+    t_hold, impact, delta_vs = _evaluate_l1d(x, ind_number, x.bounds)
     fit = normalise_fitness(
-        (delta_vs, hold_time, impact_speed), APPROX_IDEAL, APPROX_NADIR,
+        (delta_vs, t_hold, impact), APPROX_IDEAL, APPROX_NADIR,
     )
     return fit, g, None
