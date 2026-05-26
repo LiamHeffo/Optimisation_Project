@@ -40,6 +40,44 @@ from problem.transforms import variable_untransformation
 from cma.constraints_handler import AugmentedLagrangian
 
 
+def _eval_schedule(schedule, current_gen, fallback):
+    """Linearly interpolate a scheduled parameter at ``current_gen``.
+
+    Two schedule forms are accepted:
+
+    - **3-element** ``[start, end, n_gens]`` (legacy):
+        linear from ``start`` at gen 0 to ``end`` at gen ``n_gens``,
+        saturating at ``end`` afterwards.
+
+    - **4-element** ``[start, end, start_gen, end_gen]``:
+        constant at ``start`` until gen ``start_gen``, linear from
+        ``start`` to ``end`` over ``[start_gen, end_gen]``, constant
+        at ``end`` after.  Use for delayed-onset schedules — e.g.
+        a tightening that only kicks in after the population has
+        reached a feasible region, or a γ-decay that holds full
+        strength during the early CHT-pull phase.
+
+    ``schedule = None`` returns ``fallback`` (the static value).
+    """
+    if schedule is None:
+        return fallback
+    if len(schedule) == 3:
+        start, end, n_gens = schedule
+        start_gen, end_gen = 0, n_gens
+    elif len(schedule) == 4:
+        start, end, start_gen, end_gen = schedule
+    else:
+        raise ValueError(
+            f"schedule must be a 3- or 4-element list, got {len(schedule)}: "
+            f"{schedule}"
+        )
+    if current_gen < start_gen:
+        return float(start)
+    span = max(1, end_gen - start_gen)
+    progress = min(1.0, max(0.0, (current_gen - start_gen) / span))
+    return float(start * (1.0 - progress) + end * progress)
+
+
 class StrategyMultiObjective(object):
     """Multiobjective CMA-ES strategy.
 
@@ -236,10 +274,57 @@ class StrategyMultiObjective(object):
         # let it contribute to its donor parent's psucc / σ update.
         # Decouples σ adaptation from CHT-induced "successes".
         self.psucc_exclude_resampled = bool(features.get("psucc_exclude_resampled", False))
+        # Group-C reversal toggle: treat sentinel offspring in the
+        # not-chosen branch as honest failures rather than skipping the
+        # update entirely.  Reframes SPARK/PITOT3 failures as information
+        # about local feasibility (the region around the design is
+        # unsimulable) rather than as numerical artefacts to be filtered
+        # out.  When True, sentinel not-chosen offspring drive psucc
+        # down and σ down, restoring the pre-Fix-S3 behaviour on the
+        # failure side only.  Chosen-branch Fix-S3 (no "+" signal from
+        # sentinel successes) remains unconditionally — a sentinel that
+        # somehow survives selection is still a numerical artefact, not
+        # a real success.  Default False keeps existing Fix-S3 behaviour.
+        self.psucc_sentinel_as_failure = bool(features.get("psucc_sentinel_as_failure", False))
+        # F1: floor each parent's σ when both the AL and CHT are quiet
+        # for >= F1_SILENT_GENS_THRESHOLD consecutive generations.
+        # None ⇒ no floor (legacy behaviour).
+        self.sigma_floor_silent = features.get("sigma_floor_silent")
+        # F3: ranking criterion within a non-dominated front.
+        # "hv_contribution" preserves legacy Voss 2009 behaviour.
+        # "crowding" switches to NSGA-II crowding-distance ranking,
+        # which removes the knee-seeking bias of HV-contribution.
+        self.selection_mode = features.get("selection", "hv_contribution")
+        if self.selection_mode not in ("hv_contribution", "crowding"):
+            raise ValueError(
+                f"features.selection must be 'hv_contribution' or "
+                f"'crowding', got {self.selection_mode!r}"
+            )
+
+        # Silent-regime counter and threshold for F1.  Counted by
+        # update(); reset whenever either AL or CHT fires.
+        self._gens_silent_count = 0
+        self._gens_silent_threshold = 20
 
         # Generation counter used by schedule-based features (A3, B3).
         # Incremented by update() once per generation.
         self._generation = 0
+
+        # ─────────────────────────────────────────────────────────────────
+        # D1: External non-dominated archive
+        # ─────────────────────────────────────────────────────────────────
+        # Strategy elitism only retains the top-mu under the *current*
+        # selection criterion — front members that were once Pareto-
+        # optimal can be displaced when the front advances or selection
+        # criteria drift (e.g. AL penalty state changes).  The archive
+        # remembers every individual that has ever sat on the non-dom
+        # front in *raw* objective space, capped and pruned by crowding
+        # distance so the archive preserves spread rather than knee bias.
+        #
+        # Updated once per generation at the end of update().  Flushed
+        # to disk via flush_archive_to_csv() once at end of run.
+        self.archive_cap = int(params.get("archive_cap", 100))
+        self.external_archive = []
 
     # ─────────────────────────────────────────────────────────────────────────
     # Augmented Lagrangian helpers (CHT_AL sim_type only)
@@ -299,13 +384,11 @@ class StrategyMultiObjective(object):
         Called from main.py once per generation to retag each offspring's
         ``ind.al_tol`` before evaluation.
         """
-        if self.al_tol_schedule is None:
-            return self.al_tol
-        start_t, end_t, n_gens = self.al_tol_schedule
-        progress = min(1.0, self._generation / max(1, n_gens))
-        return float(start_t * (1.0 - progress) + end_t * progress)
+        return _eval_schedule(
+            self.al_tol_schedule, self._generation, self.al_tol,
+        )
 
-    def update_al(self, F_proxy_scalar, g_al_proxy):
+    def update_al(self, F_proxy_scalar, g_al_proxy, proxy_stats=None):
         """Per-generation update of γ and μ from the parent-centroid proxy.
 
         With ``set_algorithm(3)`` the μ-update is g-only (muplus3 /
@@ -368,14 +451,35 @@ class StrategyMultiObjective(object):
         # Always appended (no is_initialized gate), so the al_per_gen.csv
         # captures the full lam/mu trajectory including the bootstrap
         # window where they may legitimately be zero.
+        #
+        # Diag-2: include per-gen population g_al statistics (min/max/
+        # std/n_feasible_parents) so we can post-hoc evaluate whether
+        # the mean proxy is masking bimodality.
+        # Diag-3: include pen_to_f_ratio = (μ_AL · max(|g|)²) / max(|F|)
+        # so we can see when the penalty starts dominating f in absolute
+        # terms (sentinel-driven scaling drift).
+        stats = proxy_stats or {}
+        g_max_abs = float(np.max(np.abs(np.asarray(g_al_proxy, dtype=float))))
+        F_abs_max = stats.get("F_proxy_abs_max")
+        mu_arr = np.asarray(self.al.mu, dtype=float)
+        if F_abs_max is not None and F_abs_max > 0 and len(mu_arr) > 0:
+            pen_to_f = float(np.max(mu_arr) * (g_max_abs ** 2) / F_abs_max)
+        else:
+            pen_to_f = float("nan")
+
         self.al_diag_buffer.append({
-            "g_al_proxy":     np.asarray(g_al_proxy, dtype=float).tolist(),
-            "f_proxy_scalar": float(F_proxy_scalar),
-            "lam":            self.al.lam.tolist(),
-            "mu":             self.al.mu.tolist(),
-            "al_pen_proxy":   self._al_penalty(g_al_proxy),
-            "count":          int(self.al.count),
-            "is_initialized": bool(self.al.is_initialized),
+            "g_al_proxy":         np.asarray(g_al_proxy, dtype=float).tolist(),
+            "f_proxy_scalar":     float(F_proxy_scalar),
+            "lam":                self.al.lam.tolist(),
+            "mu":                 self.al.mu.tolist(),
+            "al_pen_proxy":       self._al_penalty(g_al_proxy),
+            "count":              int(self.al.count),
+            "is_initialized":     bool(self.al.is_initialized),
+            "g_al_min":           stats.get("g_al_min"),
+            "g_al_max":           stats.get("g_al_max"),
+            "g_al_std":           stats.get("g_al_std"),
+            "n_feasible_parents": stats.get("n_feasible_parents"),
+            "pen_to_f_ratio":     pen_to_f,
         })
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -480,6 +584,12 @@ class StrategyMultiObjective(object):
 
     def update(self, population):
         """Update covariance matrices and step sizes from the evaluated population."""
+        # Snapshot the full candidate pool BEFORE selection mutates state.
+        # Used at the end of update() to refresh the external archive
+        # (D1) — we want every evaluated individual considered for
+        # archive admission, not just the selected parents.
+        archive_candidates_snapshot = list(population) + list(self.parents)
+
         chosen, not_chosen = self._select(population + self.parents)
 
         cp, cc, ccov = self.cp, self.cc, self.ccov
@@ -531,9 +641,27 @@ class StrategyMultiObjective(object):
                 # the donor parent's σ.  Skip both the σ-up signal and
                 # the rank-one update below.  The CHT itself still
                 # consumes the resample data via the infeasible pool.
+                #
+                # Fix-S3: sentinel-aware psucc.  An offspring whose
+                # heavy evaluators (PITOT3 or SPARK) failed carries a
+                # numerical-failure signal, not an objective signal —
+                # neither rewarding it (psucc up) nor punishing it
+                # (psucc down) reflects what σ-adaptation should track.
+                # Skip the donor's psucc / σ update entirely.
+                #
+                # Reading the flags set in main.py after evaluation,
+                # rather than re-detecting here, keeps the sentinel
+                # definition consistent across filter sites (and
+                # correctly catches PITOT3-only sentinels whose fitness
+                # is real but g_al is the sentinel value).
+                is_sentinel = (
+                    getattr(ind, "_pitot3_sentinel", False)
+                    or getattr(ind, "_spark_sentinel", False)
+                )
                 skip_psucc = (
-                    self.psucc_exclude_resampled
-                    and getattr(ind, "_resampled", False)
+                    is_sentinel
+                    or (self.psucc_exclude_resampled
+                        and getattr(ind, "_resampled", False))
                 )
                 if not skip_psucc:
                     psucc[i] = (1.0 - cp) * psucc[i] + cp
@@ -601,6 +729,23 @@ class StrategyMultiObjective(object):
                 # resampled-then-dominated offspring shouldn't shrink
                 # the donor's σ either.  CHT covariance has already
                 # consumed its constraint signal — that's enough.
+                #
+                # Fix-S3 (failure branch): by default, sentinel offspring
+                # should not shrink the donor's σ — both PITOT3 and SPARK
+                # encode "numerical failure" not "honest objective
+                # failure", and skipping breaks the sentinel trap that
+                # otherwise locks σ → 0 around failure regions.
+                #
+                # Toggle psucc_sentinel_as_failure inverts this: when
+                # True, sentinels are treated as honest failures and
+                # contribute the psucc decay + σ shrinkage below.  The
+                # interpretation is that an unsimulable design is itself
+                # information about local feasibility — shrinking σ
+                # away from that region is the correct CMA response.
+                if (getattr(ind, "_pitot3_sentinel", False)
+                        or getattr(ind, "_spark_sentinel", False)):
+                    if not self.psucc_sentinel_as_failure:
+                        continue
                 if (self.psucc_exclude_resampled
                         and getattr(ind, "_resampled", False)):
                     continue
@@ -621,6 +766,198 @@ class StrategyMultiObjective(object):
         # read this to interpolate their parameters over time.  Counted
         # here rather than in main.py so the strategy is self-contained.
         self._generation += 1
+
+        # ── F1: σ floor in silent regime ─────────────────────────────────
+        # Track whether this generation was "silent" — neither AL nor
+        # CHT did any work — and clamp σ once the silent streak has
+        # reached the threshold.  The clamp prevents σ from collapsing
+        # below sigma_floor_silent purely because psucc keeps dropping
+        # in the absence of strict-Pareto offspring.  Direct attack on
+        # the σ collapse component of the diversity-degeneration story.
+        al_silent  = (self.al is None
+                      or self.al.lam is None
+                      or all(float(l) == 0.0 for l in self.al.lam))
+        cht_silent = (len(infeasible_pool) == 0)
+        if al_silent and cht_silent:
+            self._gens_silent_count += 1
+        else:
+            self._gens_silent_count = 0
+
+        if (self.sigma_floor_silent is not None
+                and self._gens_silent_count >= self._gens_silent_threshold):
+            floor = float(self.sigma_floor_silent)
+            for k in range(len(self.sigmas)):
+                if self.sigmas[k] < floor:
+                    self.sigmas[k] = floor
+
+        # ── D1: External archive refresh ─────────────────────────────────
+        # Use the pre-selection snapshot so individuals that didn't
+        # survive selection (but were Pareto-optimal at evaluation time)
+        # still get a chance at archive admission.
+        self._update_archive(archive_candidates_snapshot)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # External non-dominated archive (D1)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _update_archive(self, candidates):
+        """Refresh the external non-dominated archive with new candidates.
+
+        Each candidate is admitted only if it has a valid fitness AND
+        ``_feasible`` is True (we don't want SPARK/PITOT3 sentinel
+        failures polluting the archive).  Non-domination is recomputed
+        across (archive ∪ new entries) on *raw* fitness — the archive
+        should reflect what we have actually discovered in objective
+        space, independent of the AL coefficient state at the time of
+        capture.  When size exceeds archive_cap, prune by crowding
+        distance so the archive retains spread rather than knee bias.
+        """
+        new_entries = []
+        for ind in candidates:
+            if not getattr(ind, "_feasible", True):
+                continue
+            if not ind.fitness.valid:
+                continue
+            # D1 + sentinel filter: archive only "trustworthy" points —
+            # both heavy evaluators succeeded.  PITOT3-only sentinels
+            # have real fitness but unknown constraint state; SPARK
+            # sentinels have fitness at the nadir.  Neither belongs in
+            # an archive of "good points we have ever found".
+            if (getattr(ind, "_pitot3_sentinel", False)
+                    or getattr(ind, "_spark_sentinel", False)):
+                continue
+            g_al = getattr(ind, "_g_al", None)
+            new_entries.append({
+                "gen_found":  self._generation,
+                "design":     [float(x) for x in ind],
+                "fitness":    tuple(float(v) for v in ind.fitness.values),
+                "g_al":       ([float(x) for x in g_al]
+                               if g_al is not None else None),
+                "lineage_id": getattr(ind, "_lineage_id", None),
+            })
+        if not new_entries:
+            return
+
+        # Drop new-entry duplicates (same objective values) before union
+        # so the archive can't grow unbounded from re-admission of an
+        # unchanged elite parent each generation.  Keep the earliest-found.
+        seen = {(m["fitness"][0], m["fitness"][1])
+                for m in self.external_archive}
+        deduped_new = []
+        for m in new_entries:
+            key = (m["fitness"][0], m["fitness"][1])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped_new.append(m)
+        if not deduped_new:
+            return
+
+        pool = list(self.external_archive) + deduped_new
+        nd = self._archive_nondominated(pool)
+        if len(nd) > self.archive_cap:
+            nd = self._archive_prune_by_crowding(nd, self.archive_cap)
+        self.external_archive = nd
+
+    @staticmethod
+    def _archive_nondominated(pool):
+        """Return the non-dominated subset of pool (minimisation).
+
+        Pool is a list of dicts with a ``fitness`` tuple (any length).
+        O(N²) — fine for N ≤ a few hundred which is our archive cap.
+        """
+        n = len(pool)
+        keep = [True] * n
+        fits = [p["fitness"] for p in pool]
+        for i in range(n):
+            if not keep[i]:
+                continue
+            for j in range(n):
+                if i == j or not keep[j]:
+                    continue
+                if (all(fits[j][k] <= fits[i][k] for k in range(len(fits[i])))
+                        and any(fits[j][k] < fits[i][k] for k in range(len(fits[i])))):
+                    keep[i] = False
+                    break
+        return [pool[i] for i in range(n) if keep[i]]
+
+    @staticmethod
+    def _archive_prune_by_crowding(pool, target_size):
+        """Reduce pool to target_size by repeatedly dropping the
+        lowest-crowding member.  Boundary members in each objective
+        carry inf crowding so the extremes are protected — the archive
+        preserves spread under pruning.
+        """
+        pool = list(pool)
+        while len(pool) > target_size:
+            fits = [p["fitness"] for p in pool]
+            n = len(fits)
+            n_obj = len(fits[0])
+            crowding = [0.0] * n
+            for m in range(n_obj):
+                order = sorted(range(n), key=lambda i: fits[i][m])
+                crowding[order[0]]  = float("inf")
+                crowding[order[-1]] = float("inf")
+                f_min, f_max = fits[order[0]][m], fits[order[-1]][m]
+                denom = f_max - f_min
+                if denom == 0.0:
+                    continue
+                for k in range(1, n - 1):
+                    if crowding[order[k]] == float("inf"):
+                        continue
+                    crowding[order[k]] += (
+                        (fits[order[k + 1]][m] - fits[order[k - 1]][m]) / denom
+                    )
+            drop = min(range(n), key=lambda i: crowding[i])
+            pool = pool[:drop] + pool[drop + 1:]
+        return pool
+
+    def flush_archive_to_csv(self, out_dir):
+        """Write the external archive to ``{out_dir}/archive.csv``.
+
+        Called once at end of run from main.py.  Schema:
+          gen_found, lineage_id, f_0, f_1, ..., design_0..design_{n-1},
+          g_al_0..g_al_{m-1}
+        """
+        import csv as _csv
+        from pathlib import Path as _Path
+
+        out_dir = _Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if not self.external_archive:
+            # Write a header-only file so post-hoc tools can distinguish
+            # "feature off / nothing to archive" from "file missing".
+            csv_path = out_dir / "archive.csv"
+            with csv_path.open("w", newline="") as f:
+                f.write("gen_found,lineage_id,f_0,f_1\n")
+            return
+
+        n_obj    = len(self.external_archive[0]["fitness"])
+        n_design = len(self.external_archive[0]["design"])
+        g_sample = next((m["g_al"] for m in self.external_archive
+                         if m["g_al"] is not None), None)
+        n_gal    = len(g_sample) if g_sample else 0
+
+        fieldnames = (
+            ["gen_found", "lineage_id"]
+            + [f"f_{k}" for k in range(n_obj)]
+            + [f"design_{k}" for k in range(n_design)]
+            + [f"g_al_{k}" for k in range(n_gal)]
+        )
+        with (out_dir / "archive.csv").open("w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for m in self.external_archive:
+                row = {"gen_found": m["gen_found"],
+                       "lineage_id": m["lineage_id"]}
+                for k in range(n_obj):
+                    row[f"f_{k}"] = m["fitness"][k]
+                for k in range(n_design):
+                    row[f"design_{k}"] = m["design"][k]
+                g = m["g_al"] if m["g_al"] is not None else []
+                for k in range(n_gal):
+                    row[f"g_al_{k}"] = g[k] if k < len(g) else None
+                w.writerow(row)
 
     # ─────────────────────────────────────────────────────────────────────────
     # CHT resample loop (Chocat 2015 Algorithm 3 step 3-2)
@@ -900,16 +1237,66 @@ class StrategyMultiObjective(object):
         k = self.mu - len(chosen)
 
         if k > 0:
-            ref = np.array([ind.fitness.wvalues for ind in feasible]) * -1
-            ref = np.max(ref, axis=0) + 1
+            if self.selection_mode == "crowding":
+                # F3 (NSGA-II): rank mid_front by crowding distance and
+                # keep the k highest-crowding members.  Boundary points
+                # carry infinite crowding so the front extremes survive,
+                # which is exactly the anti-knee-bias property the
+                # diversity analysis identified as the key structural fix.
+                crowding = self._crowding_distance(mid_front)
+                order = sorted(range(len(mid_front)),
+                               key=lambda i: -crowding[i])
+                chosen     += [mid_front[i] for i in order[:k]]
+                not_chosen += [mid_front[i] for i in order[k:]]
+            else:
+                ref = np.array([ind.fitness.wvalues for ind in feasible]) * -1
+                ref = np.max(ref, axis=0) + 1
 
-            for _ in range(len(mid_front) - k):
-                idx = self.indicator(mid_front, ref=ref)
-                not_chosen.append(mid_front.pop(idx))
+                for _ in range(len(mid_front) - k):
+                    idx = self.indicator(mid_front, ref=ref)
+                    not_chosen.append(mid_front.pop(idx))
 
-            chosen += mid_front
+                chosen += mid_front
 
         return chosen, not_chosen
+
+    @staticmethod
+    def _crowding_distance(front):
+        """NSGA-II crowding distance (Deb et al. 2002) on a list of
+        DEAP individuals with valid fitness.values tuples.
+
+        Returns a list of crowding distances, one per input individual,
+        in the same order as the input.  Boundary points get ``inf`` so
+        they are always preferred under "keep highest crowding" rules.
+
+        For ``len(front) <= 2`` every point is a boundary by definition.
+        """
+        n = len(front)
+        if n == 0:
+            return []
+        if n <= 2:
+            return [float("inf")] * n
+        n_obj = len(front[0].fitness.values)
+        crowding = [0.0] * n
+        for m in range(n_obj):
+            order = sorted(range(n), key=lambda i: front[i].fitness.values[m])
+            crowding[order[0]]  = float("inf")
+            crowding[order[-1]] = float("inf")
+            f_min = front[order[0]].fitness.values[m]
+            f_max = front[order[-1]].fitness.values[m]
+            denom = f_max - f_min
+            if denom == 0.0:
+                # Objective constant across the front → no spread signal
+                # in this dimension; skip without polluting the sum.
+                continue
+            for k in range(1, n - 1):
+                if crowding[order[k]] == float("inf"):
+                    continue
+                crowding[order[k]] += (
+                    (front[order[k + 1]].fitness.values[m]
+                     - front[order[k - 1]].fitness.values[m]) / denom
+                )
+        return crowding
 
     def _rankMuSuccUpdate(self, A, invCholesky, parent_idx, parents_snapshot,
                           sigmas_snapshot, successful_steps):
@@ -1112,12 +1499,9 @@ class StrategyMultiObjective(object):
             # shrinkage to avoid anisotropy lock-in.  Schema:
             # [start_gamma, end_gamma, n_gens].  Saturates at end_gamma
             # after self._generation >= n_gens.  None ⇒ static γ.
-            if self.cht_gamma_schedule is not None:
-                start_g, end_g, n_gens = self.cht_gamma_schedule
-                progress = min(1.0, self._generation / max(1, n_gens))
-                gamma = start_g * (1.0 - progress) + end_g * progress
-            else:
-                gamma = self.cht_gamma
+            gamma = _eval_schedule(
+                self.cht_gamma_schedule, self._generation, self.cht_gamma,
+            )
 
         x_i = np.asarray(parents_snapshot[parent_idx], dtype=float)
         sigma_i = sigmas_snapshot[parent_idx]

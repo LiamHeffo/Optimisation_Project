@@ -20,11 +20,46 @@ Toolbox is constructed.
 
 import contextlib
 import os
+import signal
 import sys
 import yaml
 import numpy as np
 
 import spark
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-evaluation timeout (Linux SIGALRM).  See memory
+# project_gdtk_exception_leak: gdtk's D→C wrapper catches GasFlowException
+# and prints "Exception message: …" to stderr but does NOT raise on the
+# Python side, so a pathological design can leave SPARK or PITOT3 looping
+# inside the worker forever.  multiprocessing.Pool.map then blocks the
+# whole run.  We wrap both heavy evaluators in an alarm that turns a hang
+# into a Python exception, which the existing try/except routes to the
+# established failure sentinels (3500 for PITOT3, (0, 350) for SPARK).
+# Pure-C deadlocks that never yield to Python cannot be interrupted this
+# way; if that ever bites we'll need to escalate to pool.apply_async with
+# worker termination.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EVAL_TIMEOUT_S = 15 * 60   # 15 min; healthy SPARK eval is seconds-to-minutes.
+
+
+class EvalTimeout(Exception):
+    """Raised when SPARK or PITOT3 exceeds its per-evaluation budget."""
+
+
+@contextlib.contextmanager
+def _eval_timeout(seconds, label):
+    def _handler(signum, frame):
+        raise EvalTimeout(f"{label} exceeded {seconds}s budget")
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 # SPARK's sim.run() prints a "t_hold = ..." line per evaluation, which
@@ -216,7 +251,8 @@ def constraint_function(x1, bounds):
     )
 
     try:
-        shock_tube.calculate_shock_speed_and_related_states()
+        with _eval_timeout(_EVAL_TIMEOUT_S, "PITOT3 calculate_shock_speed_and_related_states"):
+            shock_tube.calculate_shock_speed_and_related_states()
     except Exception as e:
         print(f"{e}")
         print(f"x = {x}")
@@ -338,7 +374,8 @@ def objective_function(x, bounds):
     diaphragm_rupture_flag = False
     impact_flag = False
     try:
-        with contextlib.redirect_stdout(_DEVNULL):
+        with _eval_timeout(_EVAL_TIMEOUT_S, "SPARK sim.run"), \
+             contextlib.redirect_stdout(_DEVNULL):
             sim.run()
         diaphragm_rupture_flag = sim.flags.diaphragm_ruptured
         impact_flag = sim.flags.impact_occurred

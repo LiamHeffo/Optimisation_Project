@@ -132,15 +132,19 @@ def plot_holdtime_impactspeed_2d(fitness_history, **kwargs):
 
     In CHT_AL the fitness tuple is 2-D (hold_time, impact_speed) — delta_vs1
     is no longer a Pareto objective but an Augmented-Lagrangian constraint.
-    This is a focused twin of ``plot_objective_space(... 'hold_time',
-    'impact_speed')`` that reads from the correct slots:
-    entry[0] = hold_time, entry[1] = impact_speed (vs entry[1], entry[2]
-    in the 3-D case).
+
+    The purple-highlighted scatter shows the *surviving μ parent set* if
+    ``parent_fitness`` is supplied, falling back to ``fitness_history[-MU:]``
+    (the last offspring batch) otherwise.  The parent-set view is the
+    one users typically expect — it is the post-selection Pareto front
+    that seeds the next generation, not the pre-selection candidate pool
+    that includes sentinel offspring about to be discarded.
     """
-    MU         = kwargs.get('MU',         10)
-    gen        = kwargs.get('gen',         0)
-    normalised = kwargs.get('normalised',  True)
-    out_dir    = kwargs.get('out_dir',     None)
+    MU             = kwargs.get('MU',             10)
+    gen            = kwargs.get('gen',             0)
+    normalised     = kwargs.get('normalised',      True)
+    out_dir        = kwargs.get('out_dir',         None)
+    parent_fitness = kwargs.get('parent_fitness',  None)
 
     plt.figure(dpi=200)
     plt.title("Pareto Frontier (CHT_AL)")
@@ -156,8 +160,22 @@ def plot_holdtime_impactspeed_2d(fitness_history, **kwargs):
     else:
         plt.ylim((-0.005, 2 * np.max(impact_speed_history)))
 
-    plt.scatter(hold_time_history,       impact_speed_history,       facecolors='none', edgecolors='lightblue')
-    plt.scatter(hold_time_history[-MU:], impact_speed_history[-MU:], facecolors='none', edgecolors='purple')
+    plt.scatter(hold_time_history, impact_speed_history,
+                facecolors='none', edgecolors='lightblue',
+                label='all evaluated offspring')
+
+    if parent_fitness:
+        parent_ht = [f[0] for f in parent_fitness]
+        parent_is = [f[1] for f in parent_fitness]
+        plt.scatter(parent_ht, parent_is,
+                    facecolors='none', edgecolors='purple',
+                    label=f'surviving parents (μ={len(parent_fitness)})')
+    else:
+        plt.scatter(hold_time_history[-MU:], impact_speed_history[-MU:],
+                    facecolors='none', edgecolors='purple',
+                    label='last offspring batch')
+
+    plt.legend(loc='best', fontsize=8)
 
     filename = f"pareto_holdtime_impactspeed_gen_{gen:04d}.png"
     plt.savefig(_resolve_path(filename, out_dir))

@@ -71,6 +71,9 @@ from problem.config      import (
 )
 from problem.transforms  import variable_transformation, variable_untransformation, unnormalise_fitness
 from problem.evaluate    import evaluate, set_logbook
+# Re-exported constant so the sentinel detector below can compare
+# delta_vs1 against the same value the evaluator uses on failure.
+from problem.evaluate    import _PITOT3_FAILURE_SENTINEL
 from problem.feasibility import evaluate_constraints, is_feasible
 from plotting            import (
     plot_objective_space,
@@ -86,6 +89,7 @@ from results_io          import (
 from cht_diagnostics     import drain_and_persist as _cht_drain_and_persist
 from cht_diagnostics     import drain_and_persist_al as _al_drain_and_persist
 from cht_diagnostics     import plot_cht_diagnostics as _cht_plot
+from cht_diagnostics     import write_diversity_metrics as _write_diversity_metrics
 from utils               import parallelization_setup
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +143,11 @@ OUTPUT_FOLDERS = [
     "pareto_dvs1_impactspeed",
     "pareto_holdtime_impactspeed",
     "population",
+    # Surviving μ parent set per save trigger — the post-selection Pareto
+    # front, distinct from "population" which records the pre-selection
+    # offspring batch (and so includes individuals that selection then
+    # discards).  Direct artefact for "what is the current Pareto front".
+    "parents",
     "convergence",
     "summary",
     # CHT diagnostics (CSVs + per-SAVE_INTERVAL summary plots).  Created
@@ -158,6 +167,7 @@ RUN_PREFIX_AL       = "al_cht"
 OUTPUT_FOLDERS_AL = [
     "pareto_holdtime_impactspeed",
     "population",
+    "parents",
     "convergence",
     "summary",
     "cht_diagnostics",
@@ -192,27 +202,100 @@ def _run_constants(sim_type):
     )
 
 
+def _detect_sentinels(ind, fit, g_al):
+    """Set `_pitot3_sentinel` and `_spark_sentinel` flags on `ind`.
+
+    Called once per individual right after heavy evaluation.  The two
+    sentinel modes are independent:
+
+    - **PITOT3 sentinel**: the shock-speed solver hit its failure
+      marker, encoded as ``delta_vs1 = 3500 m/s``.  Recovered from
+      ``g_al + ind.al_tol``.  This case can leave the per-individual
+      ``fitness`` *real* (SPARK succeeded), so detecting it on fitness
+      alone (the original Fix-S3 filter) misses these individuals.
+
+    - **SPARK sentinel**: the hold-time / impact-speed solver hit its
+      failure markers (raw 0 and 350), normalised to (1, 1).  Detected
+      from the fitness tuple.
+
+    Either flag should cause exclusion from the AL proxy mean, the AL
+    bootstrap, the donor's psucc / σ update, the external archive, and
+    the non-sentinel HV trace.  See SENTINEL_FIXES_PLAN.md.
+
+    Both flags default to False when the corresponding input is None
+    (e.g. legacy 3-objective mode where fit_2d / g_al aren't computed
+    in the CHT_AL shape).
+    """
+    if fit is None:
+        ind._spark_sentinel = False
+    else:
+        ind._spark_sentinel = all(v >= 0.99999 for v in fit)
+
+    if g_al is None:
+        ind._pitot3_sentinel = False
+    else:
+        # Threshold 1 m/s below the exact 3500 sentinel; real PITOT3
+        # results are well below 3000 so this never false-positives.
+        al_tol = getattr(ind, "al_tol", 100.0)
+        delta_vs = float(np.asarray(g_al)[0]) + al_tol
+        ind._pitot3_sentinel = delta_vs >= (_PITOT3_FAILURE_SENTINEL - 1.0)
+
+
+def _is_sentinel(ind):
+    """Return True if `ind` carries either a PITOT3 or SPARK sentinel
+    flag.  Convenience wrapper for filter sites."""
+    return (getattr(ind, "_pitot3_sentinel", False)
+            or getattr(ind, "_spark_sentinel", False))
+
+
 def _cheap_al_proxy(strategy):
-    """Return the (F̄, ḡ_AL) cheap proxy from the current parent set.
+    """Return (F̄, ḡ_AL, stats) cheap proxy from the current parent set.
 
     The AL coefficient adaptation in pycma expects values "at the
     distribution mean".  In MO-CMA-ES there is no single mean; per the
     user-confirmed design we average over parents that survived
     selection.  Zero extra heavy evaluations.
 
-    Returns (None, None) when no parent has both valid fitness and a
-    g_al value (would only happen pathologically — e.g. the entire
-    parent population came from infeasible-on-shock-speed individuals,
-    which selection should have rejected anyway).
+    **Fix-S1: sentinel filter.** Parents whose fitness.values are at
+    the (1, 1) reference (heavy-evaluator failures) are excluded from
+    the proxy mean.  Their g_al is a sentinel-implied value
+    (PITOT3 → +3400 m/s) that does not reflect the true geometric
+    state of the population; including them skews the mean and
+    pollutes pycma's CDF-based μ-update.
+
+    Returns (None, None, {}) when no real parent remains for proxying
+    (all parents are sentinel-failures — should be rare).
+
+    **Diag-2**: returns a stats dict alongside the proxy, capturing
+    per-gen population g_al distribution (min, max, std, count) so
+    we can post-hoc evaluate whether the mean proxy is masking
+    bimodality.
     """
     Fs, gals = [], []
     for p in strategy.parents:
-        if p.fitness.valid and getattr(p, "_g_al", None) is not None:
-            Fs.append(sum(p.fitness.values))
-            gals.append(np.asarray(p._g_al, dtype=float))
+        if not p.fitness.valid:
+            continue
+        if getattr(p, "_g_al", None) is None:
+            continue
+        # Fix-S1 (extended): skip both PITOT3-only sentinels (real
+        # fit but g_al sentinel-inflated) and SPARK sentinels (fit at
+        # (1,1)).  Either type contaminates the proxy.
+        if _is_sentinel(p):
+            continue
+        Fs.append(sum(p.fitness.values))
+        gals.append(np.asarray(p._g_al, dtype=float))
     if not Fs:
-        return None, None
-    return float(np.mean(Fs)), np.mean(np.stack(gals, axis=0), axis=0)
+        return None, None, {}
+    g_arr = np.stack(gals, axis=0)              # (n_real_parents, m)
+    F_arr = np.asarray(Fs, dtype=float)
+    stats = {
+        "g_al_min":           float(np.min(g_arr)),
+        "g_al_max":           float(np.max(g_arr)),
+        "g_al_std":           float(np.std(g_arr)),
+        "n_feasible_parents": int(len(Fs)),
+        "F_proxy_abs_max":    float(np.max(np.abs(F_arr))),
+    }
+    return float(np.mean(F_arr)), np.mean(g_arr, axis=0), stats
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Snapshot helpers
@@ -352,6 +435,109 @@ def _make_snapshot(gen, population, sigmas_per_slot, parent_idx_per_slot, bounds
     return rows
 
 
+def _write_parents_csv(out_dir, gen, strategy, bounds):
+    """Write one CSV per save trigger recording the surviving μ parent set.
+
+    Distinct from ``population_gen_*.csv``: the offspring snapshot
+    records the *pre-selection* candidate batch (which includes sentinel
+    offspring that selection then drops).  This file records the
+    *post-selection* parents — the actual search distribution that
+    seeds the next generation.
+
+    One row per slot in ``strategy.parents``.  Columns include
+    fitness (the missing piece in strategy_per_gen.csv), constraint
+    state, sentinel flags, σ and psucc per slot, and design variables
+    in both raw and scaled form.
+    """
+    import csv
+    from pathlib import Path
+
+    fieldnames = [
+        "generation", "parent_slot",
+        "lineage_id",
+        "sigma", "psucc",
+        "feasible",
+        "pitot3_sentinel", "spark_sentinel",
+        "g_al",
+        # Raw (physical) design variables
+        "raw_pct_he", "raw_driver_p", "raw_p4",
+        "raw_d_throat", "raw_reservoir_p", "raw_buffer_length",
+        # Scaled (algorithm-space [1, 2]) design variables
+        "scaled_pct_he", "scaled_driver_p", "scaled_p4",
+        "scaled_d_throat", "scaled_reservoir_p", "scaled_buffer_length",
+        # Objectives (raw + scaled).  delta_vs1 only meaningful for
+        # legacy 3-objective mode; CHT_AL records it via g_al instead.
+        "raw_delta_vs1", "raw_hold_time", "raw_impact_speed",
+        "scaled_delta_vs1", "scaled_hold_time", "scaled_impact_speed",
+    ]
+
+    rows = []
+    for i, ind in enumerate(strategy.parents):
+        raw_vars    = variable_untransformation(ind, bounds)
+        scaled_vars = list(ind)
+
+        is_2d = ind.fitness.valid and len(ind.fitness.values) == 2
+        if ind.fitness.valid:
+            scaled_objs_raw = list(ind.fitness.values)
+            if is_2d:
+                raw_2d = list(unnormalise_fitness(
+                    ind.fitness.values, APPROX_IDEAL_2D, APPROX_NADIR_2D,
+                ))
+                g_al = getattr(ind, "_g_al", None)
+                al_tol = getattr(ind, "al_tol", 100.0)
+                raw_dvs = (float(g_al[0]) + al_tol) if g_al is not None else None
+                raw_objs    = [raw_dvs, raw_2d[0], raw_2d[1]]
+                scaled_objs = [None, scaled_objs_raw[0], scaled_objs_raw[1]]
+            else:
+                raw_objs = list(unnormalise_fitness(
+                    ind.fitness.values, APPROX_IDEAL, APPROX_NADIR,
+                ))
+                scaled_objs = scaled_objs_raw
+        else:
+            raw_objs    = [None, None, None]
+            scaled_objs = [None, None, None]
+
+        g_al = getattr(ind, "_g_al", None)
+        g_al_val = float(np.asarray(g_al)[0]) if g_al is not None else None
+
+        rows.append({
+            "generation":          gen,
+            "parent_slot":         i,
+            "lineage_id":          getattr(ind, "lineage_id", None),
+            "sigma":               float(strategy.sigmas[i]),
+            "psucc":               float(strategy.psucc[i]),
+            "feasible":            getattr(ind, "_feasible", None),
+            "pitot3_sentinel":     bool(getattr(ind, "_pitot3_sentinel", False)),
+            "spark_sentinel":      bool(getattr(ind, "_spark_sentinel", False)),
+            "g_al":                g_al_val,
+            "raw_pct_he":          raw_vars[0],
+            "raw_driver_p":        raw_vars[1],
+            "raw_p4":              raw_vars[2],
+            "raw_d_throat":        raw_vars[3],
+            "raw_reservoir_p":     raw_vars[4],
+            "raw_buffer_length":   raw_vars[5],
+            "scaled_pct_he":       scaled_vars[0],
+            "scaled_driver_p":     scaled_vars[1],
+            "scaled_p4":           scaled_vars[2],
+            "scaled_d_throat":     scaled_vars[3],
+            "scaled_reservoir_p":  scaled_vars[4],
+            "scaled_buffer_length":scaled_vars[5],
+            "raw_delta_vs1":       raw_objs[0],
+            "raw_hold_time":       raw_objs[1],
+            "raw_impact_speed":    raw_objs[2],
+            "scaled_delta_vs1":    scaled_objs[0],
+            "scaled_hold_time":    scaled_objs[1],
+            "scaled_impact_speed": scaled_objs[2],
+        })
+
+    path = Path(out_dir) / f"parents_gen_{gen:04d}.csv"
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({k: ("" if r.get(k) is None else r[k]) for k in fieldnames})
+
+
 def _mark_chosen(gen_snapshots, chosen):
     """Set chosen=True for every snapshot row whose individual survived
     selection.  Idempotent — once True, stays True."""
@@ -387,7 +573,8 @@ def _fill_offspring(gen_snapshots, parents_at_generate, offspring):
             row["offspring_ind_number"] = off.ind_number
 
 
-def _save_outputs(bookshelf_gen, gen_snapshots, fitness_history, MU, folders):
+def _save_outputs(bookshelf_gen, gen_snapshots, fitness_history, MU, folders,
+                  strategy=None, bounds=None):
     """Write per-generation plots and population CSVs.
 
     All known snapshots are re-written every save trigger so that lazily-
@@ -398,10 +585,26 @@ def _save_outputs(bookshelf_gen, gen_snapshots, fitness_history, MU, folders):
     fitness_history).  3-D fitness goes to the legacy 5-plot bundle;
     2-D fitness (CHT_AL) goes to a single hold_time-vs-impact_speed
     plot — there is no third axis to scatter on.
+
+    When ``strategy`` is supplied, also writes the surviving μ parent
+    set to parents_gen_NNNN.csv and threads the parents' fitness into
+    the 2-D Pareto plot so the purple highlight shows the post-selection
+    Pareto front rather than the last offspring batch.
     """
     pop_dir = folders["population"]
     for g, rows in gen_snapshots.items():
         write_population_csv(pop_dir / f"population_gen_{g:04d}.csv", rows)
+
+    # Surviving parents CSV.  Skipped if no strategy passed (legacy
+    # callers) or the parents folder isn't in the layout.
+    parent_fitness = None
+    if strategy is not None and "parents" in folders:
+        _write_parents_csv(folders["parents"], bookshelf_gen, strategy, bounds)
+        parent_fitness = [
+            tuple(ind.fitness.values)
+            for ind in strategy.parents
+            if ind.fitness.valid
+        ]
 
     is_2d = (
         len(fitness_history) > 0
@@ -415,6 +618,7 @@ def _save_outputs(bookshelf_gen, gen_snapshots, fitness_history, MU, folders):
             fitness_history,
             MU=MU, gen=bookshelf_gen,
             out_dir=folders["pareto_holdtime_impactspeed"],
+            parent_fitness=parent_fitness,
         )
     else:
         # Legacy 3-objective plots (unchanged behaviour).
@@ -464,11 +668,48 @@ def _append_strategy_per_gen_row(out_dir, gen, strategy):
     fieldnames = (
         ["generation", "mu",
          "mean_sigma", "min_sigma", "max_sigma",
-         "mean_psucc", "min_psucc", "max_psucc"]
+         "mean_psucc", "min_psucc", "max_psucc",
+         "gens_silent", "sigma_floor_active",
+         "archive_size",
+         # Diag-1 (split): PITOT3 vs SPARK vs both, plus the union count
+         # for ranking.  A parent can be both (PITOT3 + SPARK joint
+         # failure); n_both counts that overlap.
+         "n_pitot3_sentinels",
+         "n_spark_sentinels",
+         "n_both_sentinels",
+         "n_sentinels"]            # union: pitot3 + spark - both
         + [f"lineage_{i}" for i in range(mu)]
         + [f"sigma_{i}"   for i in range(mu)]
         + [f"psucc_{i}"   for i in range(mu)]
     )
+
+    # F1/D1 diagnostics: silent-streak length, whether the σ floor is
+    # currently active, and current archive size.  All three are safe
+    # defaults when the corresponding feature is off.
+    floor = getattr(strategy, "sigma_floor_silent", None)
+    silent = getattr(strategy, "_gens_silent_count", 0)
+    silent_thresh = getattr(strategy, "_gens_silent_threshold", 20)
+    floor_active = (
+        floor is not None and silent >= silent_thresh
+    )
+
+    # Diag-1 (split): differentiate PITOT3 sentinels (delta_vs1 = 3500;
+    # fit may be real) from SPARK sentinels (fit ≈ (1, 1); g_al may be
+    # real).  Reading flags rather than re-computing keeps the
+    # definitions consistent with the filters in _cheap_al_proxy etc.
+    n_pitot3 = 0
+    n_spark  = 0
+    n_both   = 0
+    for p in strategy.parents:
+        pitot3 = getattr(p, "_pitot3_sentinel", False)
+        spark  = getattr(p, "_spark_sentinel",  False)
+        if pitot3:
+            n_pitot3 += 1
+        if spark:
+            n_spark += 1
+        if pitot3 and spark:
+            n_both += 1
+    n_sent = n_pitot3 + n_spark - n_both    # union, no double counting
 
     row = {
         "generation": gen,
@@ -479,6 +720,13 @@ def _append_strategy_per_gen_row(out_dir, gen, strategy):
         "mean_psucc": float(np.mean(psucc)),
         "min_psucc":  float(np.min(psucc)),
         "max_psucc":  float(np.max(psucc)),
+        "gens_silent":         silent,
+        "sigma_floor_active":  bool(floor_active),
+        "archive_size":        len(getattr(strategy, "external_archive", [])),
+        "n_pitot3_sentinels":  n_pitot3,
+        "n_spark_sentinels":   n_spark,
+        "n_both_sentinels":    n_both,
+        "n_sentinels":         n_sent,
     }
     for i in range(mu):
         row[f"lineage_{i}"] = lineage_ids[i]
@@ -504,7 +752,7 @@ def main(experiment_type):
     N           = 6
     pop_size    = experiment_type[1]
     MU, LAMBDA  = pop_size, pop_size
-    NGEN        = 500
+    NGEN        = 300
     sim_type    = experiment_type[0]
     p4_treatment = experiment_type[3]
     step_size   = experiment_type[2]
@@ -551,9 +799,27 @@ def main(experiment_type):
     # name to a local 2-D / 3-D variant — the global lookup at the
     # bottom of the loop will hit this local instead.  No global access
     # leaks because no other site in main.py reads pop_hypervolumes.
-    pop_hypervolumes = HyperVolume(
-        np.zeros(2 if sim_type == 'CHT_AL' else 3)
-    )
+    #
+    # Two parallel HV calculators are kept:
+    #   * ``pop_hypervolumes``        — ref at (0, …, 0) in fit_neg space
+    #                                   (= IDEAL of fit_2d).  This is a
+    #                                   utopia-distance metric: every
+    #                                   point contributes fit_2d[0] *
+    #                                   fit_2d[1], so LOWER HV = front
+    #                                   closer to the ideal.  Does not
+    #                                   reward front spread.  Retained
+    #                                   for back-compat with the existing
+    #                                   convergence_data.txt format.
+    #   * ``pop_hypervolumes_nadir``  — ref at (1, …, 1) in fit_2d space
+    #                                   directly (no negation).  Standard
+    #                                   MOO convention: HIGHER HV = better
+    #                                   (more area dominated below ref);
+    #                                   rewards both convergence toward
+    #                                   ideal AND front spread.  This is
+    #                                   the headline convergence metric.
+    n_obj = 2 if sim_type == 'CHT_AL' else 3
+    pop_hypervolumes       = HyperVolume(np.zeros(n_obj))
+    pop_hypervolumes_nadir = HyperVolume(np.ones(n_obj))
 
     # ── Logbook initialisation ────────────────────────────────────────────
     gen_counter = 0
@@ -565,6 +831,17 @@ def main(experiment_type):
     toolbox.logbook.add("No. individuals that produced no hold time",  0)
     toolbox.logbook.add("No. individuals that failed constraint tests", 0)
     toolbox.logbook.add("hypervolume",         [0 for _ in range(1, NGEN + 1)])
+    # Standard-MOO HV with ref at the nadir corner (1,…,1) in fit_2d
+    # space.  Higher = better; rewards both convergence and spread.
+    # This is the headline convergence metric; ``hypervolume`` above is
+    # the legacy utopia-distance variant retained for back-compat.
+    toolbox.logbook.add("hypervolume_nadir",   [0 for _ in range(1, NGEN + 1)])
+    # Diag-4: HV computed only over non-sentinel parents (those whose
+    # heavy evaluators succeeded — fitness ≠ (1, 1)).  Removes the
+    # sentinel-rate confounder when comparing HV trajectories across
+    # runs.  Same length as "hypervolume", zero-padded.
+    toolbox.logbook.add("hypervolume_nonsentinel",
+                        [0 for _ in range(1, NGEN + 1)])
     # Per-generation count of offspring that passed the feasibility check
     # (and were therefore evaluated by SPARK + PITOT3).  A persistently
     # low number signals stagnation — the search ellipsoid is wider than
@@ -662,6 +939,14 @@ def main(experiment_type):
         ind._feasible = fit is not None
         if ind._feasible:
             ind.fitness.values = fit
+        # Detect PITOT3 / SPARK sentinels for downstream filters.
+        # Only meaningful in CHT_AL mode (legacy modes route failures
+        # through a different sentinel-recovery path).
+        if sim_type == 'CHT_AL':
+            _detect_sentinels(ind, fit, g_al)
+        else:
+            ind._pitot3_sentinel = False
+            ind._spark_sentinel = False
 
     # ── Strategy and multiprocessing setup ────────────────────────────────
     strategy = StrategyMultiObjective(
@@ -681,12 +966,26 @@ def main(experiment_type):
     # Idempotent: pycma's set_coefficients short-circuits once
     # _initialized is fully True; we still call it again every generation
     # below until it is, to refine on additional samples.
+    #
+    # Fix-S2: filter sentinel individuals (heavy-evaluator failures
+    # encoded as fitness ≈ (1, 1)) from the bootstrap sample.  Their
+    # g_al is a sentinel-implied value (PITOT3 → +3400 m/s) that
+    # inflates iqr(G) and biases the initial μ_AL too small.
     if sim_type == 'CHT_AL':
-        F_pop  = [sum(ind.fitness.values) for ind in population if ind._feasible]
-        G_AL   = [ind._g_al               for ind in population if ind._feasible]
+        F_pop, G_AL = [], []
+        for ind in population:
+            if not ind._feasible:
+                continue
+            if not ind.fitness.valid:
+                continue
+            if _is_sentinel(ind):
+                continue   # PITOT3 or SPARK sentinel — exclude from bootstrap
+            F_pop.append(sum(ind.fitness.values))
+            G_AL.append(ind._g_al)
         if F_pop:
             strategy.init_al(F_pop, G_AL)
-            print(f"AL bootstrapped: lam={strategy.al.lam}, mu={strategy.al.mu}")
+            print(f"AL bootstrapped on {len(F_pop)} real parents: "
+                  f"lam={strategy.al.lam}, mu={strategy.al.mu}")
 
     # maxtasksperchild caps the number of evaluations a worker handles
     # before the Pool kills and respawns it.  This bounds per-worker
@@ -828,9 +1127,20 @@ def main(experiment_type):
                 # failures to fit=None, g_al=None — those individuals are
                 # excluded from AL coefficient adaptation by construction.
                 ind._feasible = False
+                ind._pitot3_sentinel = False
+                ind._spark_sentinel = False
                 continue
 
             ind._feasible = True
+            # Detect PITOT3 / SPARK sentinels.  In CHT_AL mode fit_2d may
+            # be real even when delta_vs1 is the PITOT3 sentinel (SPARK
+            # succeeded, PITOT3 failed) — detecting this case requires
+            # checking g_al + al_tol, not fit alone.
+            if sim_type == 'CHT_AL':
+                _detect_sentinels(ind, fit, g_al)
+            else:
+                ind._pitot3_sentinel = False
+                ind._spark_sentinel = False
             # Failure-sentinel detection in legacy 3-objective mode:
             # fit[0] is normalised delta_vs1 and == 1.0 means PITOT3 hit
             # its 3500 m/s sentinel.  In CHT_AL mode that path is already
@@ -934,18 +1244,27 @@ def main(experiment_type):
         # _initialized array) — pycma short-circuits idempotently once
         # the initial-conditions are met, so the cost is negligible.
         if sim_type == 'CHT_AL':
-            F_proxy, g_al_proxy = _cheap_al_proxy(strategy)
+            F_proxy, g_al_proxy, proxy_stats = _cheap_al_proxy(strategy)
             if F_proxy is not None:
                 # Refine bootstrap on additional g_al samples whilst not
                 # yet fully initialised.  No-op once is_initialized=True.
+                # Fix-S2: exclude sentinels from the bootstrap iqr scale,
+                # matching the proxy filter so the initial μ_AL isn't
+                # calibrated against sentinel-inflated g.
                 if not strategy.al.is_initialized:
-                    F_pop_now = [sum(p.fitness.values) for p in strategy.parents
-                                 if p.fitness.valid and getattr(p, "_g_al", None) is not None]
-                    G_AL_now  = [p._g_al for p in strategy.parents
-                                 if p.fitness.valid and getattr(p, "_g_al", None) is not None]
+                    F_pop_now, G_AL_now = [], []
+                    for p in strategy.parents:
+                        if not p.fitness.valid:
+                            continue
+                        if getattr(p, "_g_al", None) is None:
+                            continue
+                        if _is_sentinel(p):
+                            continue   # PITOT3 or SPARK sentinel
+                        F_pop_now.append(sum(p.fitness.values))
+                        G_AL_now.append(p._g_al)
                     if F_pop_now:
                         strategy.init_al(F_pop_now, G_AL_now)
-                strategy.update_al(F_proxy, g_al_proxy)
+                strategy.update_al(F_proxy, g_al_proxy, proxy_stats=proxy_stats)
                 print(f"AL: lam={strategy.al.lam}, mu={strategy.al.mu}, "
                       f"g_al_proxy={g_al_proxy}")
 
@@ -984,12 +1303,40 @@ def main(experiment_type):
         # noise that produced the discrete-plateau jumps in the convergence trace.
         parent_fitnesses = np.array([ind.fitness.values for ind in strategy.parents])
         hypervolume = pop_hypervolumes.compute(parent_fitnesses * -1)
-        print(f'hypervolume = {hypervolume}')
-        toolbox.logbook.bookshelf['hypervolume'][gen] = hypervolume
+        # Standard-MOO HV (nadir ref): pass fit_2d directly, no negation.
+        # See pop_hypervolumes_nadir construction above for interpretation.
+        hypervolume_nadir = pop_hypervolumes_nadir.compute(parent_fitnesses.copy())
+        print(f'hypervolume (utopia ref, lower=better) = {hypervolume}')
+        print(f'hypervolume (nadir ref, higher=better) = {hypervolume_nadir}')
+        toolbox.logbook.bookshelf['hypervolume'][gen]       = hypervolume
+        toolbox.logbook.bookshelf['hypervolume_nadir'][gen] = hypervolume_nadir
+
+        # Diag-4: HV over non-sentinel parents only.  Sentinels sit at
+        # the (1, 1) nadir and contribute ≈ 0 to HV, but their inclusion
+        # in the parent array distorts cross-run comparison when sentinel
+        # rates differ.  Reporting a second HV stripped of sentinels lets
+        # us compare runs on equal footing.  Excludes both PITOT3-only
+        # and SPARK sentinels — for the cross-run HV comparison we want
+        # only individuals whose entire heavy-eval succeeded.
+        if sim_type == 'CHT_AL':
+            non_sent_fits = np.array([
+                ind.fitness.values for ind in strategy.parents
+                if ind.fitness.valid and not _is_sentinel(ind)
+            ])
+            if len(non_sent_fits) > 0:
+                hv_ns = pop_hypervolumes.compute(non_sent_fits * -1)
+            else:
+                # Every parent is a sentinel — degenerate HV; report 1.0
+                # to mean "no real progress".  Matches the convention of
+                # the main HV trace for the empty-front case.
+                hv_ns = 1.0
+            toolbox.logbook.bookshelf['hypervolume_nonsentinel'][gen] = hv_ns
+            print(f'hypervolume (non-sentinel) = {hv_ns}')
 
         # Periodic outputs every SAVE_INTERVAL generations.
         if bookshelf_gen % SAVE_INTERVAL == 0:
-            _save_outputs(bookshelf_gen, gen_snapshots, fitness_history, MU, folders)
+            _save_outputs(bookshelf_gen, gen_snapshots, fitness_history, MU, folders,
+                          strategy=strategy, bounds=bounds)
             # Refresh the CHT diagnostic figure from the CSVs the drain
             # block has been appending to every generation.  The plot is
             # stateless (read-from-disk), so this is a pure side-effect
@@ -1012,9 +1359,30 @@ def main(experiment_type):
             rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
             print(f"parent RSS (peak) = {rss_mb:.1f} MB")
 
+    # ── D1: External archive dump ─────────────────────────────────────────
+    # Write the non-dominated archive accumulated across all generations
+    # to summary/archive.csv.  Distinct from the final-parent set: the
+    # archive captures every individual that was ever Pareto-optimal in
+    # raw objective space, even if subsequently displaced from the parent
+    # set by HV-contribution selection drift.
+    summary_dir = folders["summary"]
+    if hasattr(strategy, "flush_archive_to_csv"):
+        strategy.flush_archive_to_csv(summary_dir)
+
+    # ── D2: Diversity metrics ─────────────────────────────────────────────
+    # Compute Deb's Δ (and ext_0, ext_1, spacing) on both the final
+    # parent set and the external archive.  Dumped to a human-readable
+    # txt file alongside convergence_data.txt.  Only meaningful for
+    # 2-objective sim_types (CHT_AL); the writer no-ops for 3-obj runs.
+    if sim_type == 'CHT_AL':
+        _write_diversity_metrics(
+            out_path=summary_dir / "diversity_metrics.txt",
+            final_parents=strategy.parents,
+            archive=getattr(strategy, "external_archive", []),
+        )
+
     # ── Convergence data ──────────────────────────────────────────────────
     convergence_dir = folders["convergence"]
-    summary_dir     = folders["summary"]
 
     with open(convergence_dir / "convergence_data.txt", "w") as file:
         file.write(f"Simulation Type = {sim_type}\n")
@@ -1023,7 +1391,11 @@ def main(experiment_type):
         file.write(f'p4 treatment = {p4_treatment}\n')
         file.write(f'Number of generations = {NGEN}\n')
         file.write(f'Current Time = {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}\n')
-        file.write(f"Hypervolume per generation:\n")
+        file.write(f"Hypervolume (nadir ref, higher = better) per generation:\n")
+        for gen in range(NGEN):
+            file.write(f"Generation {gen + 1}: {toolbox.logbook.bookshelf['hypervolume_nadir'][gen]}\n")
+
+        file.write(f"\nHypervolume (utopia ref, lower = closer to ideal; legacy) per generation:\n")
         for gen in range(NGEN):
             file.write(f"Generation {gen + 1}: {toolbox.logbook.bookshelf['hypervolume'][gen]}\n")
 
@@ -1033,6 +1405,15 @@ def main(experiment_type):
                 f"Generation {gen + 1}: "
                 f"{toolbox.logbook.bookshelf['feasible_offspring_count'][gen]}\n"
             )
+
+        # Diag-4: non-sentinel HV trace (only meaningful for CHT_AL).
+        if sim_type == 'CHT_AL':
+            file.write("\nHypervolume (non-sentinel parents) per generation:\n")
+            for gen in range(NGEN):
+                file.write(
+                    f"Generation {gen + 1}: "
+                    f"{toolbox.logbook.bookshelf['hypervolume_nonsentinel'][gen]}\n"
+                )
 
         if sim_type == 'CovarianceCHT':
             file.write("\nCHT resample iterations per generation:\n")
@@ -1047,13 +1428,13 @@ def main(experiment_type):
     tick_interval = x_range / 5
 
     plt.figure(dpi=200)
-    plt.title("Convergence")
+    plt.title("Convergence (nadir-ref hypervolume — higher is better)")
     plt.xlabel("Generation")
-    plt.ylabel("Hypervolume")
+    plt.ylabel("Hypervolume (ref = nadir point)")
     plt.ylim((0, 1.1))
 
     gen_axis = list(range(1, NGEN + 1))
-    avg_hv_list = [toolbox.logbook.bookshelf['hypervolume'][g - 1] for g in gen_axis]
+    avg_hv_list = [toolbox.logbook.bookshelf['hypervolume_nadir'][g - 1] for g in gen_axis]
     plt.plot(gen_axis, avg_hv_list)
     plt.savefig(convergence_dir / f"convergence_{sim_type}.png")
     plt.close()
@@ -1186,7 +1567,8 @@ def main(experiment_type):
     # multiple of SAVE_INTERVAL) and re-writes earlier CSVs with any newly
     # available chosen / offspring data.
     _save_outputs(toolbox.logbook.bookshelf['generation'],
-                  gen_snapshots, fitness_history, MU, folders)
+                  gen_snapshots, fitness_history, MU, folders,
+                  strategy=strategy, bounds=bounds)
 
     print('\n\nEND OF SIM')
     print('*' * 60)

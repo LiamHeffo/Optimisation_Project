@@ -185,6 +185,17 @@ AL_PER_GEN_FIELDS = [
     "lam",                   # Lagrangian coefficients (JSON list)
     "mu",                    # penalty coefficients      (JSON list)
     "al_pen_proxy",          # AL penalty at the proxy point
+    # Diag-2: per-generation population g_al statistics, computed across
+    # the *real* (non-sentinel) parents that fed the proxy.  Lets us see
+    # whether the mean proxy is masking bimodality / wide distribution.
+    "g_al_min",              # min g_al across real parents this gen
+    "g_al_max",              # max g_al across real parents this gen
+    "g_al_std",              # std deviation of g_al across real parents
+    "n_feasible_parents",    # count of real (non-sentinel) parents
+    # Diag-3: scaling-drift ratio.  Grows when μ_AL grows faster than
+    # |F| shrinks.  Large values mean the penalty dominates the
+    # objective in the augmented fitness.
+    "pen_to_f_ratio",
 ]
 
 
@@ -229,6 +240,143 @@ def drain_and_persist_al(strategy, gen: int, out_dir: Path) -> list[dict]:
     # empty records list on subsequent calls.
     append_al_per_gen_rows(csv_path, gen, records)
     return records
+
+
+def _nondominated_pairs(pairs):
+    """Return the non-dominated subset of a list of (f0, f1) tuples.
+
+    Minimisation in both objectives.  O(N²) — only used at end-of-run
+    on small lists (final-population N=12, archive N≤100).
+    """
+    n = len(pairs)
+    keep = [True] * n
+    for i in range(n):
+        if not keep[i]:
+            continue
+        for j in range(n):
+            if i == j or not keep[j]:
+                continue
+            if (pairs[j][0] <= pairs[i][0] and pairs[j][1] <= pairs[i][1]
+                    and (pairs[j][0] < pairs[i][0]
+                         or pairs[j][1] < pairs[i][1])):
+                keep[i] = False
+                break
+    return [pairs[i] for i in range(n) if keep[i]]
+
+
+def _diversity_for_set(pairs):
+    """Compute Deb's Δ on a set of 2-objective (f0, f1) tuples.
+
+    Returns a dict with: ``n_nd``, ``ext_0``, ``ext_1``, ``d_bar``,
+    ``spacing`` (Schott), ``delta`` (Deb).
+
+    The Δ formula uses *self-extremes* for d_f and d_l (= 0) — so
+    in-isolation Δ collapses to a uniformity measure
+    Σ|d_i - d̄| / ((N-1)·d̄) rather than a coverage measure.  Cross-run
+    coverage is captured by the ``ext_*`` fields and by post-hoc
+    cross-run analysis (see ``compute_spread.py``).
+
+    Sentinel filter: drop any pair where both components equal 1.0
+    (SPARK/PITOT3 failure marker).  Caller must pass *raw scaled*
+    objectives, not augmented-Lagrangian fitness.
+    """
+    import math
+
+    valid = [(float(a), float(b)) for (a, b) in pairs
+             if not (a >= 0.99999 and b >= 0.99999)]
+    nd = _nondominated_pairs(valid)
+    out = {"n_nd": len(nd),
+           "ext_0": 0.0, "ext_1": 0.0,
+           "d_bar": float("nan"),
+           "spacing": float("nan"),
+           "delta": float("nan")}
+    if len(nd) < 2:
+        return out
+
+    nd_sorted = sorted(nd, key=lambda p: p[0])
+    f0s = [p[0] for p in nd_sorted]
+    f1s = [p[1] for p in nd_sorted]
+    out["ext_0"] = max(f0s) - min(f0s)
+    out["ext_1"] = max(f1s) - min(f1s)
+
+    dists = [
+        math.sqrt((nd_sorted[k + 1][0] - nd_sorted[k][0]) ** 2
+                  + (nd_sorted[k + 1][1] - nd_sorted[k][1]) ** 2)
+        for k in range(len(nd_sorted) - 1)
+    ]
+    d_bar = sum(dists) / len(dists)
+    out["d_bar"] = d_bar
+    out["spacing"] = math.sqrt(
+        sum((d - d_bar) ** 2 for d in dists) / len(dists)
+    )
+    num = sum(abs(d - d_bar) for d in dists)
+    den = (len(dists)) * d_bar
+    out["delta"] = num / den if den > 0 else float("nan")
+    return out
+
+
+def write_diversity_metrics(out_path, final_parents, archive):
+    """Write Δ and crowding-related metrics for the final population
+    and the external archive to ``out_path``.
+
+    Both inputs are sequences carrying (f0, f1) pairs in raw fitness
+    space:
+      * ``final_parents``: DEAP individuals — we read ``fitness.values``
+        and ``_feasible`` to filter.
+      * ``archive``: archive dicts from ``strategy.external_archive``,
+        each with a ``fitness`` tuple.
+
+    Both metric blocks are computed and dumped as a human-readable
+    text file.  Designed to be called once at end of run.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    pop_pairs = []
+    for ind in final_parents:
+        if not getattr(ind, "_feasible", True):
+            continue
+        if not ind.fitness.valid:
+            continue
+        if len(ind.fitness.values) != 2:
+            # Diversity metric only defined for the 2-objective CHT_AL
+            # set-up; legacy 3-objective runs skip this block.
+            return
+        # Skip sentinels (PITOT3 or SPARK).  The internal
+        # _diversity_for_set function also drops (1, 1) points via its
+        # own fitness-based filter, which catches SPARK sentinels; the
+        # explicit flag check here additionally catches PITOT3-only
+        # sentinels (real fit, fake constraint state).
+        if (getattr(ind, "_pitot3_sentinel", False)
+                or getattr(ind, "_spark_sentinel", False)):
+            continue
+        pop_pairs.append(tuple(ind.fitness.values))
+
+    arc_pairs = [tuple(m["fitness"]) for m in archive
+                 if len(m["fitness"]) == 2]
+
+    pop_metrics = _diversity_for_set(pop_pairs)
+    arc_metrics = _diversity_for_set(arc_pairs)
+
+    def _fmt(v):
+        if isinstance(v, float):
+            if v != v:  # NaN
+                return "n/a"
+            return f"{v:.6f}"
+        return str(v)
+
+    with out_path.open("w") as f:
+        f.write("# Diversity metrics — Deb's Δ on the non-dominated set\n")
+        f.write("# Lower Δ = more uniform spread along the front.\n")
+        f.write("# Δ uses per-set extremes (d_f = d_l = 0); for cross-run\n")
+        f.write("# coverage compare ext_0 and ext_1 directly.\n")
+        f.write("\n[Final population]\n")
+        for k in ("n_nd", "ext_0", "ext_1", "d_bar", "spacing", "delta"):
+            f.write(f"  {k} = {_fmt(pop_metrics[k])}\n")
+        f.write("\n[External archive]\n")
+        f.write(f"  total_size = {len(archive)}\n")
+        for k in ("n_nd", "ext_0", "ext_1", "d_bar", "spacing", "delta"):
+            f.write(f"  {k} = {_fmt(arc_metrics[k])}\n")
 
 
 def drain_and_persist(strategy, gen: int, out_dir: Path,

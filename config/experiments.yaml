@@ -76,8 +76,14 @@
 #                        their mean by α.  Counteracts anisotropy lock-in
 #                        across many CHT calls.
 #                    cht_gamma_schedule: [start, end, n_gens]
-#                        linear interpolation of cht_gamma over n_gens.
-#                        Aggressive early, gentle late.
+#                                     or  [start, end, start_gen, end_gen]
+#                        Schedule for cht_gamma.  3-element form is the
+#                        legacy linear-from-gen-0 schedule.  4-element
+#                        form holds start until start_gen, interpolates
+#                        linearly to end over [start_gen, end_gen], then
+#                        stays at end.  Use the 4-element form for
+#                        delayed γ-decay (e.g. hold full strength during
+#                        the early CHT-pull phase, then back off).
 #                    cht_kappa_trigger: float (e.g. 5.0)
 #                        when κ(C) exceeds this threshold, re-isotropise
 #                        even with no infeasibles present.  Escape valve.
@@ -90,8 +96,15 @@
 #                        when λ is at its floor, multiply μ by this factor
 #                        each gen.  Lets the AL "forget" the early peak.
 #                    al_tol_schedule: [start_tol, end_tol, n_gens]
-#                        tighten ε over time.  Keeps the constraint active
-#                        when the search would otherwise sit comfortably.
+#                                  or  [start_tol, end_tol, start_gen, end_gen]
+#                        tighten ε over time.  3-element form is the
+#                        legacy linear-from-gen-0 schedule.  4-element
+#                        form holds start_tol until start_gen, then
+#                        interpolates to end_tol over [start_gen, end_gen],
+#                        and stays at end_tol.  Use 4-element for
+#                        delayed onset (e.g. let the AL bootstrap on a
+#                        wide initial tol, then tighten only once the
+#                        search has stabilised).
 #
 #                  Group C — redefine / re-treat infeasibility
 #                    cht_resample_tol: float (e.g. 0.02)
@@ -104,6 +117,30 @@
 #                        exclude CHT-resampled offspring from the donor
 #                        parent's σ/psucc adaptation.  Decouples σ from
 #                        CHT-induced "successes".
+#                    psucc_sentinel_as_failure: bool (true/false)
+#                        partial reversal of Fix-S3.  When True, PITOT3
+#                        and SPARK sentinel offspring in the *not-chosen*
+#                        branch contribute the standard psucc decay + σ
+#                        shrinkage — they are treated as honest failures
+#                        rather than skipped.  The chosen-branch Fix-S3
+#                        (no "+" signal from sentinel successes) stays
+#                        active unconditionally.  Reframes sentinels as
+#                        information about region (in)feasibility rather
+#                        than noise.  Default False (full Fix-S3).
+#
+#                  Group F — diversity-preserving fixes (new in run set 11+)
+#                    sigma_floor_silent: float (e.g. 1.0e-3)
+#                        clamp σ ≥ this value once both AL and CHT have
+#                        been silent for ≥ 20 consecutive generations.
+#                        Direct backstop against σ collapse in the
+#                        post-disengagement window.
+#                    selection: 'hv_contribution' | 'crowding'
+#                        within-front ranking criterion.
+#                        'hv_contribution' (default) is the legacy
+#                        Voss 2009 knee-attractive selection.
+#                        'crowding' uses NSGA-II crowding distance,
+#                        which removes the knee-seeking bias and
+#                        directly promotes objective-space diversity.
 
 experiments:
   # ────────────────────────────────────────────────────────────────────────
@@ -117,116 +154,260 @@ experiments:
   # the order doesn't matter and you can safely skip any subset.
   # ────────────────────────────────────────────────────────────────────────
 
-  # Baseline (no features) — reproduces the run analysed in the diagnostic
-  # post-mortem.  Includes for direct comparison against each feature run.
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features: {}
+  # ────────────────────────────────────────────────────────────────────────
+  # Run set 12+ — psucc_sentinel_as_failure exploration (NGEN = 500).
+  #
+  # All five tests share the new psucc_sentinel_as_failure toggle:
+  # SPARK/PITOT3 sentinels in the not-chosen branch contribute σ shrinkage
+  # rather than being skipped (treating numerical-failure regions as real
+  # information about local feasibility).  Chosen-branch Fix-S3 stays
+  # active unconditionally — a sentinel that survives selection is still
+  # not a real success.
+  #
+  # Tests 2-5 also exercise the new 4-element schedule form
+  # [start, end, start_gen, end_gen] for delayed-onset schedules:
+  # the AL ε holds wide for the first 100 gens (lets the population
+  # settle into a feasible region without aggressive constraint
+  # pressure), then tightens over gens 100-450 and is constant for
+  # the final 50 gens.
+  # ────────────────────────────────────────────────────────────────────────
 
-  # A1 — eigenvalue floor (caps per-call shrinkage at 50% of prior axis).
+  # T1 — baseline + psucc_sentinel_as_failure.
+  # Establishes the new reference: how does the death-spiral look once
+  # σ shrinks in response to sentinel failures?  Direct comparison against
+  # the pre-toggle baseline (0028).
+  # - sim_type: CHT_AL
+  #   pop_size: 12
+  #   step_size: 0.05
+  #   p4_treatment: null
+  #   al_tol: 100.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     psucc_sentinel_as_failure: true
+
+  # T2 — delayed ε tightening (1500 → 100 over gens 100-450), pop=12.
+  # Wide initial tol lets the AL bootstrap on a population that is mostly
+  # AL-feasible (delta_vs1 < 1500 m/s), avoiding the early μ over-ramp
+  # observed in the baseline rerun.  Tightening starts at gen 100, when
+  # the search distribution has had time to align with the real Pareto
+  # front, and finishes at gen 450 — the last 50 gens run at ε = 100 to
+  # let the population settle on the final constraint surface.
+  # - sim_type: CHT_AL
+  #   pop_size: 12
+  #   step_size: 0.05
+  #   p4_treatment: null
+  #   al_tol: 1500.0                  # initial; schedule overrides per-gen
+  #   cht_gamma: 0.0125
+  #   features:
+  #     psucc_sentinel_as_failure: true
+  #     al_tol_schedule: [1500.0, 100.0, 100, 450]
+
+  # T3 — T2 + γ-decay schedule [0.0125 → 0.0 over gens 100-450], pop=12.
+  # CHT shrinkage at full strength during the early feasibility-finding
+  # phase (gens 0-99), then linear decay alongside the ε tightening
+  # (gens 100-449), then γ = 0 for the final 50 gens.  At γ = 0 the
+  # CHT effectively stops carving the covariance — the search runs on
+  # pure CMA-ES adaptation, freeing it from the κ inflation observed in
+  # the rerun set (κ ≈ 15-18 in 0028 / 0030 was CHT-driven).
+  # - sim_type: CHT_AL
+  #   pop_size: 12
+  #   step_size: 0.05
+  #   p4_treatment: null
+  #   al_tol: 1500.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     psucc_sentinel_as_failure: true
+  #     al_tol_schedule:    [1500.0,  100.0, 100, 450]
+  #     cht_gamma_schedule: [0.0125,  0.0,   100, 450]
+
+  # T4 — T2 with pop=24.  Tests whether doubling μ (and therefore λ)
+  # changes the dynamics: more parents → richer Pareto front candidates,
+  # more offspring → more sentinel events per gen but also more
+  # information per gen.  pop scaling probes the small-population
+  # hypothesis as a separate cause of front clustering.
   - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
+    pop_size: 24
+    step_size: 0.1
     p4_treatment: null
-    al_tol: 100.0
+    al_tol: 1500.0
     cht_gamma: 0.0125
     features:
-      cht_eigenvalue_floor: 0.5
+      psucc_sentinel_as_failure: true
+      al_tol_schedule: [1500.0, 100.0, 100, 450]
 
-  # A2 — isotropy relaxation (5% pull toward mean(eigenvalues) per CHT call).
+  # T5 — T3 with pop=24.  The full stack: psucc-as-failure + delayed ε
+  # tightening + γ-decay + doubled population.  Expected to be the
+  # highest-budget run of the set and the strongest test of whether
+  # the combined mechanisms can produce a well-spread Pareto front
+  # without the κ inflation or σ collapse pathologies.
   - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
+    pop_size: 24
+    step_size: 0.1
     p4_treatment: null
-    al_tol: 100.0
+    al_tol: 1500.0
     cht_gamma: 0.0125
     features:
-      cht_isotropy_alpha: 0.05
+      psucc_sentinel_as_failure: true
+      al_tol_schedule:    [1500.0,  100.0, 100, 450]
+      cht_gamma_schedule: [0.0125,  0.0,   100, 450]
 
-  # A3 — gamma schedule (decay 0.0125 → 0.001 over 500 generations).
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      cht_gamma_schedule: [0.0125, 0.001, 500]
+  # ────────────────────────────────────────────────────────────────────────
+  # Previous rerun set (0028-0033) — commented out.  These were the
+  # post-sentinel-fix runs (baseline + A2 + A3 + B2 + B3 + C3) at
+  # NGEN = 400 without the psucc_sentinel_as_failure toggle.  Kept
+  # here as a yaml history; uncomment to reproduce.
+  # ────────────────────────────────────────────────────────────────────────
 
-  # A4 — kappa trigger (re-isotropise when κ(C) > 5).
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      cht_kappa_trigger: 5.0
-      cht_isotropy_alpha: 0.1   # correction strength when trigger fires
+  # # Baseline (no features) — pre-toggle.
+  # - sim_type: CHT_AL
+  #   pop_size: 12
+  #   step_size: 0.05
+  #   p4_treatment: null
+  #   al_tol: 100.0
+  #   cht_gamma: 0.0125
+  #   features: {}
 
-  # B1 — lam floor (maintain λ ≥ 0.01·μ instead of clamping to 0).
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      al_lam_floor_factor: 0.01
+  # # A2 — isotropy relaxation (5% pull toward mean(eigenvalues) per CHT call).
+  # - sim_type: CHT_AL
+  #   pop_size: 12
+  #   step_size: 0.05
+  #   p4_treatment: null
+  #   al_tol: 100.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     cht_isotropy_alpha: 0.05
 
-  # B2 — mu decay (multiply μ by 0.99 each gen while λ is clamped).
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      al_mu_decay: 0.99
+  # # A3 — gamma schedule (decay 0.0125 → 0.001 over 500 generations).
+  # - sim_type: CHT_AL
+  #   pop_size: 12
+  #   step_size: 0.05
+  #   p4_treatment: null
+  #   al_tol: 100.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     cht_gamma_schedule: [0.0125, 0.001, 500]
 
-  # B3 — al_tol decay (tighten 100 → 20 m/s over 500 generations).
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      al_tol_schedule: [100.0, 20.0, 500]
+  # # B2 — mu decay (multiply μ by 0.99 each gen while λ is clamped).
+  # - sim_type: CHT_AL
+  #   pop_size: 12
+  #   step_size: 0.05
+  #   p4_treatment: null
+  #   al_tol: 100.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     al_mu_decay: 0.99
 
-  # C1 — resample tolerance (allow up to 0.02 violation during resample).
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      cht_resample_tol: 0.02
+  # # B3 — al_tol decay (tighten 100 → 20 m/s over 500 generations).
+  # - sim_type: CHT_AL
+  #   pop_size: 12
+  #   step_size: 0.05
+  #   p4_treatment: null
+  #   al_tol: 100.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     al_tol_schedule: [100.0, 20.0, 500]
 
-  # C2 — reflective box repair (reflect [1,2] violations back into the box).
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      box_reflective_repair: true
+  # # C3 — exclude resampled offspring from psucc adaptation.
+  # - sim_type: CHT_AL
+  #   pop_size: 12
+  #   step_size: 0.05
+  #   p4_treatment: null
+  #   al_tol: 100.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     psucc_exclude_resampled: true
 
-  # C3 — exclude resampled offspring from psucc adaptation.
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      psucc_exclude_resampled: true
+  # ────────────────────────────────────────────────────────────────────────
+  # Diversity-preserving combinations (run set 11+).  Each addresses one
+  # or more of the three confirmed damage mechanisms (anisotropy, psucc
+  # inflation, frozen-μ boundary sharpening) plus the structural knee-
+  # seeking bias of HV-contribution selection.  D1/D2 (archive + Δ
+  # output) are universal — they fire on every run regardless of feature
+  # flags, so no toggle here.
+  #
+  # Currently commented out: the rerun-set above is running first
+  # (post sentinel-fix), and these combinations will be re-enabled after
+  # the rerun analysis (see SENTINEL_FIXES_PLAN.md).
+  # ────────────────────────────────────────────────────────────────────────
+
+  # # T11 — σ floor + C3.  Pairs the two σ-retention features: C3 stops
+  # # psucc inflation, σ floor backstops if psucc collapses anyway.
+  # - sim_type: CHT_AL
+  #   pop_size: 12
+  #   step_size: 0.05
+  #   p4_treatment: null
+  #   al_tol: 100.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     psucc_exclude_resampled: true
+  #     sigma_floor_silent: 1.0e-3
+
+  # # T12 — C3 + A3.  The top mechanism combination: psucc decouple plus
+  # # γ-decay schedule.  Both extend σ retention via independent paths.
+  # - sim_type: CHT_AL
+  #   pop_size: 12
+  #   step_size: 0.05
+  #   p4_treatment: null
+  #   al_tol: 100.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     psucc_exclude_resampled: true
+  #     cht_gamma_schedule: [0.0125, 0.001, 500]
+
+  # # T13 — C3 + ε schedule with wide start.  Tests the "delayed AL"
+  # # hypothesis: start ε wide enough that initial population is mostly
+  # # feasible (g_al ≤ 0), tighten over gens 50–250, then constant.
+  # - sim_type: CHT_AL
+  #   pop_size: 12
+  #   step_size: 0.05
+  #   p4_treatment: null
+  #   al_tol: 1500.0      # initial; overridden by schedule each gen
+  #   cht_gamma: 0.0125
+  #   features:
+  #     psucc_exclude_resampled: true
+  #     al_tol_schedule: [1500.0, 100.0, 250]
+
+  # # T14 — Crowding-distance selection on baseline (no other features).
+  # # Isolation test: does NSGA-II selection alone meaningfully change
+  # # the HV/Δ landscape?  If yes, integrate into T15/T16.
+  # - sim_type: CHT_AL
+  #   pop_size: 12
+  #   step_size: 0.05
+  #   p4_treatment: null
+  #   al_tol: 100.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     selection: crowding
+
+  # # T15 — C3 + A3 + crowding-distance selection.
+  # # Mechanism stack: psucc decouple (σ retention) + γ schedule (CHT
+  # # softening) + crowding selection (anti-knee bias).  Three orthogonal
+  # # interventions, one per identified damage mechanism.
+  # - sim_type: CHT_AL
+  #   pop_size: 12
+  #   step_size: 0.05
+  #   p4_treatment: null
+  #   al_tol: 100.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     psucc_exclude_resampled: true
+  #     cht_gamma_schedule: [0.0125, 0.001, 500]
+  #     selection: crowding
+
+  # # T16 — C3 + A3 + ε schedule.  The alternative triple stack (without
+  # # crowding selection), as a comparison point for T15.  Tests whether
+  # # the AL/ε mechanism plus γ schedule plus C3 can match the structural
+  # # selection fix.
+  # - sim_type: CHT_AL
+  #   pop_size: 12
+  #   step_size: 0.05
+  #   p4_treatment: null
+  #   al_tol: 1500.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     psucc_exclude_resampled: true
+  #     cht_gamma_schedule: [0.0125, 0.001, 500]
+  #     al_tol_schedule: [1500.0, 100.0, 250]
 
 
 
