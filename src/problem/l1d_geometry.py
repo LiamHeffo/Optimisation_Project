@@ -53,9 +53,23 @@ D_BUFFER_STUD  = 0.050
 # Hodson methodology constant.
 M_ASPECT = 2.0
 
-# Provisional orifice-plate parameters.  L_ORIFICE is the axial extent of
-# the constant-D_throat section between the two flanking gradients.
-L_ORIFICE = 0.010
+# Provisional orifice-plate parameters.
+#
+# L_ORIFICE_THROAT is the actual axial extent of the constant-D_throat
+# section between the two flanking ramps — i.e., the gap between break-
+# points 14 and 15 in plot_geometry().  Held constant regardless of D_throat
+# so that the throat is always resolved by the same number of driver-gas
+# cells (otherwise the throat width would scale with the volume-conserving
+# correction (r − a)/m and shrink to ~7 mm at D_throat ≈ 75 mm).
+L_ORIFICE_THROAT = 0.010
+
+# Aspect ratio (radius:length) of the orifice plate's contraction and
+# expansion ramps.  Smaller than M_ASPECT (= 2.0, used for the
+# reservoir/launcher/buffer-plate ramps) so each orifice ramp spans
+# multiple driver-gas cells rather than collapsing inside one cell.
+# At M_ORIFICE = 0.5 the ramp axial length is 2·(R_SHOCK − R_throat),
+# i.e., 10 mm at D_throat = 75 mm and 35 mm at D_throat = 50 mm.
+M_ORIFICE = 1.0
 
 # Minimal-model shock-tube extent past the primary diaphragm.
 L_SHOCK_TUBE_END = 5.0
@@ -172,26 +186,43 @@ def build_break_points(buffer_length, D_throat=None):
     # than the shock-tube diameter.  At D_throat == 2*R_SHOCK the orifice
     # is degenerate (no area change), so we skip the gradient calls and
     # treat the design as if no orifice were present.
+    #
+    # We do NOT call volume_conserving_ramp here: that API fixes x_nominal
+    # and solves for (x_R, x_r), which makes the throat span depend on
+    # (r − a)/m and shrink with smaller D_throat.  Instead, we fix the
+    # throat endpoints x_r_T6, x_r_T7 at ±L_ORIFICE_THROAT/2 about the
+    # orifice centre and the ramp slope at M_ORIFICE, which gives a
+    # throat width independent of D_throat and ramps long enough to be
+    # resolved by ≥1 driver-gas cell each.  Volume conservation still
+    # holds — the implicit x_nominal just slides to make it work.
     if D_throat is not None and D_throat < 2 * R_SHOCK:
         x_orifice_centre = x_r_T5 / 2.0          # midpoint(x_inner_buffer, PD_X=0)
-        x_T6_nom = x_orifice_centre - L_ORIFICE / 2.0
-        x_T7_nom = x_orifice_centre + L_ORIFICE / 2.0
         R_throat = D_throat / 2.0
 
-        # Upstream gradient (reduction shock-tube → orifice).
-        x_R_T6, x_r_T6 = volume_conserving_ramp(
-            R_SHOCK, R_throat, x_T6_nom, direction=-1,
-        )
-        # Downstream gradient (expansion orifice → shock-tube).
-        x_R_T7, x_r_T7 = volume_conserving_ramp(
-            R_SHOCK, R_throat, x_T7_nom, direction=+1,
-        )
-        if x_r_T7 <= x_r_T6:
+        # Throat endpoints — gap between break-points 14 and 15 fixed.
+        x_r_T6 = x_orifice_centre - L_ORIFICE_THROAT / 2.0
+        x_r_T7 = x_orifice_centre + L_ORIFICE_THROAT / 2.0
+
+        # Ramp endpoints — axial length set by M_ORIFICE alone.
+        ramp_axial = (R_SHOCK - R_throat) / M_ORIFICE
+        x_R_T6 = x_r_T6 - ramp_axial             # upstream end of contraction
+        x_R_T7 = x_r_T7 + ramp_axial             # downstream end of expansion
+
+        # Feasibility — ramps must not overlap the buffer-plate small-D
+        # end upstream or the primary diaphragm downstream.
+        if x_R_T6 <= x_r_T5:
             raise ValueError(
-                f"Orifice geometry infeasible at D_throat={D_throat:.4f} m, "
-                f"L_orifice={L_ORIFICE:.4f} m: gradients would overlap "
-                f"(x_r_T6={x_r_T6:.6f}, x_r_T7={x_r_T7:.6f})."
+                f"Orifice contraction ramp infeasible at "
+                f"D_throat={D_throat:.4f} m, M_ORIFICE={M_ORIFICE}: "
+                f"x_R_T6={x_R_T6:.6f} <= x_inner_buffer={x_r_T5:.6f}."
             )
+        if x_R_T7 >= PD_X:
+            raise ValueError(
+                f"Orifice expansion ramp infeasible at "
+                f"D_throat={D_throat:.4f} m, M_ORIFICE={M_ORIFICE}: "
+                f"x_R_T7={x_R_T7:.6f} >= PD_X={PD_X:.6f}."
+            )
+
         bps.append((x_R_T6, 2 * R_SHOCK))
         bps.append((x_r_T6, D_throat))
         bps.append((x_r_T7, D_throat))
@@ -202,6 +233,244 @@ def build_break_points(buffer_length, D_throat=None):
     bps.append((L_SHOCK_TUBE_END, 2 * R_SHOCK))
     bps.sort(key=lambda xd: xd[0])
     return bps, derived
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Roberts cluster function (port of gdtk.numeric.roberts for visualisation)
+# ─────────────────────────────────────────────────────────────────────────────
+# Used only by plot_geometry() to place cell faces where l1d4-prep will place
+# them.  Reproducing this here avoids a runtime gdtk import from the
+# optimisation hot path while keeping the cell layout in the plot exact.
+
+def _roberts(eta, alpha, beta):
+    """Roberts boundary-layer-like coordinate stretching, eta ∈ [0,1]."""
+    lmbda = (beta + 1.0) / (beta - 1.0)
+    lmbda = np.power(lmbda, (eta - alpha) / (1.0 - alpha))
+    etabar = (beta + 2.0 * alpha) * lmbda - beta + 2.0 * alpha
+    return etabar / ((2.0 * alpha + 1.0) * (1.0 + lmbda))
+
+
+def _distribute_cell_faces(xL, xR, n, end_L, end_R, beta):
+    """Return n+1 cell faces between xL and xR.
+
+    Mirrors ``gdtk.numeric.roberts.distribute_points_1`` so the cell
+    positions shown by plot_geometry() are bit-identical to what l1d4-prep
+    computes for the same slug parameters.  beta < 1 (or no end specified)
+    falls back to uniform spacing.
+    """
+    if ((not end_L) and (not end_R)) or beta < 1.0:
+        return np.linspace(xL, xR, n + 1)
+    alpha   = 0.0
+    reverse = end_L and (not end_R)
+    eta     = np.linspace(0.0, 1.0, n + 1)
+    if reverse:
+        eta = 1.0 - eta
+    etabar = _roberts(eta, alpha, beta)
+    if reverse:
+        etabar = 1.0 - etabar
+    return (1.0 - etabar) * xL + etabar * xR
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Geometry visualisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_geometry(
+    buffer_length,
+    D_throat=None,
+    *,
+    mesh_scale=2,
+    n_res_base=30,
+    n_drv_base=60,
+    n_test_base=30,
+    drv_cluster_strength=1.01,
+    test_cluster_strength=1.02,
+    shock_tube_end_x=4.0,
+    save_path=None,
+    show=False,
+):
+    """Render the X2 driver geometry for one (buffer_length, D_throat) pair.
+
+    Two-panel figure, both drawn to scale:
+
+    * Top — overview from the reservoir start anchor to just past the
+      primary diaphragm (matches Hodson Fig 4.5 framing).
+    * Bottom — zoom on the buffer plate / studs / orifice region, where
+      the volume-conserving ramps are too small to resolve at full scale.
+
+    Both panels show:
+      * Symmetric area profile (±D/2 vs x), light-grey filled.
+      * Every break-point as a numbered dot below the lower profile.
+      * The piston as a filled dark rectangle at its initial (xL0, xR0)
+        position with diameter D_compression.
+      * The buffer studs as a hatched rectangle of axial extent
+        ``buffer_length`` immediately upstream of BUFFER_PLATE_X_NOMINAL,
+        diameter ``D_BUFFER_STUD`` (schematic — radial placement is
+        representative, not physical).
+      * Gas-slug cell faces as short vertical ticks on the axis and cell
+        centres as dots, at the positions L1d will compute via the
+        Roberts cluster function (slug colours: reservoir = blue,
+        driver = red, test = green).
+
+    Parameters
+    ----------
+    buffer_length, D_throat
+        Same semantics as :func:`build_break_points`.
+    mesh_scale
+        Multiplier on the per-slug base cell counts; matches
+        ``MESH_SCALE_FACTOR`` in l1d_job.py.
+    n_res_base, n_drv_base, n_test_base
+        Base cell counts for the reservoir, driver, and test gas slugs.
+    drv_cluster_strength, test_cluster_strength
+        Roberts β for the driver (clustered to PD) and test (clustered
+        to PD) slugs.  Pass < 1.0 for uniform spacing.
+    shock_tube_end_x
+        Right end of the test-gas slug (== ``right_free.x0`` in the job
+        template).
+    save_path
+        If set, writes PNG to this path at dpi=150.
+    show
+        If True, calls ``plt.show()`` before returning.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    bps, derived = build_break_points(buffer_length, D_throat)
+    xs   = np.array([p[0] for p in bps])
+    Ds   = np.array([p[1] for p in bps])
+    y_up = +Ds / 2.0
+    y_lo = -Ds / 2.0
+
+    piston_xL0   = derived["piston_xL0"]
+    piston_xR0   = derived["piston_xR0"]
+    pd_x         = derived["pd_x"]
+    reservoir_xL = RESERVOIR_START_ANCHOR[0]
+
+    # ── Cell layouts (matches JOB_SCRIPT_TEMPLATE in l1d_job.py) ─────────
+    n_res  = n_res_base  * mesh_scale
+    n_drv  = n_drv_base  * mesh_scale
+    n_test = n_test_base * mesh_scale
+
+    res_faces  = _distribute_cell_faces(
+        reservoir_xL, piston_xL0, n_res,
+        end_L=False, end_R=False, beta=0.0)
+    drv_faces  = _distribute_cell_faces(
+        piston_xR0, pd_x, n_drv,
+        end_L=False, end_R=True, beta=drv_cluster_strength)
+    test_faces = _distribute_cell_faces(
+        pd_x, shock_tube_end_x, n_test,
+        end_L=True, end_R=False, beta=test_cluster_strength)
+
+    res_ctr  = 0.5 * (res_faces[:-1]  + res_faces[1:])
+    drv_ctr  = 0.5 * (drv_faces[:-1]  + drv_faces[1:])
+    test_ctr = 0.5 * (test_faces[:-1] + test_faces[1:])
+
+    x_stud_upstr = BUFFER_PLATE_X_NOMINAL - buffer_length
+
+    fig, (ax_over, ax_zoom) = plt.subplots(2, 1, figsize=(14, 9))
+
+    def _draw_common(ax):
+        # Area profile
+        ax.fill_between(xs, y_up, y_lo, color="#ececec", lw=0, zorder=0)
+        ax.plot(xs, y_up, color="black", lw=1.0, zorder=2)
+        ax.plot(xs, y_lo, color="black", lw=1.0, zorder=2)
+
+        # Break-points + numeric labels
+        ax.plot(xs, y_lo, "o", ms=4, color="black", zorder=3)
+        for i, (x, d) in enumerate(zip(xs, Ds), start=1):
+            ax.annotate(
+                str(i), xy=(x, -d / 2),
+                xytext=(3, -10), textcoords="offset points",
+                fontsize=8, color="black",
+            )
+
+        # Piston
+        ax.add_patch(Rectangle(
+            (piston_xL0, -R_COMPRESSION),
+            piston_xR0 - piston_xL0, 2 * R_COMPRESSION,
+            facecolor="#404040", edgecolor="black", lw=0.8, zorder=4,
+        ))
+
+        # Buffer studs (axial extent + cross-section; radial position
+        # schematic — see docstring).
+        if buffer_length > 0:
+            ax.add_patch(Rectangle(
+                (x_stud_upstr, -D_BUFFER_STUD / 2.0),
+                buffer_length, D_BUFFER_STUD,
+                facecolor="none", edgecolor="black",
+                lw=0.8, hatch="////", zorder=4,
+            ))
+
+        # Cell faces (short axial ticks) + cell centres (dots)
+        tk = 0.005   # 5 mm half-tick
+        for xf in res_faces:
+            ax.plot([xf, xf], [-tk, +tk],
+                    color="steelblue", lw=0.4, alpha=0.55, zorder=1)
+        for xf in drv_faces:
+            ax.plot([xf, xf], [-tk, +tk],
+                    color="crimson",  lw=0.4, alpha=0.55, zorder=1)
+        for xf in test_faces:
+            ax.plot([xf, xf], [-tk, +tk],
+                    color="darkgreen", lw=0.4, alpha=0.55, zorder=1)
+        ax.plot(res_ctr,  np.zeros_like(res_ctr),  ".",
+                ms=2, color="steelblue", alpha=0.55, zorder=1)
+        ax.plot(drv_ctr,  np.zeros_like(drv_ctr),  ".",
+                ms=2, color="crimson",   alpha=0.55, zorder=1)
+        ax.plot(test_ctr, np.zeros_like(test_ctr), ".",
+                ms=2, color="darkgreen", alpha=0.55, zorder=1)
+
+        ax.set_xlabel("x-location (m)")
+        ax.set_ylabel("Radius (m)")
+        ax.grid(True, lw=0.3, alpha=0.4)
+        ax.set_aspect("equal", adjustable="box")
+
+    _draw_common(ax_over)
+    _draw_common(ax_zoom)
+
+    # Region labels on the overview only (cluttered on zoom).
+    ax_over.text(0.5 * (reservoir_xL + piston_xL0), 0.0,
+                 "Reservoir", ha="center", va="center", fontsize=11)
+    ax_over.text(0.5 * (piston_xR0 + pd_x), 0.0,
+                 "Compression Tube", ha="center", va="center", fontsize=11)
+    ax_over.text(piston_xL0 + 0.5 * (piston_xR0 - piston_xL0), 0.18,
+                 "Piston", ha="center", va="bottom", fontsize=9)
+
+    # Overview limits — match Hodson Fig 4.5 framing.
+    ax_over.set_xlim(reservoir_xL - 0.3, pd_x + 0.5)
+    ax_over.set_ylim(-0.3, 0.3)
+
+    orifice_blurb = (f", D_throat={D_throat * 1e3:.1f} mm"
+                     if D_throat is not None else ", no orifice plate")
+    ax_over.set_title(
+        f"X2 driver geometry — overview  "
+        f"(buffer_length={buffer_length * 1e3:.1f} mm{orifice_blurb})",
+        fontsize=11,
+    )
+
+    # Zoom — buffer plate + orifice region.
+    zoom_x0 = derived["x_outer_buffer"] - 0.03
+    zoom_x1 = pd_x + 0.02
+    ax_zoom.set_xlim(zoom_x0, zoom_x1)
+    ax_zoom.set_ylim(-0.15, 0.15)
+    ax_zoom.set_title("Zoom — buffer plate, studs, and orifice region",
+                      fontsize=11)
+    ax_zoom.axvline(pd_x, color="orange", ls="--", lw=0.8, alpha=0.7,
+                    label="Primary diaphragm (PD)")
+    if "x_orifice_centre" in derived:
+        ax_zoom.axvline(derived["x_orifice_centre"], color="purple",
+                        ls=":", lw=0.8, alpha=0.7, label="Orifice centre")
+    ax_zoom.legend(loc="upper right", fontsize=8)
+
+    plt.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150)
+    if show:
+        plt.show()
+    return fig
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,6 +513,9 @@ if __name__ == "__main__":
     # Orifice sanity check across the D_throat bound.  At the upper
     # bound (D_throat == 2*R_SHOCK) the orifice is degenerate and is
     # skipped; at smaller D_throat the orifice break-points are added.
+    # Verify the new invariants: throat span (14↔15) == L_ORIFICE_THROAT
+    # for every D_throat, and each ramp axial length == (R_SHOCK − R_throat)
+    # / M_ORIFICE.
     for D_th in (0.085, 0.07, 0.05):
         bps_o, derived_o = build_break_points(0.10, D_throat=D_th)
         has_orifice = "x_orifice_centre" in derived_o
@@ -252,5 +524,15 @@ if __name__ == "__main__":
         print(f"  x_inner_buffer     = {derived_o['x_inner_buffer']:+.5f}")
         if has_orifice:
             print(f"  x_orifice_centre   = {derived_o['x_orifice_centre']:+.5f}")
+            throat_bps = [bp for bp in bps_o if abs(bp[1] - D_th) < 1e-9]
+            shock_d_bps = [bp for bp in bps_o
+                           if abs(bp[1] - 2 * R_SHOCK) < 1e-9
+                           and derived_o["x_inner_buffer"] < bp[0] < 0.0]
+            throat_span = throat_bps[-1][0] - throat_bps[0][0]
+            ramp_axial  = throat_bps[0][0] - shock_d_bps[0][0]
+            print(f"  throat span (14↔15) = {throat_span * 1e3:.3f} mm  "
+                  f"(expected {L_ORIFICE_THROAT * 1e3:.3f} mm)")
+            print(f"  ramp axial length   = {ramp_axial * 1e3:.3f} mm  "
+                  f"(expected {(R_SHOCK - D_th / 2) / M_ORIFICE * 1e3:.3f} mm)")
 
     print("\nAll smoke tests passed.")

@@ -45,7 +45,21 @@ from pathlib import Path
 
 import numpy as np
 
-from problem.l1d_geometry import build_break_points
+from problem.l1d_geometry import (
+    build_break_points,
+    PISTON_FRONT_X,
+    LAUNCHER_LARGE_D,
+    BUFFER_PLATE_X_NOMINAL,
+)
+
+# Piston half-length: distance from the centre (what L1d tracks) to either face.
+# L1d's x_buffer triggers when piston CENTRE crosses x_buffer, so to stop the
+# FRONT FACE at a target axial coordinate x_target we must pass
+# (x_target − PISTON_HALF_LENGTH) as x_buffer.  The target here is the upstream
+# tip of the buffer studs (x_stud_tip = BUFFER_PLATE_X_NOMINAL − buffer_length):
+# this models the piston coming to a hard stop the instant its front face
+# first contacts the buffer studs, with no crush distance.
+PISTON_HALF_LENGTH = (PISTON_FRONT_X - LAUNCHER_LARGE_D[0]) / 2   # = 0.1105 m
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -72,12 +86,12 @@ PREP_TIMEOUT_S       = 2 * 60
 POSTPROCESS_TIMEOUT_S = 60
 
 # Mesh & wall-resolution controls.
-MESH_SCALE_FACTOR    = 5      # per-slug ncells multiplier
+MESH_SCALE_FACTOR    = 2      # per-slug ncells multiplier
 TUBE_N               = 4000   # tube-wall mesh resolution
 
 # Time-stepping constants.
-T_FINISH             = 100.0e-3
-T_SWITCH             = 23.0e-3
+T_FINISH             = 30.0e-3
+T_SWITCH             = 19.0e-3
 
 # Provisional X2-default transducer x-positions (relative to PD at x=0).
 TRANSDUCER_XS = (4.231, 4.746)
@@ -153,7 +167,7 @@ piston = Piston(
 driver_gas = GasSlug(
     gmodel_id=gm_he_ar,
     p={driver_p:.6e}, T=T_amb, vel=0.0, massf=massf_he_ar,
-    ncells={n_drv}, cluster_strength=1.05, to_end_R=True,
+    ncells={n_drv}, cluster_strength=1.01, to_end_R=True,
     viscous_effects=1, hcells=1,
     label="driver gas",
 )
@@ -163,7 +177,7 @@ primary_diaphragm = Diaphragm(x0={pd_x:.4f}, p_burst={p4:.6e}, state=0)
 test_gas = GasSlug(
     gmodel_id=gm_cea_air,
     p={test_gas_p1:.6e}, T=T_amb, vel=0.0,
-    ncells={n_test}, cluster_strength=1.05, to_end_L=True,
+    ncells={n_test}, cluster_strength=1.01, to_end_L=True,
     viscous_effects=0, hcells=1,
     label="test gas",
 )
@@ -178,12 +192,21 @@ add_loss_region({launcher_loss_x0:.4f}, {launcher_loss_x1:.4f}, 0.1)
 add_loss_region({diaphragm_loss_x0:.6f}, {pd_x:.4f}, 0.7)
 
 # ─── History locations (indices wired in parse_l1d_outputs) ──────────────
-add_history_loc({pd_x:.4f})                  # idx 0 — primary-diaphragm pressure
-add_history_loc({transducer_x_1:.4f})        # idx 1 — vs1 ToF station 1
-add_history_loc({transducer_x_2:.4f})        # idx 2 — vs1 ToF station 2
+add_history_loc({transducer_x_1:.4f})        # idx 0 — vs1 ToF station 1
+add_history_loc({transducer_x_2:.4f})        # idx 1 — vs1 ToF station 2
+add_history_loc({pd_x:.4f} - 0.01)           # idx 2 — driver, 0.01 m upstream of PD
+add_history_loc({pd_x:.4f} - 0.02)           # idx 3 — driver, 0.02 m upstream of PD
+add_history_loc({pd_x:.4f} - 0.03)           # idx 4 — driver, 0.03 m upstream of PD
+add_history_loc({pd_x:.4f} - 0.04)           # idx 5 — driver, 0.04 m upstream of PD
+add_history_loc({pd_x:.4f} - 0.05)           # idx 6 — driver, 0.05 m upstream of PD
+add_history_loc({pd_x:.4f} - 0.06)           # idx 7 — driver, 0.06 m upstream of PD
+add_history_loc({pd_x:.4f} - 0.07)           # idx 8 — driver, 0.07 m upstream of PD
+add_history_loc({pd_x:.4f} - 0.08)           # idx 9 — driver, 0.08 m upstream of PD
+add_history_loc({pd_x:.4f} - 0.09)           # idx 10 — driver, 0.09 m upstream of PD
+add_history_loc({pd_x:.4f} - 0.10)           # idx 11 — driver, 0.10 m upstream of PD
 
 # ─── Time stepping ──────────────────────────────────────────────────────
-config.dt_init   = 1.0e-10
+config.dt_init   = 1.0e-9
 config.max_time  = {t_finish:.4e}
 config.max_step  = 25_000_000
 add_cfl_value(0.0, 0.25)
@@ -215,6 +238,10 @@ def write_job_script(out_path, params, ind_number):
     launcher_loss_x0 = next(x for x, d in bps if abs(d - 0.1561) < 1e-4)
     launcher_loss_x1 = next(x for x, d in reversed(bps) if abs(d - 0.1561) < 1e-4)
 
+    # Piston front face stops when it first contacts the buffer-stud tips,
+    # which project upstream from the buffer plate by buffer_length.
+    x_stud_tip = BUFFER_PLATE_X_NOMINAL - params["buffer_length"]
+
     script = JOB_SCRIPT_TEMPLATE.format(
         ind_number=ind_number,
         break_point_calls=bp_lines,
@@ -224,9 +251,9 @@ def write_job_script(out_path, params, ind_number):
         D_compression=0.2568,
         piston_xL0=derived["piston_xL0"],
         piston_xR0=derived["piston_xR0"],
-        x_buffer=derived["x_inner_buffer"],
+        x_buffer=x_stud_tip - PISTON_HALF_LENGTH,
         pd_x=derived["pd_x"],
-        shock_tube_end_x=5.0,
+        shock_tube_end_x=4.0,
         launcher_loss_x0=launcher_loss_x0,
         launcher_loss_x1=launcher_loss_x1,
         diaphragm_loss_x0=derived["x_outer_buffer"],
@@ -234,9 +261,9 @@ def write_job_script(out_path, params, ind_number):
         transducer_x_2=params["transducer_xs"][1],
         t_finish=T_FINISH,
         t_switch=T_SWITCH,
-        n_res=39 * params["mesh_scale"],
-        n_drv=46 * params["mesh_scale"],
-        n_test=34 * params["mesh_scale"],
+        n_res=30 * params["mesh_scale"],
+        n_drv=60 * params["mesh_scale"],
+        n_test=30 * params["mesh_scale"],
         percent_He=params["percent_He"],
         driver_p=params["driver_p"],
         reservoir_p=params["reservoir_p"],

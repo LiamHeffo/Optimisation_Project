@@ -752,7 +752,7 @@ def main(experiment_type):
     N           = 6
     pop_size    = experiment_type[1]
     MU, LAMBDA  = pop_size, pop_size
-    NGEN        = 300
+    NGEN        = 350
     sim_type    = experiment_type[0]
     p4_treatment = experiment_type[3]
     step_size   = experiment_type[2]
