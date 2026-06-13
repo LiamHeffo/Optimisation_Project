@@ -40,6 +40,86 @@ from problem.transforms import variable_untransformation
 from cma.constraints_handler import AugmentedLagrangian
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# sim_type classification
+# ─────────────────────────────────────────────────────────────────────────────
+# Every place in the codebase that needs to ask "is a CHT active?" /
+# "is the AL active?" / "which CHT family is in use?" should go through
+# these helpers rather than enumerating sim_type strings inline.  Two
+# bring-up failures in this repo have been traced back to a guard
+# tuple that forgot a sim_type — centralising the classification
+# eliminates that whole bug class.
+#
+# Method families
+# ---------------
+#   chocat : Chocat 2015 + Adaptation-B Mahalanobis pooling (the legacy
+#            'CovarianceCHT' / 'CHT_AL' covariance-shrink path).
+#   arnold : Arnold & Hansen 2012 with per-parent constraint vectors
+#            v_j,i.  Infeasibles are NOT evaluated and NOT resampled —
+#            the offspring is consumed by Eq. 6 + Eq. 7 and the slot
+#            simply produces no selection candidate that generation.
+
+CHT_ENABLED_SIM_TYPES = (
+    'CovarianceCHT', 'CHT_AL', 'ArnoldCHT', 'ArnoldCHT_AL',
+)
+AL_ENABLED_SIM_TYPES  = ('CHT_AL', 'ArnoldCHT_AL')
+CHOCAT_SIM_TYPES      = ('CovarianceCHT', 'CHT_AL')
+ARNOLD_SIM_TYPES      = ('ArnoldCHT', 'ArnoldCHT_AL')
+
+KNOWN_SIM_TYPES = (
+    'ParentValue', 'ElitistCrossover', 'RandomCrossover', 'Penalty',
+) + CHT_ENABLED_SIM_TYPES
+
+
+def is_cht_active(sim_type):
+    """True iff a CHT (Chocat or Arnold family) is engaged."""
+    return sim_type in CHT_ENABLED_SIM_TYPES
+
+
+def is_al_active(sim_type):
+    """True iff the Augmented Lagrangian is layered on top."""
+    return sim_type in AL_ENABLED_SIM_TYPES
+
+
+def cht_method(sim_type):
+    """Return 'chocat' | 'arnold' | None for the CHT family in use."""
+    if sim_type in ARNOLD_SIM_TYPES:
+        return 'arnold'
+    if sim_type in CHOCAT_SIM_TYPES:
+        return 'chocat'
+    return None
+
+
+def _eval_schedule(schedule, generation, default):
+    """Evaluate a feature schedule at the given generation.
+
+    Supports two forms:
+      3-element [start, end, n_gens]:
+          hold `start` until gen 0, interpolate linearly to `end` over
+          n_gens generations, then saturate at `end`.
+      4-element [start, end, start_gen, end_gen]:
+          hold `start` until start_gen, interpolate linearly from
+          start_gen to end_gen, then hold `end`.
+
+    Returns `default` when schedule is None.
+    """
+    if schedule is None:
+        return default
+    if len(schedule) == 3:
+        start, end, n_gens = schedule
+        progress = min(1.0, generation / max(1, n_gens))
+        return float(start * (1.0 - progress) + end * progress)
+    if len(schedule) == 4:
+        start, end, start_gen, end_gen = schedule
+        if generation < start_gen:
+            return float(start)
+        if generation >= end_gen:
+            return float(end)
+        progress = (generation - start_gen) / max(1, end_gen - start_gen)
+        return float(start * (1.0 - progress) + end * progress)
+    raise ValueError(f"Schedule must be 3 or 4 elements, got {len(schedule)}")
+
+
 class StrategyMultiObjective(object):
     """Multiobjective CMA-ES strategy.
 
@@ -80,10 +160,28 @@ class StrategyMultiObjective(object):
     """
 
     def __init__(self, population, sigma, **params):
-        self.sim_type     = params.get("sim_type", 1)
+        # Default sim_type 'ParentValue' is a known mode that bypasses
+        # both AL and any CHT covariance machinery.  Production runs
+        # always pass sim_type explicitly from the YAML; the default
+        # only matters for unit tests that construct the strategy with
+        # the minimum kwargs.  Previously this was the integer ``1`` —
+        # which silently fell through every guard tuple as "not in",
+        # producing legacy behaviour by accident.  Making it explicit
+        # avoids that fragility.
+        self.sim_type     = params.get("sim_type", 'ParentValue')
         self.p4_treatment = params.get("p4_treatment")
         self.bounds       = params.get("bounds")
         self.logbook      = params.get("logbook", None)   # injected — no global access
+
+        # Validate sim_type up-front.  An unknown string used to ripple
+        # through as a silent no-op (every guard returned False, every
+        # method defaulted to legacy behaviour) which made misconfig
+        # debugging painful.  Reject loudly here instead.
+        if self.sim_type not in KNOWN_SIM_TYPES:
+            raise ValueError(
+                f"Unknown sim_type {self.sim_type!r}. Must be one of "
+                f"{KNOWN_SIM_TYPES}."
+            )
 
         print(f'self.sim_type = {self.sim_type}')
         print(f'self.p4_treatment = {self.p4_treatment}')
@@ -142,12 +240,59 @@ class StrategyMultiObjective(object):
             else 0.5 / (self.dim + 2.0)
         )
 
+        # ─────────────────────────────────────────────────────────────────
+        # Arnold & Hansen 2012 parameters (Table 1 of the paper)
+        # ─────────────────────────────────────────────────────────────────
+        # Used only when sim_type is in ARNOLD_SIM_TYPES.  Per the paper:
+        #   β    = 0.1 / (n + 2)   (update-step magnitude in Eq. 7)
+        #   c_c  = 1 / (n + 2)     (low-pass filter constant for v_j, Eq. 6)
+        # Note: arnold_cc is DISTINCT from self.cc (the CMA-ES search-path
+        # cumulation constant, 2/(n+2)).  Reusing the name would be a
+        # footgun — the two coefficients control different things.
+        _arnold_beta = params.get("arnold_beta")
+        self.arnold_beta = (
+            _arnold_beta if _arnold_beta is not None
+            else 0.1 / (self.dim + 2.0)
+        )
+        _arnold_cc = params.get("arnold_cc")
+        self.arnold_cc = (
+            _arnold_cc if _arnold_cc is not None
+            else 1.0 / (self.dim + 2.0)
+        )
+
+        # Number of constraints, supplied by main.py from
+        # len(feasibility.evaluate_constraints(...)).  Required for the
+        # Arnold modes (one v_j vector per constraint per parent); for
+        # Chocat modes the value is informational only.
+        self.n_constraints = params.get("n_constraints")
+        if cht_method(self.sim_type) == 'arnold' and self.n_constraints is None:
+            raise ValueError(
+                "Arnold sim_type requires n_constraints to be passed "
+                "into StrategyMultiObjective(...). Compute it once via "
+                "len(evaluate_constraints(seed_x, bounds))."
+            )
+
         # Per-parent internal state
         self.sigmas      = [sigma] * len(population)
         self.A           = [np.identity(self.dim) for _ in range(len(population))]
         self.invCholesky = [np.identity(self.dim) for _ in range(len(population))]
         self.pc          = [np.zeros(self.dim)    for _ in range(len(population))]
         self.psucc       = [self.ptarg]            * len(population)
+
+        # Per-parent Arnold constraint vectors v_j,i.  Allocated only when
+        # the Arnold family is active; the empty list keeps the attribute
+        # always-present so plotting / drain code can rely on it.
+        if cht_method(self.sim_type) == 'arnold':
+            self.v = [
+                [np.zeros(self.dim) for _ in range(self.n_constraints)]
+                for _ in range(len(population))
+            ]
+        else:
+            self.v = []
+        # Diagnostic buffer for Arnold update events.  Drained per-gen by
+        # main.py into arnold_per_call.csv / arnold_per_gen.csv.  Always
+        # initialised so drain code is sim_type-agnostic.
+        self.arnold_diag_buffer = []
 
         self.indicator = params.get("indicator", tools.hypervolume)
         self.time_spent_fixing = 0
@@ -180,7 +325,7 @@ class StrategyMultiObjective(object):
         # set_dufosse2020() then overrides chi_domega = 2^(1/sqrt(n)) and
         # k1 = 10 per Section 4.2 of Dufossé & Hansen 2020.
         self.al_tol = float(params.get("al_tol", 100.0))
-        if self.sim_type == 'CHT_AL':
+        if is_al_active(self.sim_type):
             self.al = AugmentedLagrangian(self.dim, equality=False)
             self.al.set_algorithm(3)
             self.al.set_dufosse2020()
@@ -236,10 +381,82 @@ class StrategyMultiObjective(object):
         # let it contribute to its donor parent's psucc / σ update.
         # Decouples σ adaptation from CHT-induced "successes".
         self.psucc_exclude_resampled = bool(features.get("psucc_exclude_resampled", False))
+        # C3b (psucc_sentinel_as_failure): treat PITOT3/SPARK sentinel
+        # offspring in the not-chosen branch as honest failures rather
+        # than skipping the psucc update.  Default False keeps legacy
+        # Fix-S3 behaviour (sentinels silently skipped).
+        self.psucc_sentinel_as_failure = bool(
+            features.get("psucc_sentinel_as_failure", False)
+        )
+        # F1 (sigma_floor_silent): clamp σ ≥ this value once both AL and
+        # CHT have been silent for ≥ _gens_silent_threshold consecutive
+        # generations.  None ⇒ no floor.
+        self.sigma_floor_silent = features.get("sigma_floor_silent")
+        # F3 (selection): within-front ranking criterion.
+        # 'hv_contribution' (default) uses Voss 2009 HV-contribution.
+        # 'crowding' uses NSGA-II crowding distance (anti-knee bias).
+        self.selection_mode = features.get("selection", "hv_contribution")
+        if self.selection_mode not in ("hv_contribution", "crowding"):
+            raise ValueError(
+                f"features.selection must be 'hv_contribution' or "
+                f"'crowding', got {self.selection_mode!r}"
+            )
+        # Group G (restart strategies): M1 internal restart.
+        # None ⇒ feature off.
+        self.restart_on_sigma_collapse = features.get("restart_on_sigma_collapse")
+        if self.restart_on_sigma_collapse is not None:
+            cfg = self.restart_on_sigma_collapse
+            for required in ("sigma_threshold", "sustained_gens",
+                             "pop_increment", "max_restarts"):
+                if required not in cfg:
+                    raise ValueError(
+                        f"features.restart_on_sigma_collapse missing "
+                        f"required field {required!r}"
+                    )
+        self._sigma_collapse_streak = 0
+        self._restart_count = 0
+        self._restart_pending = False
+        self._last_restart_gen = None
+
+        # F1 silent-streak counter.
+        self._gens_silent_count = 0
+        self._gens_silent_threshold = 20
+
+        # D1: External non-dominated archive (crowding-pruned).
+        self.archive_cap = int(params.get("archive_cap", 100))
+        self.external_archive = []
 
         # Generation counter used by schedule-based features (A3, B3).
         # Incremented by update() once per generation.
         self._generation = 0
+
+        # ─────────────────────────────────────────────────────────────────
+        # Reject Chocat-only feature flags when an Arnold sim_type is in
+        # use.  Arnold's mechanism operates on the Cholesky factor A
+        # directly (Eq. 7) — none of the eigenvalue-shaping or
+        # resample-loop features that exist for Chocat make sense here.
+        # Silent no-op'ing would hide config bugs; raise loudly instead.
+        # ─────────────────────────────────────────────────────────────────
+        if cht_method(self.sim_type) == 'arnold':
+            _chocat_only = {
+                "cht_eigenvalue_floor":      self.cht_eigenvalue_floor,
+                "cht_isotropy_alpha":        self.cht_isotropy_alpha,
+                "cht_gamma_schedule":        self.cht_gamma_schedule,
+                "cht_kappa_trigger":         self.cht_kappa_trigger,
+                "cht_resample_tol":          self.cht_resample_tol,
+                "box_reflective_repair":     self.box_reflective_repair,
+                "psucc_exclude_resampled":   self.psucc_exclude_resampled,
+            }
+            offenders = [k for k, v in _chocat_only.items() if v]
+            if offenders:
+                raise ValueError(
+                    f"sim_type={self.sim_type!r} is incompatible with "
+                    f"the following Chocat-only feature flag(s): "
+                    f"{offenders}. Arnold operates on the Cholesky "
+                    f"factor directly (Eq. 7) and has no analogue for "
+                    f"these knobs. Remove them from features or pick a "
+                    f"Chocat sim_type (CovarianceCHT / CHT_AL)."
+                )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Augmented Lagrangian helpers (CHT_AL sim_type only)
@@ -299,11 +516,9 @@ class StrategyMultiObjective(object):
         Called from main.py once per generation to retag each offspring's
         ``ind.al_tol`` before evaluation.
         """
-        if self.al_tol_schedule is None:
-            return self.al_tol
-        start_t, end_t, n_gens = self.al_tol_schedule
-        progress = min(1.0, self._generation / max(1, n_gens))
-        return float(start_t * (1.0 - progress) + end_t * progress)
+        return _eval_schedule(
+            self.al_tol_schedule, self._generation, self.al_tol,
+        )
 
     def update_al(self, F_proxy_scalar, g_al_proxy):
         """Per-generation update of γ and μ from the parent-centroid proxy.
@@ -420,15 +635,14 @@ class StrategyMultiObjective(object):
                                 new_individual[k] = 4.0 - new_individual[k]
                             reflections += 1
 
-                # CovarianceCHT (and CHT_AL, which layers AL on top of CHT)
-                # replace the repair while-loop: infeasible offspring pass
-                # through and feed the CHT covariance update (Phase 3).
-                # Without this guard, CHT_AL would enter the loop, call
-                # crossover() — which has no CHT_AL branch — get the
-                # individual back unchanged, and spin forever.
-                # Penalty mode also bypasses repair (its handler is in
-                # evaluate.py).
-                if self.sim_type not in ('Penalty', 'CovarianceCHT', 'CHT_AL'):
+                # Any CHT-active sim_type (Chocat or Arnold family) and
+                # the Penalty mode bypass the in-generate() repair loop.
+                # Chocat consumes infeasibles via covariance shrinkage in
+                # update() / resample_infeasibles(); Arnold consumes them
+                # via Eq. 6 + Eq. 7 in apply_arnold_infeasibility().
+                # crossover() has no branch for either, so without this
+                # guard the while-loop would spin forever.
+                if self.sim_type != 'Penalty' and not is_cht_active(self.sim_type):
                     s = time.time()
                     while True:
                         if not self.check_feasibility(new_individual)[0]:
@@ -457,6 +671,12 @@ class StrategyMultiObjective(object):
                 individuals[-1]._ps = "o", i
                 individuals[-1]._repaired = repaired
                 individuals[-1]._lineage_id = self._next_lineage_id
+                # ind._Az is the raw Gaussian step (σ_i · A_i · z_i) that
+                # produced this offspring.  Consumed by the Arnold
+                # constraint-vector update (Eq. 6) and by the v_j
+                # diagnostics.  Stored for ALL sim_types: cheap (one
+                # length-n array) and keeps consumers sim_type-agnostic.
+                individuals[-1]._Az = np.array(mutation, copy=True)
                 self._next_lineage_id += 1
 
         else:
@@ -465,21 +685,21 @@ class StrategyMultiObjective(object):
             for i in range(self.lambda_):
                 j = np.random.randint(0, len(ndom))
                 _, p_idx = ndom[j]._ps
+                _mutation = self.sigmas[p_idx] * np.dot(self.A[p_idx], arz[i])
                 individuals.append(
-                    ind_init(
-                        self.parents[p_idx]
-                        + self.sigmas[p_idx] * np.dot(self.A[p_idx], arz[i])
-                    )
+                    ind_init(self.parents[p_idx] + _mutation)
                 )
                 individuals[-1]._ps = "o", p_idx
                 individuals[-1]._repaired = False
                 individuals[-1]._lineage_id = self._next_lineage_id
+                individuals[-1]._Az = np.array(_mutation, copy=True)
                 self._next_lineage_id += 1
 
         return individuals
 
     def update(self, population):
         """Update covariance matrices and step sizes from the evaluated population."""
+        archive_candidates_snapshot = list(population) + list(self.parents)
         chosen, not_chosen = self._select(population + self.parents)
 
         cp, cc, ccov = self.cp, self.cc, self.ccov
@@ -547,7 +767,11 @@ class StrategyMultiObjective(object):
                 # on the constraint-aware geometry.  Matches Chocat
                 # Algorithm 3 step-3-2 -> step-3-4 ordering.  Only fires
                 # when the sim_type opts in AND there are infeasibles.
-                if self.sim_type in ('CovarianceCHT', 'CHT_AL') and infeasible_pool:
+                # Arnold modes do all their CHT work in
+                # apply_arnold_infeasibility() before evaluation; there
+                # is no post-eval residual to consume, so we exclude
+                # them from this branch.
+                if cht_method(self.sim_type) == 'chocat' and infeasible_pool:
                     # The C being updated belongs to chosen[i] — the new
                     # occupant of slot i.  Record by *its* lineage so the
                     # diagnostic trace tracks the right individual.
@@ -571,8 +795,9 @@ class StrategyMultiObjective(object):
                 # toward a less-anisotropic shape — even if there are
                 # no current infeasibles to feed the regular CHT.
                 # Acts as an escape valve for anisotropy lock-in.
+                # Chocat-only feature: Arnold rejects it at __init__.
                 if (self.cht_kappa_trigger is not None
-                        and self.sim_type in ('CovarianceCHT', 'CHT_AL')):
+                        and cht_method(self.sim_type) == 'chocat'):
                     A[i], invCholesky[i] = self._chtIsotropyCorrection(
                         A[i], invCholesky[i],
                     )
@@ -597,6 +822,13 @@ class StrategyMultiObjective(object):
         for ind in not_chosen:
             t, p_idx = ind._ps
             if t == "o":
+                # Fix-S3 (failure branch): by default skip psucc update for
+                # sentinel offspring so numerical-failure regions don't
+                # collapse σ.  psucc_sentinel_as_failure inverts this.
+                if (getattr(ind, "_pitot3_sentinel", False)
+                        or getattr(ind, "_spark_sentinel", False)):
+                    if not self.psucc_sentinel_as_failure:
+                        continue
                 # Feature C3 also applies to the failure side: a
                 # resampled-then-dominated offspring shouldn't shrink
                 # the donor's σ either.  CHT covariance has already
@@ -621,6 +853,116 @@ class StrategyMultiObjective(object):
         # read this to interpolate their parameters over time.  Counted
         # here rather than in main.py so the strategy is self-contained.
         self._generation += 1
+
+        # ── F1: σ floor in silent regime ─────────────────────────────
+        al_silent  = (self.al is None
+                      or self.al.lam is None
+                      or all(float(l) == 0.0 for l in self.al.lam))
+        cht_silent = (len([
+            ind for ind in population
+            if ind._ps[0] == "o"
+            and hasattr(ind, "_g")
+            and np.any(np.asarray(ind._g) > 0)
+        ]) == 0)
+        if al_silent and cht_silent:
+            self._gens_silent_count += 1
+        else:
+            self._gens_silent_count = 0
+
+        if (self.sigma_floor_silent is not None
+                and self._gens_silent_count >= self._gens_silent_threshold):
+            floor = float(self.sigma_floor_silent)
+            for k in range(len(self.sigmas)):
+                if self.sigmas[k] < floor:
+                    self.sigmas[k] = floor
+
+        # ── Group G: σ-collapse restart trigger (M1) ─────────────────
+        if self.restart_on_sigma_collapse is not None:
+            cfg = self.restart_on_sigma_collapse
+            thresh       = float(cfg["sigma_threshold"])
+            sustained    = int(cfg["sustained_gens"])
+            max_restarts = int(cfg["max_restarts"])
+            if max(self.sigmas) < thresh:
+                self._sigma_collapse_streak += 1
+            else:
+                self._sigma_collapse_streak = 0
+            if (self._sigma_collapse_streak >= sustained
+                    and self._restart_count < max_restarts):
+                self._restart_pending = True
+
+        # ── D1: External archive refresh ──────────────────────────────
+        self._update_archive(archive_candidates_snapshot)
+
+    def consume_restart_pending(self):
+        """Return True and clear the flag iff a restart is pending.
+
+        main.py polls this once per generation after toolbox.update().
+        """
+        pending = self._restart_pending
+        self._restart_pending = False
+        return pending
+
+    def apply_internal_restart(self, fresh_individuals, step_size_initial):
+        """Perform the M1 (IPOP-style) restart.
+
+        Resets all per-parent CMA state (σ, p_c, p_succ, A, invCholesky)
+        to fresh defaults.  Parent design vectors are kept.  Appends
+        fresh_individuals (already evaluated and feasible) to extend the
+        parent set by pop_increment.  Updates mu / lambda_ accordingly.
+
+        Caller (main.py) is responsible for generating and evaluating the
+        fresh individuals before passing them here.
+        """
+        sigma0 = float(step_size_initial)
+        n = len(fresh_individuals)
+
+        # Reset existing parents' CMA state
+        for k in range(len(self.parents)):
+            self.sigmas[k]      = sigma0
+            self.psucc[k]       = self.ptarg
+            self.pc[k]          = np.zeros(self.dim)
+            self.A[k]           = np.identity(self.dim)
+            self.invCholesky[k] = np.identity(self.dim)
+
+        # Arnold: clear every existing parent's v_j accumulators so the
+        # restart is a clean re-learn of the constraint boundary.
+        # Carrying v over from a collapsed σ regime would bias the new
+        # search distribution before it has had any new violation
+        # signal to work with.
+        if cht_method(self.sim_type) == 'arnold':
+            for k in range(len(self.parents)):
+                for j in range(self.n_constraints):
+                    self.v[k][j] = np.zeros(self.dim)
+
+        # Assign lineage IDs to fresh individuals
+        for ind in fresh_individuals:
+            ind._lineage_id = self._next_lineage_id
+            self._next_lineage_id += 1
+
+        # Extend parent set and per-parent state arrays
+        self.parents     += list(fresh_individuals)
+        self.sigmas      += [sigma0]               * n
+        self.psucc       += [self.ptarg]            * n
+        self.pc          += [np.zeros(self.dim)    for _ in range(n)]
+        self.A           += [np.identity(self.dim) for _ in range(n)]
+        self.invCholesky += [np.identity(self.dim) for _ in range(n)]
+
+        # Arnold: extend v with fresh zero accumulators for the new
+        # parents.  No carry-over (per user direction for M2 too).
+        if cht_method(self.sim_type) == 'arnold':
+            for _ in range(n):
+                self.v.append(
+                    [np.zeros(self.dim) for _ in range(self.n_constraints)]
+                )
+
+        # Update mu / lambda
+        self.mu      = len(self.parents)
+        self.lambda_ = self.mu
+
+        # Bookkeeping
+        self._restart_count          += 1
+        self._last_restart_gen        = self._generation
+        self._sigma_collapse_streak   = 0
 
     # ─────────────────────────────────────────────────────────────────────────
     # CHT resample loop (Chocat 2015 Algorithm 3 step 3-2)
@@ -744,6 +1086,177 @@ class StrategyMultiObjective(object):
         return max_iterations
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Arnold & Hansen 2012 CHT — one-shot infeasibility consumer
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def apply_arnold_infeasibility(self, population, feasibility_check):
+        """Consume infeasible offspring via Eq. 6 + Eq. 7 (no resampling).
+
+        Faithful to the (1+1) lifecycle of Arnold & Hansen 2012 mapped
+        onto the (μ+λ) batched setting: each parent gets exactly one
+        sample per generation.  When that sample is infeasible:
+
+          1. For each violated constraint j, update v_{j,i} (Eq. 6).
+          2. Apply the multi-rank subtractive update to A_i (Eq. 7),
+             with a Cholesky-PSD guard.
+          3. Mark the offspring infeasible so it bypasses both SPARK
+             evaluation and the selection pool.  No resampling — the
+             slot simply contributes no candidate this generation.
+             Per the paper (Fig. 3 step 3): "The iteration is complete."
+
+        After this method returns, ``ind._g`` and ``ind._feasible`` are
+        set for every individual, mirroring the post-condition of
+        ``resample_infeasibles`` so downstream code is sim_type-agnostic.
+
+        Parameters
+        ----------
+        population : list of Individual
+            Output of generate().  Each individual must carry ind._Az
+            (the σ·A·z step used to construct it) — generate() tags this.
+        feasibility_check : callable(ind) -> (feasible_bool, g_vector)
+            Same contract as for resample_infeasibles: a CHEAP check
+            that does not call SPARK / PITOT3.
+        """
+        for ind in population:
+            feasible, g = feasibility_check(ind)
+            ind._g = g
+            ind._feasible = feasible
+            if feasible:
+                continue
+            # Only offspring (not parents looped in for selection) carry
+            # _Az and _ps.  Parents survive untouched by definition.
+            if not hasattr(ind, "_Az") or not hasattr(ind, "_ps"):
+                continue
+            p_idx = ind._ps[1]
+            active_js = self._arnold_update_v(p_idx, ind._Az, g)
+            if not active_js:
+                # No finite, positive g_j — can happen if every violation
+                # is a +inf cascade from a box bound.  Skip Eq. 7 since
+                # there is no direction to shrink.  Still record a diag
+                # entry so the generation totals stay honest.
+                self._record_arnold_diag(
+                    parent_idx=p_idx, active_js=[], m_active=0,
+                    A_delta_fro=0.0, v_norms=[], shrink_applied=False,
+                    psd_fallback=False,
+                    lineage_id=getattr(ind, "_lineage_id", None),
+                )
+                continue
+            self.A[p_idx], self.invCholesky[p_idx] = self._arnold_update_A(
+                self.A[p_idx], self.invCholesky[p_idx],
+                p_idx, active_js,
+                lineage_id=getattr(ind, "_lineage_id", None),
+            )
+
+    def _arnold_update_v(self, parent_idx, Az, g):
+        """Eq. 6: low-pass filter of violation steps into v_{j,i}.
+
+        For each constraint j with ``g[j]`` finite and strictly positive,
+        update v_{j,i} ← (1 − c_c) v_{j,i} + c_c · Az.  Returns the list
+        of active constraint indices, for use by the subsequent Eq. 7
+        update.
+
+        ``+inf`` entries in g are skipped.  These are produced by
+        ``feasibility.evaluate_constraints`` when box bounds are
+        violated: the physical-space slots cannot be reliably evaluated
+        because the un-transformation has driver_p-coupled divisions
+        that aren't well-defined outside the box.  The box violation
+        itself still carries the directional signal (via its own
+        finite-positive g entry), so dropping the +inf cascade is
+        consistent with the existing Chocat handling.
+        """
+        cc = self.arnold_cc
+        active_js = []
+        Az = np.asarray(Az, dtype=float)
+        for j in range(len(g)):
+            gj = g[j]
+            if np.isfinite(gj) and gj > 0.0:
+                v_j = self.v[parent_idx][j]
+                self.v[parent_idx][j] = (1.0 - cc) * v_j + cc * Az
+                active_js.append(j)
+        return active_js
+
+    def _arnold_update_A(self, A, invCholesky, parent_idx, active_js,
+                          lineage_id=None):
+        """Eq. 7: multi-rank subtractive update of the Cholesky factor.
+
+        A ← A − (β / m_active) Σ_j (v_j w_j^T) / (w_j^T w_j),
+        with w_j = A^{-1} v_j.
+
+        PSD guard: re-Cholesky from C_new = A_new A_new^T.  If the
+        decomposition fails (the subtractive form is unbounded; rare
+        but possible for nearly-collinear v_j configurations), roll
+        back to (A, invCholesky) and flag the diag record.
+        """
+        n = self.dim
+        beta = self.arnold_beta
+        m_active = len(active_js)
+        if m_active == 0:
+            return A, invCholesky
+
+        delta = np.zeros((n, n))
+        v_norms = []
+        for j in active_js:
+            v_j = self.v[parent_idx][j]
+            v_norms.append(float(np.linalg.norm(v_j)))
+            w_j = invCholesky @ v_j
+            denom = float(w_j @ w_j)
+            if denom < 1e-30:
+                # v_j collapsed to (near-)zero or A·invCholesky drift —
+                # skip this constraint's contribution this iteration.
+                continue
+            delta += np.outer(v_j, w_j) / denom
+
+        A_new = A - (beta / m_active) * delta
+        A_delta_fro = float(np.linalg.norm(A_new - A, ord='fro'))
+
+        # PSD check via re-Cholesky on the implied C.  Numerically
+        # equivalent to "is A_new a valid Cholesky factor of a PSD
+        # matrix?" — the symmetrisation guards against round-off.
+        C_new = A_new @ A_new.T
+        C_new = 0.5 * (C_new + C_new.T)
+        try:
+            A_new = np.linalg.cholesky(C_new)
+        except np.linalg.LinAlgError:
+            self._record_arnold_diag(
+                parent_idx=parent_idx, active_js=active_js,
+                m_active=m_active, A_delta_fro=A_delta_fro,
+                v_norms=v_norms, shrink_applied=False,
+                psd_fallback=True, lineage_id=lineage_id,
+            )
+            return A, invCholesky
+
+        invCholesky_new = scipy.linalg.solve_triangular(
+            A_new, np.eye(n), lower=True,
+        )
+        self._record_arnold_diag(
+            parent_idx=parent_idx, active_js=active_js,
+            m_active=m_active, A_delta_fro=A_delta_fro,
+            v_norms=v_norms, shrink_applied=True,
+            psd_fallback=False, lineage_id=lineage_id,
+        )
+        return A_new, invCholesky_new
+
+    def _record_arnold_diag(self, parent_idx, active_js, m_active,
+                             A_delta_fro, v_norms, shrink_applied,
+                             psd_fallback, lineage_id=None):
+        """Append one Arnold diagnostic record.
+
+        Mirrors ``_record_cht_diag`` structure so downstream drain /
+        plot code can be written once with method-tagged columns.
+        """
+        rec = {
+            "parent_idx":     int(parent_idx),
+            "lineage_id":     int(lineage_id) if lineage_id is not None else None,
+            "active_js":      list(active_js),
+            "m_active":       int(m_active),
+            "A_delta_fro":    float(A_delta_fro),
+            "v_norms":        [float(x) for x in v_norms],
+            "shrink_applied": bool(shrink_applied),
+            "psd_fallback":   bool(psd_fallback),
+        }
+        self.arnold_diag_buffer.append(rec)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # X2-specific feasibility repair (p4 pressure constraint)
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -832,12 +1345,25 @@ class StrategyMultiObjective(object):
         """
         # ── AL augmentation: enter ───────────────────────────────────────
         # Build a snapshot of (id(ind) -> original fitness.values) so we
-        # can restore even if downstream code throws.  We only augment in
-        # CHT_AL mode AND only after AL has been initialised (the very
-        # first generation runs raw, since lam=0 and mu=0 make AL == 0
-        # anyway and the bootstrapping happens after gen 0 selection).
+        # can restore even if downstream code throws.  We augment in
+        # AL-active modes (CHT_AL / ArnoldCHT_AL) as soon as the strategy
+        # has an AL object — the per-individual gating happens inside
+        # ``_al_penalty`` (returns 0.0 when ``self.al.lam is None``), and
+        # the ``pen == 0.0`` short-circuit below handles both the genuine
+        # zero-penalty case and any ind whose ``_g_al`` is missing.
+        #
+        # The previous gate of ``self.al.is_initialized`` was wrong:
+        # pycma's ``is_initialized`` requires an empirical sign-balance
+        # condition on recent ``al(g)`` calls and can stay False for
+        # several generations after ``init_al`` has populated lam/mu.
+        # During that window pycma was returning real, non-zero
+        # penalties, but this gate threw them away — so PITOT3 sentinels
+        # (g_al ≈ +4900) competed in selection on RAW fitness alone and
+        # could survive when their underlying (hold_time, impact_speed)
+        # pair happened to look attractive.  Aligning with
+        # ``_al_penalty``'s lam-based gate closes that loophole.
         original_fitness = {}
-        if self.sim_type == 'CHT_AL' and self.al is not None and self.al.is_initialized:
+        if is_al_active(self.sim_type) and self.al is not None:
             for ind in candidates:
                 if not ind.fitness.valid:
                     continue
@@ -870,13 +1396,28 @@ class StrategyMultiObjective(object):
         DEAP's ``tools.sortLogNondominated`` requires every individual to
         have a valid fitness — including infeasibles would crash the sort.
 
-        Filtered infeasibles are appended directly to ``not_chosen`` so they
-        still surface to ``update()`` via the population it received, and
-        their ``_g`` vectors feed the CHT covariance update.
+        Disposition of filtered infeasibles depends on the CHT family:
+
+        * Chocat (CovarianceCHT / CHT_AL): infeasibles are appended to
+          ``not_chosen`` so they surface to ``update()`` — their ``_g``
+          vectors feed the post-eval CHT call and the σ-down failure
+          branch.
+        * Arnold (ArnoldCHT / ArnoldCHT_AL): infeasibles are dropped
+          entirely.  All Arnold CHT work happened in
+          ``apply_arnold_infeasibility()`` before evaluation, and the
+          paper specifies that infeasibles contribute nothing to σ in
+          either direction.  Surfacing them to ``update()`` would
+          drive σ down via the not_chosen branch — wrong.
         """
         # Partition: feasibles drive selection; infeasibles bypass it.
         feasible    = [ind for ind in candidates if getattr(ind, "_feasible", True)]
         infeasibles = [ind for ind in candidates if not getattr(ind, "_feasible", True)]
+
+        # Arnold: infeasibles must not influence σ in either direction.
+        # Drop them from the returned tuple so update()'s loops never
+        # see them.
+        if cht_method(self.sim_type) == 'arnold':
+            infeasibles = []
 
         if len(feasible) <= self.mu:
             return feasible, infeasibles
@@ -900,16 +1441,173 @@ class StrategyMultiObjective(object):
         k = self.mu - len(chosen)
 
         if k > 0:
-            ref = np.array([ind.fitness.wvalues for ind in feasible]) * -1
-            ref = np.max(ref, axis=0) + 1
+            if self.selection_mode == "crowding":
+                # F3 (NSGA-II): keep the k highest-crowding-distance
+                # members.  Boundary points carry inf crowding so front
+                # extremes are protected — removes the knee-attractive bias.
+                crowding = self._crowding_distance(mid_front)
+                order = sorted(range(len(mid_front)),
+                               key=lambda i: -crowding[i])
+                chosen     += [mid_front[i] for i in order[:k]]
+                not_chosen += [mid_front[i] for i in order[k:]]
+            else:
+                ref = np.array([ind.fitness.wvalues for ind in feasible]) * -1
+                ref = np.max(ref, axis=0) + 1
 
-            for _ in range(len(mid_front) - k):
-                idx = self.indicator(mid_front, ref=ref)
-                not_chosen.append(mid_front.pop(idx))
+                for _ in range(len(mid_front) - k):
+                    idx = self.indicator(mid_front, ref=ref)
+                    not_chosen.append(mid_front.pop(idx))
 
-            chosen += mid_front
+                chosen += mid_front
 
         return chosen, not_chosen
+
+    @staticmethod
+    def _crowding_distance(front):
+        """NSGA-II crowding distance on a list of DEAP individuals."""
+        n = len(front)
+        if n == 0:
+            return []
+        if n <= 2:
+            return [float("inf")] * n
+        n_obj = len(front[0].fitness.values)
+        crowding = [0.0] * n
+        for m in range(n_obj):
+            order = sorted(range(n), key=lambda i: front[i].fitness.values[m])
+            crowding[order[0]]  = float("inf")
+            crowding[order[-1]] = float("inf")
+            f_min = front[order[0]].fitness.values[m]
+            f_max = front[order[-1]].fitness.values[m]
+            denom = f_max - f_min
+            if denom == 0.0:
+                continue
+            for k in range(1, n - 1):
+                if crowding[order[k]] == float("inf"):
+                    continue
+                crowding[order[k]] += (
+                    (front[order[k + 1]].fitness.values[m]
+                     - front[order[k - 1]].fitness.values[m]) / denom
+                )
+        return crowding
+
+    def _update_archive(self, candidates):
+        """Refresh the external non-dominated archive (D1)."""
+        new_entries = []
+        for ind in candidates:
+            if not getattr(ind, "_feasible", True):
+                continue
+            if not ind.fitness.valid:
+                continue
+            if (getattr(ind, "_pitot3_sentinel", False)
+                    or getattr(ind, "_spark_sentinel", False)):
+                continue
+            g_al = getattr(ind, "_g_al", None)
+            new_entries.append({
+                "gen_found":  self._generation,
+                "design":     [float(x) for x in ind],
+                "fitness":    tuple(float(v) for v in ind.fitness.values),
+                "g_al":       ([float(x) for x in g_al]
+                               if g_al is not None else None),
+                "lineage_id": getattr(ind, "_lineage_id", None),
+            })
+        if not new_entries:
+            return
+
+        seen = {(m["fitness"][0], m["fitness"][1])
+                for m in self.external_archive}
+        deduped_new = []
+        for m in new_entries:
+            key = (m["fitness"][0], m["fitness"][1])
+            if key not in seen:
+                seen.add(key)
+                deduped_new.append(m)
+
+        pool = list(self.external_archive) + deduped_new
+        nd = self._archive_nondominated(pool)
+        if len(nd) > self.archive_cap:
+            nd = self._archive_prune_by_crowding(nd, self.archive_cap)
+        self.external_archive = nd
+
+    @staticmethod
+    def _archive_nondominated(pool):
+        """Non-dominated subset of a list of archive-entry dicts."""
+        n = len(pool)
+        keep = [True] * n
+        fits = [p["fitness"] for p in pool]
+        for i in range(n):
+            if not keep[i]:
+                continue
+            for j in range(n):
+                if i == j or not keep[j]:
+                    continue
+                if (all(fits[j][k] <= fits[i][k] for k in range(len(fits[i])))
+                        and any(fits[j][k] < fits[i][k] for k in range(len(fits[i])))):
+                    keep[i] = False
+                    break
+        return [pool[i] for i in range(n) if keep[i]]
+
+    @staticmethod
+    def _archive_prune_by_crowding(pool, target_size):
+        """Reduce pool to target_size by dropping lowest-crowding member."""
+        pool = list(pool)
+        while len(pool) > target_size:
+            fits = [p["fitness"] for p in pool]
+            n = len(fits)
+            n_obj = len(fits[0])
+            crowding = [0.0] * n
+            for m in range(n_obj):
+                order = sorted(range(n), key=lambda i: fits[i][m])
+                crowding[order[0]]  = float("inf")
+                crowding[order[-1]] = float("inf")
+                f_min, f_max = fits[order[0]][m], fits[order[-1]][m]
+                denom = f_max - f_min
+                if denom == 0.0:
+                    continue
+                for k in range(1, n - 1):
+                    if crowding[order[k]] == float("inf"):
+                        continue
+                    crowding[order[k]] += (
+                        (fits[order[k + 1]][m] - fits[order[k - 1]][m]) / denom
+                    )
+            drop = min(range(n), key=lambda i: crowding[i])
+            pool = pool[:drop] + pool[drop + 1:]
+        return pool
+
+    def flush_archive_to_csv(self, out_dir):
+        """Write external_archive to {out_dir}/archive.csv."""
+        import csv as _csv
+        from pathlib import Path as _Path
+        out_dir = _Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if not self.external_archive:
+            with (out_dir / "archive.csv").open("w", newline="") as f:
+                f.write("gen_found,lineage_id,f_0,f_1\n")
+            return
+        n_obj    = len(self.external_archive[0]["fitness"])
+        n_design = len(self.external_archive[0]["design"])
+        g_sample = next((m["g_al"] for m in self.external_archive
+                         if m["g_al"] is not None), None)
+        n_gal    = len(g_sample) if g_sample else 0
+        fieldnames = (
+            ["gen_found", "lineage_id"]
+            + [f"f_{k}" for k in range(n_obj)]
+            + [f"design_{k}" for k in range(n_design)]
+            + [f"g_al_{k}" for k in range(n_gal)]
+        )
+        with (out_dir / "archive.csv").open("w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for m in self.external_archive:
+                row = {"gen_found": m["gen_found"],
+                       "lineage_id": m["lineage_id"]}
+                for k in range(n_obj):
+                    row[f"f_{k}"] = m["fitness"][k]
+                for k in range(n_design):
+                    row[f"design_{k}"] = m["design"][k]
+                g = m["g_al"] if m["g_al"] is not None else []
+                for k in range(n_gal):
+                    row[f"g_al_{k}"] = g[k] if k < len(g) else None
+                w.writerow(row)
 
     def _rankMuSuccUpdate(self, A, invCholesky, parent_idx, parents_snapshot,
                           sigmas_snapshot, successful_steps):

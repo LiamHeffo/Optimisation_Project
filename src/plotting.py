@@ -279,3 +279,88 @@ def plot_objective_space_heatmap(fitness_history, **kwargs):
     filename = f"pareto_heatmap_gen_{gen:04d}.png"
     plt.savefig(_resolve_path(filename, out_dir))
     plt.close()
+
+
+def plot_archive_holdtime_impactspeed_2d(archive_fitness, **kwargs):
+    """Scatter the non-dominated external archive in (hold_time, impact_speed) space.
+
+    Distinct from plot_holdtime_impactspeed_2d: input is already the
+    non-dominated set; shows only archive points with a connecting front
+    line, no full-history cloud underneath.
+    """
+    gen        = kwargs.get('gen',         0)
+    normalised = kwargs.get('normalised',  True)
+    out_dir    = kwargs.get('out_dir',     None)
+
+    plt.figure(dpi=200)
+    plt.title("External Archive — Non-Dominated Front (CHT_AL)")
+    plt.xlabel("Normalised Hold Time")
+    plt.ylabel("Normalised Impact Speed")
+
+    if normalised:
+        plt.xlim((0, 1.1))
+        plt.ylim((0, 1.1))
+
+    if archive_fitness:
+        ordered = sorted(archive_fitness, key=lambda f: f[0])
+        ht   = [f[0] for f in ordered]
+        ispd = [f[1] for f in ordered]
+        plt.plot(ht, ispd, color='gray', linestyle='--', linewidth=0.7,
+                 alpha=0.5, zorder=1)
+        plt.scatter(ht, ispd,
+                    facecolors='none', edgecolors='darkgreen',
+                    label=f'archive ND front (n={len(ordered)})',
+                    zorder=2)
+        plt.legend(loc='best', fontsize=8)
+    else:
+        plt.text(0.5, 0.5, "archive empty",
+                 transform=plt.gca().transAxes,
+                 ha='center', va='center', color='gray')
+
+    filename = f"archive_pareto_gen_{gen:04d}.png"
+    plt.savefig(_resolve_path(filename, out_dir))
+    plt.close()
+
+
+def plot_current_parent_population_2d(parent_fitness, **kwargs):
+    """Scatter the *current* selected parent set in (hold_time, impact_speed) space.
+
+    Distinct from plot_holdtime_impactspeed_2d in two ways:
+      * Input is the surviving parent fitnesses (one tuple per parent
+        in self.parents), NOT the full sampled-history cloud.
+      * No background trace and no last-MU highlight — every point on
+        the plot is a current survivor.
+
+    Used by _save_outputs to give a clean "where is the search now?"
+    view independent of the trajectory cloud, rendered every
+    SAVE_INTERVAL generations.  AL-active sim_types only (2-D fitness).
+    """
+    gen        = kwargs.get('gen',         0)
+    normalised = kwargs.get('normalised',  True)
+    out_dir    = kwargs.get('out_dir',     None)
+
+    plt.figure(dpi=200)
+    plt.title(f"Current Parent Population — gen {gen} (CHT_AL)")
+    plt.xlabel("Normalised Hold Time")
+    plt.ylabel("Normalised Impact Speed")
+
+    if normalised:
+        plt.xlim((0, 1.1))
+        plt.ylim((0, 1.1))
+
+    if parent_fitness:
+        ht   = [f[0] for f in parent_fitness]
+        ispd = [f[1] for f in parent_fitness]
+        plt.scatter(ht, ispd,
+                    facecolors='none', edgecolors='purple',
+                    label=f'parents (n={len(parent_fitness)})',
+                    zorder=2)
+        plt.legend(loc='best', fontsize=8)
+    else:
+        plt.text(0.5, 0.5, "no parents",
+                 transform=plt.gca().transAxes,
+                 ha='center', va='center', color='gray')
+
+    filename = f"current_parents_gen_{gen:04d}.png"
+    plt.savefig(_resolve_path(filename, out_dir))
+    plt.close()

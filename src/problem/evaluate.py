@@ -52,7 +52,13 @@ from problem.transforms import variable_untransformation, normalise_fitness
 # _PITOT3_FAILURE_SENTINEL is treated as a failed evaluation (not a real
 # constraint reading); in CHT_AL mode the individual is _feasible=False
 # and excluded from AL coefficient adaptation.
-_PITOT3_FAILURE_SENTINEL = 3500
+#
+# Set well outside the natural delta_vs1 = |vs - 4900| range (which
+# caps around ~4900 m/s for vs near 0) so the sentinel is unmistakably
+# distinct from any real shock-speed output.  Earlier value of 3500
+# was too close to plausible real delta_vs1 values and risked
+# misclassifying poor-but-real designs as sentinels.
+_PITOT3_FAILURE_SENTINEL = 5000
 from problem.feasibility import evaluate_constraints, is_feasible
 from utils import valid
 from algorithm.penalty import ClosestValidPenalty
@@ -88,7 +94,7 @@ def constraint_function(x1, bounds):
     Returns
     -------
     float
-        |vs - vs1| in m/s, or 3500 (penalty) on failure.
+        |vs - vs1| in m/s, or ``_PITOT3_FAILURE_SENTINEL`` on failure.
     """
     ind_number = x1.ind_number
     test_name = f"DEAP_tests_{ind_number}"
@@ -115,24 +121,24 @@ def constraint_function(x1, bounds):
     if driver_dict['driver_p'] > driver_dict['reservoir_p']:
         print("bad guess")
         os.chdir(starting_working_directory)
-        return 3500
+        return _PITOT3_FAILURE_SENTINEL
 
     if 0.085 < driver_dict['D_throat'] < 0:
         print("bad guess")
         os.chdir(starting_working_directory)
-        return 3500
+        return _PITOT3_FAILURE_SENTINEL
 
     pressure_ratio = driver_dict["p4"] / driver_dict["driver_p"]
     compression_ratio = pressure_ratio ** (1 / 1.667)
     if not (5 < compression_ratio < 70):
         print("bad guess")
         os.chdir(starting_working_directory)
-        return 3500
+        return _PITOT3_FAILURE_SENTINEL
 
     if driver_dict['p4'] > bounds[2][1]:
         print("bad guess")
         os.chdir(starting_working_directory)
-        return 3500
+        return _PITOT3_FAILURE_SENTINEL
 
     # ── Build PITOT3 configuration ────────────────────────────────────────
     config_data = base_config_dict()
@@ -221,7 +227,7 @@ def constraint_function(x1, bounds):
         print(f"{e}")
         print(f"x = {x}")
         os.chdir(starting_working_directory)
-        return 3500
+        return _PITOT3_FAILURE_SENTINEL
 
     os.chdir(starting_working_directory)
     return np.abs(shock_tube.vs - 4900)
@@ -407,7 +413,13 @@ def evaluate(x):
             fit = ClosestValidPenalty.wrapper(x)
         return fit, g, None
 
-    if x.sim_type == "CHT_AL":
+    # Any AL-active sim_type (CHT_AL or ArnoldCHT_AL) goes down the
+    # 2-objective + AL-constraint path.  Import is local to avoid a
+    # cycle: cmaes.py imports nothing from problem.evaluate, but the
+    # converse path runs at module-init time and would deadlock if
+    # done at module top.
+    from algorithm.cmaes import is_al_active as _is_al_active
+    if _is_al_active(x.sim_type):
         # AL path: delta_vs1 becomes a constraint; objectives are 2-D.
         # Box+phys infeasible => no PITOT3 / SPARK, no AL data.
         if not is_feasible(g):
@@ -415,10 +427,11 @@ def evaluate(x):
 
         # Heavy-evaluator failures are encoded via the existing sentinel
         # returns rather than rejected as infeasible:
-        #   - PITOT3 failure  ⇒ delta_vs1 = 3500 m/s
-        #                       ⇒ g_al = 3500 - al_tol ≈ +3400  (a large
-        #                         positive, which the AL will penalise as
-        #                         a major constraint violation)
+        #   - PITOT3 failure  ⇒ delta_vs1 = _PITOT3_FAILURE_SENTINEL m/s
+        #                       ⇒ g_al ≈ sentinel - al_tol  (a large
+        #                         positive — e.g. 4900 at al_tol=100;
+        #                         the AL penalises this as a major
+        #                         constraint violation)
         #   - SPARK  failure  ⇒ (hold_time, impact_speed) = (0, 350)
         #                       ⇒ fit_2d normalises to (1, 1)  (worst
         #                         possible values on both axes; Pareto-

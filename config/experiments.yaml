@@ -30,6 +30,30 @@
 #                                          incompatible with the legacy plot
 #                                          and CSV layouts (writes its own
 #                                          al_diagnostics directory).
+#                    'ArnoldCHT'        – Arnold & Hansen 2012 covariance update.
+#                                          Per-parent constraint vectors v_{j,i}
+#                                          are accumulated from the σ·A·z steps
+#                                          of infeasible offspring (Eq. 6) and
+#                                          drive a multi-rank subtractive update
+#                                          of A_i (Eq. 7) at the moment of
+#                                          infeasibility.  No resample loop —
+#                                          per the paper, the infeasible
+#                                          iteration is complete and the slot
+#                                          contributes NO selection candidate
+#                                          that generation.  Uses only the
+#                                          binary indicator 1_{g_j>0}, not the
+#                                          constraint magnitude (invariance).
+#                                          MUST set p4_treatment: null.
+#                                          Chocat-only feature flags
+#                                          (cht_eigenvalue_floor, cht_isotropy_alpha,
+#                                          cht_gamma_schedule, cht_kappa_trigger,
+#                                          cht_resample_tol, box_reflective_repair,
+#                                          psucc_exclude_resampled) are REJECTED
+#                                          at strategy __init__ for this sim_type.
+#                    'ArnoldCHT_AL'     – ArnoldCHT (above) PLUS Augmented
+#                                          Lagrangian on delta_vs1, with the
+#                                          same 2-objective fit / output
+#                                          layout as CHT_AL.
 #
 #   pop_size     : population size  (MU = LAMBDA = pop_size)
 #
@@ -38,10 +62,12 @@
 #   p4_treatment : how to enforce the upper p4 bound after mutation
 #                    'hard_bounds_on_p4' – re-transform to stay within the physical p4 limit
 #                    null                – no special treatment.  Mandatory for
-#                                          'CovarianceCHT' and 'CHT_AL' since
+#                                          any CHT-active sim_type
+#                                          (CovarianceCHT / CHT_AL /
+#                                           ArnoldCHT / ArnoldCHT_AL) since
 #                                          the CHT replaces repair entirely.
 #
-#   al_tol       : (CHT_AL only) tolerance ε in m/s for the AL constraint
+#   al_tol       : (CHT_AL / ArnoldCHT_AL only) tolerance ε in m/s for the AL constraint
 #                  g_AL(x) = delta_vs1(x) - ε ≤ 0.  Default 100 m/s
 #                  (≈ 2% of the 4900 m/s shock-speed target).  Smaller values
 #                  drive the AL toward a tighter delta_vs1 at the cost of
@@ -59,6 +85,16 @@
 #                    0.0125  = 0.1 / (n+2) (Arnold-Hansen 2012 default)
 #                    0.0375  = 0.0125·3   (3× the Arnold-Hansen default)
 #                    0.0625  = 0.5 / (n+2) (current strategy default, 5×)
+#
+#   arnold_beta  : (ArnoldCHT / ArnoldCHT_AL only) shrinkage strength for the
+#                  Eq. 7 subtractive update of A_i.  Omit to use the paper
+#                  default 0.1 / (n+2) (= 0.0125 at n=6).
+#
+#   arnold_cc    : (ArnoldCHT / ArnoldCHT_AL only) low-pass filter constant
+#                  for the v_j accumulator in Eq. 6.  Omit to use the paper
+#                  default 1 / (n+2) (= 0.125 at n=6).  Distinct from the
+#                  CMA-ES search-path c (which is 2/(n+2)) — same name in
+#                  the paper, different role here.
 #
 #   features     : (optional) dict of anti-degeneration toggles aimed at
 #                  preventing σ-collapse in the CHT/AL pipeline.  Each
@@ -104,155 +140,114 @@
 #                        exclude CHT-resampled offspring from the donor
 #                        parent's σ/psucc adaptation.  Decouples σ from
 #                        CHT-induced "successes".
+#
+#                  Group G — restart strategies
+#                    restart_on_sigma_collapse: dict
+#                        M1 internal restart.  Required fields:
+#                          sigma_threshold: float   (e.g. 1.0e-5)
+#                              trigger when max(σ) < this for sustained_gens
+#                              consecutive generations.
+#                          sustained_gens: int      (e.g. 5)
+#                          pop_increment: int       (e.g. 0 or 12)
+#                              add this many fresh individuals on each
+#                              restart.  0 ⇒ σ-only (warm) restart: existing
+#                              parents keep their design vectors but their
+#                              per-parent CMA state (σ, p_succ, p_c, A,
+#                              invCholesky) is reset to defaults; population
+#                              size is unchanged.  >0 ⇒ IPOP-style growth
+#                              (Auger & Hansen 2005), with the population
+#                              extended by that many fresh feasible draws.
+#                          max_restarts: int        (e.g. 3)
+#                              hard cap on restarts per run.
+#                    restart_round_two: dict
+#                        M2 seeded round-2 restart.  After NGEN gens round 2
+#                        is always launched, seeded from the non-dominated
+#                        external archive.  Required fields:
+#                          pop_increment: int       (e.g. 12)
+#                          pad_with_random: bool    (true)
+#
+#   n_gen        : number of generations (default 500 for back-compat).
+#
+#   lhs_seed     : (optional) int.  Seeds the numpy Generator that drives
+#                  every Latin Hypercube call in this run — initial population,
+#                  M1 restart fresh individuals, and M2 padding all share
+#                  the same Generator, so two runs with the same lhs_seed
+#                  and the same code produce identical LHS streams.  Omit
+#                  (or set to null) to use fresh OS entropy on each call
+#                  (matches the legacy uniform-sampling behaviour).
+#
 
 experiments:
-  # ────────────────────────────────────────────────────────────────────────
-  # Anti-degeneration feature sweep — each entry enables exactly ONE
-  # feature against the same baseline (pop=12, step=0.05, cht_gamma=0.0125,
-  # al_tol=100).  Any HV / σ / κ(C) / lam-trajectory difference vs the
-  # baseline is attributable to the enabled feature.
-  #
-  # Comment out the entries you don't want to run.  Each is ~500
-  # generations and the runs are dispatched as fresh subprocesses, so
-  # the order doesn't matter and you can safely skip any subset.
-  # ────────────────────────────────────────────────────────────────────────
 
-  # Baseline (no features) — reproduces the run analysed in the diagnostic
-  # post-mortem.  Includes for direct comparison against each feature run.
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features: {}
+  # ─────────────────────────────────────────────────────────────────
+  # Revised schedule (Arnold integration phase):
+  #   • 3 × Arnold baseline runs  (sim_type: ArnoldCHT_AL, NGEN=500)
+  #   • 3 × M1 with NGEN bumped to 500
+  #   • M2 (round-2 seeded restart) removed
+  #   • 3 × M3 (crowding-distance) kept at NGEN=400
+  # All AL-active runs share the baseline ε schedule
+  # [2000, 100, 100, 250] and psucc_sentinel_as_failure=true.
+  # 3 replicates per method for seed-variance averaging (CV~21.6%).
+  # ─────────────────────────────────────────────────────────────────
 
-  # A1 — eigenvalue floor (caps per-call shrinkage at 50% of prior axis).
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
+  # Arnold — Arnold & Hansen 2012 covariance update with AL on delta_vs1.
+  # No cht_gamma (Chocat-only field — would be ignored, but omitting
+  # makes the intent clear).  arnold_beta / arnold_cc default to the
+  # paper values (0.1/(n+2), 1/(n+2)) — see the YAML header.
+  - &arnold
+    sim_type: ArnoldCHT_AL
+    pop_size: 24
+    step_size: 0.1
     p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
+    al_tol: 4900
+    n_gen: 500
     features:
-      cht_eigenvalue_floor: 0.5
+      psucc_sentinel_as_failure: true
+      al_tol_schedule: [4900, 100.0, 100, 250]
+  - *arnold
+  - *arnold
 
-  # A2 — isotropy relaxation (5% pull toward mean(eigenvalues) per CHT call).
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      cht_isotropy_alpha: 0.05
-
-  # A3 — gamma schedule (decay 0.0125 → 0.001 over 500 generations).
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      cht_gamma_schedule: [0.0125, 0.001, 500]
-
-  # A4 — kappa trigger (re-isotropise when κ(C) > 5).
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      cht_kappa_trigger: 5.0
-      cht_isotropy_alpha: 0.1   # correction strength when trigger fires
-
-  # B1 — lam floor (maintain λ ≥ 0.01·μ instead of clamping to 0).
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      al_lam_floor_factor: 0.01
-
-  # B2 — mu decay (multiply μ by 0.99 each gen while λ is clamped).
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      al_mu_decay: 0.99
-
-  # B3 — al_tol decay (tighten 100 → 20 m/s over 500 generations).
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      al_tol_schedule: [100.0, 20.0, 500]
-
-  # C1 — resample tolerance (allow up to 0.02 violation during resample).
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      cht_resample_tol: 0.02
-
-  # C2 — reflective box repair (reflect [1,2] violations back into the box).
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      box_reflective_repair: true
-
-  # C3 — exclude resampled offspring from psucc adaptation.
-  - sim_type: CHT_AL
-    pop_size: 12
-    step_size: 0.05
-    p4_treatment: null
-    al_tol: 100.0
-    cht_gamma: 0.0125
-    features:
-      psucc_exclude_resampled: true
-
-
-
-  # Legacy 3-objective comparators — uncomment to A/B against the AL run.
-  # - sim_type: CovarianceCHT
-  #   pop_size: 12
-  #   step_size: 0.05
+  # M1 — σ-only (warm) restart.  NGEN=500.
+  # Triggers when max(σ) < 5e-4 for ≥5 consecutive gens.  Resets every
+  # parent's per-parent CMA state (σ → step_size, p_succ → ptarg,
+  # p_c → 0, A and invCholesky → I) while keeping their design vectors.
+  # Population size is unchanged (pop_increment: 0) — this isolates the
+  # σ-reset effect from IPOP-style population growth.  Up to 3 restarts
+  # allowed per run.
+  # - &m1
+  #   sim_type: CHT_AL
+  #   pop_size: 24
+  #   step_size: 0.1
   #   p4_treatment: null
+  #   al_tol: 2000.0
+  #   cht_gamma: 0.0125
+  #   n_gen: 500
+  #   features:
+  #     psucc_sentinel_as_failure: true
+  #     al_tol_schedule: [2000.0, 100.0, 100, 250]
+  #     restart_on_sigma_collapse:
+  #       sigma_threshold: 5.0e-4
+  #       sustained_gens: 5
+  #       pop_increment: 0
+  #       max_restarts: 3
+  # - *m1
+  # - *m1
 
-  # - sim_type: CovarianceCHT
-  #   pop_size: 36
-  #   step_size: 0.05
-  #   p4_treatment: null
-
-  # - sim_type: CovarianceCHT
-  #   pop_size: 12
-  #   step_size: 0.5
-  #   p4_treatment: null
-
-  # - sim_type: ParentValue
-  #   pop_size: 36
-  #   step_size: 0.5
-  #   p4_treatment: hard_bounds_on_p4
-
-  # - sim_type: ParentValue
-  #   pop_size: 36
-  #   step_size: 0.5
-  #   p4_treatment: hard_bounds_on_p4
+  # M3 — crowding-distance selection.  NGEN=400.
+  # Replaces HV-contribution within-front ranking with NSGA-II crowding
+  # distance, removing the knee-attractive bias that drives the σ spiral.
+  - &m3
+    sim_type: CHT_AL
+    pop_size: 24
+    step_size: 0.1
+    p4_treatment: null
+    al_tol: 2000.0
+    cht_gamma: 0.0125
+    n_gen: 400
+    features:
+      psucc_sentinel_as_failure: true
+      al_tol_schedule: [2000.0, 100.0, 100, 250]
+      selection: crowding
+  - *m3
+  - *m3
 
