@@ -349,6 +349,22 @@ class StrategyMultiObjective(object):
         # B3: linearly interpolate al_tol from start → end over n_gens.
         # Schema: [start_tol, end_tol, n_gens].  None ⇒ static al_tol.
         self.al_tol_schedule = features.get("al_tol_schedule")
+        # B4: AL update-proxy shaping (FRONT-ALAMO-aligned, Cocchi/Lapucci/
+        # Mansueto 2021).  These affect ONLY the per-generation
+        # multiplier/penalty update fed by _cheap_al_proxy in main.py — NOT
+        # the set_coefficients bootstrap, which keeps summarising the full
+        # parent set for a meaningful iqr(F)/iqr(G) scale.
+        #   al_proxy_front_only: restrict the proxy set to the first
+        #     non-dominated front (w.r.t. AL-augmented fitness) — the MO
+        #     analogue of "the current solution(s)" the shared multiplier
+        #     should price.  None/False ⇒ all surviving parents (legacy).
+        #   al_proxy_g_quantile: aggregate g_al over the proxy set with this
+        #     upper quantile in [0, 1] (e.g. 0.9) instead of the mean.
+        #     FRONT-ALAMO drives the update from the WORST violation; a high
+        #     quantile is the noise/sentinel-robust surrogate for the raw
+        #     max.  None ⇒ mean (legacy).
+        self.al_proxy_front_only = features.get("al_proxy_front_only")
+        self.al_proxy_g_quantile = features.get("al_proxy_g_quantile")
         # C1: tolerance for is_feasible() inside the CHT resample loop.
         # Higher ⇒ more permissive (fewer offspring re-sampled / fewer
         # CHT calls).  None or 0.0 ⇒ strict feasibility.
@@ -513,6 +529,49 @@ class StrategyMultiObjective(object):
             ind._g_al = np.array([raw - cur], dtype=float)
             ind.al_tol = cur
 
+    def al_first_front(self, candidates):
+        """Return the first non-dominated front of ``candidates`` w.r.t. the
+        AL-augmented fitness (fₖ + Σ AL(g_alₖ) added to every objective).
+
+        This is the multi-objective analogue of "the current solution(s)"
+        that the shared AL multiplier should price.  FRONT-ALAMO (Cocchi,
+        Lapucci & Mansueto 2021) summarises the set of points non-dominated
+        w.r.t. the augmented Lagrangian — not the whole population — when
+        updating the shared multiplier/penalty.  Consumed by
+        ``_cheap_al_proxy`` in main.py when ``al_proxy_front_only`` is set.
+
+        The augmentation reuses the exact monkey-swap-then-restore pattern
+        as ``_select`` (via ``_al_penalty``), so the front here is defined by
+        the *identical* criterion selection uses.  When AL is inactive or
+        not yet bootstrapped every penalty is 0.0, so this degrades to the
+        raw first front — still a sensible leading edge.
+
+        Individuals without a valid fitness are dropped (DEAP's sort needs
+        valid fitnesses).  Returns ``[]`` only when no candidate is valid,
+        and the input list unchanged when it holds ≤ 1 valid individual.
+        """
+        valid = [ind for ind in candidates if ind.fitness.valid]
+        if len(valid) <= 1:
+            return valid
+        original_fitness = {}
+        try:
+            for ind in valid:
+                pen = self._al_penalty(getattr(ind, "_g_al", None))
+                if pen == 0.0:
+                    continue
+                original_fitness[id(ind)] = ind.fitness.values
+                ind.fitness.values = tuple(v + pen for v in ind.fitness.values)
+            return tools.sortLogNondominated(
+                valid, len(valid), first_front_only=True,
+            )
+        finally:
+            # Restore raw fitness on every path so downstream logging /
+            # archiving never sees AL-shifted values (same contract as
+            # _select's try/finally).
+            for ind in valid:
+                if id(ind) in original_fitness:
+                    ind.fitness.values = original_fitness[id(ind)]
+
     def update_al(self, F_proxy_scalar, g_al_proxy, proxy_stats=None):
         """Per-generation update of γ and μ from the parent-centroid proxy.
 
@@ -605,6 +664,11 @@ class StrategyMultiObjective(object):
             "g_al_std":           stats.get("g_al_std"),
             "n_feasible_parents": stats.get("n_feasible_parents"),
             "pen_to_f_ratio":     pen_to_f,
+            # B4 proxy-shaping mode (so the mean-vs-quantile / front-vs-all
+            # A/B is self-documenting in al_per_gen.csv).
+            "n_proxy_set":        stats.get("n_proxy_set"),
+            "proxy_front_only":   stats.get("proxy_front_only"),
+            "proxy_g_quantile":   stats.get("proxy_g_quantile"),
         })
 
     # ─────────────────────────────────────────────────────────────────────────

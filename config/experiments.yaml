@@ -105,6 +105,19 @@
 #                        delayed onset (e.g. let the AL bootstrap on a
 #                        wide initial tol, then tighten only once the
 #                        search has stabilised).
+#                    al_proxy_front_only: bool (e.g. true)
+#                        drive the per-gen AL multiplier/penalty update from
+#                        the first non-dominated front (w.r.t. AL-augmented
+#                        fitness) instead of all surviving parents.  The MO
+#                        analogue of pricing "the current solution(s)"
+#                        (FRONT-ALAMO, Cocchi/Lapucci/Mansueto 2021).
+#                        Affects only the update, NOT the iqr bootstrap.
+#                    al_proxy_g_quantile: float in [0, 1] (e.g. 0.9)
+#                        aggregate g_al over the proxy set with this upper
+#                        quantile instead of the mean.  FRONT-ALAMO uses the
+#                        WORST violation; a high quantile is the robust
+#                        surrogate for max (mean lets feasible members mask
+#                        infeasible ones, stalling the penalty).
 #
 #                  Group C — redefine / re-treat infeasibility
 #                    cht_resample_tol: float (e.g. 0.02)
@@ -172,6 +185,10 @@ experiments:
     features:
       psucc_sentinel_as_failure: true
       al_tol_schedule: [4900, 100.0, 100, 250]
+      # B4 (FRONT-ALAMO-aligned proxy shaping) — uncomment to A/B against
+      # the legacy mean-of-all-parents proxy.  Both default off (legacy).
+      # al_proxy_front_only: true
+      # al_proxy_g_quantile: 0.9
   - *arnold
 
   # ────────────────────────────────────────────────────────────────────────

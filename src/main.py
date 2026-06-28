@@ -291,36 +291,80 @@ def _cheap_al_proxy(strategy):
     Returns (None, None, {}) when no real parent remains for proxying
     (all parents are sentinel-failures — should be rare).
 
-    **Diag-2**: returns a stats dict alongside the proxy, capturing
-    per-gen population g_al distribution (min, max, std, count) so
-    we can post-hoc evaluate whether the mean proxy is masking
-    bimodality.
+    **Diag-2**: returns a stats dict alongside the proxy, capturing the
+    per-gen population g_al distribution (min, max, std, count) — always
+    over the *full* clean parent set, so the spread the proxy collapses
+    stays visible even when the proxy itself is front-restricted.
+
+    **B4 (FRONT-ALAMO-aligned proxy shaping).** Two strategy flags reshape
+    which points are summarised and how:
+
+    * ``al_proxy_front_only``: restrict the proxy set to the first
+      non-dominated front (w.r.t. the AL-augmented fitness) rather than all
+      survivors — the MO analogue of "the current solution(s)" the shared
+      multiplier should price (Cocchi, Lapucci & Mansueto 2021).
+    * ``al_proxy_g_quantile``: aggregate g_al with this upper quantile
+      instead of the mean.  FRONT-ALAMO drives the update from the WORST
+      violation; a high quantile is the noise/sentinel-robust surrogate for
+      the raw max, and avoids the mean's failure mode (feasible members
+      masking infeasible ones, so the penalty stalls).
+
+    The F aggregate stays a plain mean regardless: F only sets the
+    bootstrap iqr scale (computed elsewhere) and is ignored by pycma's
+    ``set_algorithm(3)`` per-gen branch, so a robust-upper F buys nothing.
     """
-    Fs, gals = [], []
-    for p in strategy.parents:
-        if not p.fitness.valid:
-            continue
-        if getattr(p, "_g_al", None) is None:
-            continue
-        # Fix-S1 (extended): skip both PITOT3-only sentinels (real
-        # fit but g_al sentinel-inflated) and SPARK sentinels (fit at
-        # (1,1)).  Either type contaminates the proxy.
-        if _is_sentinel(p):
-            continue
-        Fs.append(sum(p.fitness.values))
-        gals.append(np.asarray(p._g_al, dtype=float))
-    if not Fs:
+    # Clean candidate set: valid fitness, has g_al, non-sentinel.
+    # Fix-S1: skip both PITOT3-only sentinels (real fit but g_al
+    # sentinel-inflated) and SPARK sentinels (fit at (1,1)) — either type
+    # contaminates the proxy and (below) the front membership.
+    candidates = [
+        p for p in strategy.parents
+        if p.fitness.valid
+        and getattr(p, "_g_al", None) is not None
+        and not _is_sentinel(p)
+    ]
+    if not candidates:
         return None, None, {}
-    g_arr = np.stack(gals, axis=0)              # (n_real_parents, m)
-    F_arr = np.asarray(Fs, dtype=float)
+
+    # Distribution stats over the FULL clean set, so the spread is visible
+    # even when the proxy below is front-restricted.
+    g_all = np.stack([np.asarray(p._g_al, dtype=float) for p in candidates],
+                     axis=0)
+
+    # B4 set restriction: summarise only the leading edge when asked.
+    # al_first_front augments by the same AL penalty _select uses, so the
+    # front here matches the one selection keeps.  An empty front (should
+    # not occur with ≥1 candidate) falls back to all candidates.
+    proxy_set = candidates
+    if getattr(strategy, "al_proxy_front_only", None):
+        front = strategy.al_first_front(candidates)
+        if front:
+            proxy_set = front
+
+    g_arr = np.stack([np.asarray(p._g_al, dtype=float) for p in proxy_set],
+                     axis=0)                     # (n_proxy_set, m)
+    F_arr = np.asarray([sum(p.fitness.values) for p in proxy_set],
+                       dtype=float)
+
+    # B4 aggregator: upper quantile (worst-violation surrogate) or mean.
+    # g_al > 0 is a violation, so the HIGH quantile picks the worst points.
+    q = getattr(strategy, "al_proxy_g_quantile", None)
+    if q is not None:
+        g_proxy = np.quantile(g_arr, float(q), axis=0)
+    else:
+        g_proxy = np.mean(g_arr, axis=0)
+
     stats = {
-        "g_al_min":           float(np.min(g_arr)),
-        "g_al_max":           float(np.max(g_arr)),
-        "g_al_std":           float(np.std(g_arr)),
-        "n_feasible_parents": int(len(Fs)),
+        "g_al_min":           float(np.min(g_all)),
+        "g_al_max":           float(np.max(g_all)),
+        "g_al_std":           float(np.std(g_all)),
+        "n_feasible_parents": int(len(candidates)),
         "F_proxy_abs_max":    float(np.max(np.abs(F_arr))),
+        "n_proxy_set":        int(len(proxy_set)),
+        "proxy_front_only":   bool(getattr(strategy, "al_proxy_front_only", None)),
+        "proxy_g_quantile":   (float(q) if q is not None else None),
     }
-    return float(np.mean(F_arr)), np.mean(g_arr, axis=0), stats
+    return float(np.mean(F_arr)), g_proxy, stats
 
 
 def _store_raw_delta_vs1(ind, g_al):

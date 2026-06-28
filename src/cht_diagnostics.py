@@ -196,6 +196,11 @@ AL_PER_GEN_FIELDS = [
     # |F| shrinks.  Large values mean the penalty dominates the
     # objective in the augmented fitness.
     "pen_to_f_ratio",
+    # B4: AL update-proxy shaping mode, so the mean-vs-quantile and
+    # front-vs-all-parents A/B is self-documenting per generation.
+    "n_proxy_set",           # points actually summarised (front size or all)
+    "proxy_front_only",      # True ⇒ proxy restricted to first non-dom front
+    "proxy_g_quantile",      # upper quantile used for g_al (None ⇒ mean)
 ]
 
 
