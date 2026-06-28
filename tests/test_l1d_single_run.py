@@ -1,10 +1,8 @@
 """
-Standalone L1d4 integration test with SPARK comparison.
+Standalone L1d4 integration test.
 
 Runs a single L1d simulation using exactly the same code path that the
-CMA-ES uses (evaluate._evaluate_l1d → run_l1d → parse_l1d_outputs), then
-runs a SPARK simulation of the same design and overlays results for
-direct comparison.
+CMA-ES uses (evaluate._evaluate_l1d → run_l1d → parse_l1d_outputs).
 
 The design vector is the mid-point of the physical BOUNDS — a neutral,
 physically reasonable starting point with no prior knowledge required.
@@ -17,14 +15,15 @@ Run from the project root on the l1d_cht_al branch:
 
 Prerequisites:
   - The three .lua gas model files must be present in the project root.
-  - SPARK must be importable (it lives in /home/x-lab-user/spark/src).
 
 Outputs (written to src/L1d_Outputs/DEAP_0/):
-  - pressure_histories.png   : L1d pressure at all three history locations
-  - piston_kinematics.png    : L1d piston position and velocity
-  - spark_vs_l1d_driver.png  : SPARK driver pressure overlaid on L1d PD trace
+  - pressure_histories.png       : L1d pressure at the two ToF transducer
+                                   stations (history-loc-0000 and -0001)
+  - piston_kinematics.png        : L1d piston position and velocity
+  - driver_pressure_profiles.png : single-panel pressure trace at
+                                   history-loc-0002 with ±10 % hold band
+                                   and computed t_hold window
 """
-import contextlib
 import sys
 import os
 
@@ -43,14 +42,24 @@ from problem.l1d_job import run_l1d, TRANSDUCER_XS, SENTINEL_TUPLE
 
 # x_phys = np.array([0.5 * (lo + hi) for lo, hi in BOUNDS])
 
+# x_phys = np.array([
+#     80,       # percent_He     [%]
+#     77.2e3,      # driver_p       [Pa]
+#     35.7e6,     # p4 (burst)     [Pa]
+#     0.085,      # D_throat       [m]
+#     6.08e6,      # reservoir_p    [Pa]
+#     0.045,       # buffer_length  [m]
+# ])
+
 x_phys = np.array([
-    80.0,       # percent_He     [%]
-    0.0103e6,      # driver_p       [Pa]
-    3.5e6,     # p4 (burst)     [Pa]
-    0.065,      # D_throat       [m]
-    7.94e6,      # reservoir_p    [Pa]
-    0.05,       # buffer_length  [m]
+    88.0,       # percent_He     [%]
+    170.3e3,      # driver_p       [Pa]
+    21.5e6,     # p4 (burst)     [Pa]
+    0.075,      # D_throat       [m]
+    2.94e6,      # reservoir_p    [Pa]
+    0.08,       # buffer_length  [m]
 ])
+
 
 VAR_LABELS = [
     "percent_He   [%]  ",
@@ -62,7 +71,7 @@ VAR_LABELS = [
 ]
 
 print("=" * 60)
-print("L1d single-run test — design vector (physical mid-bounds)")
+print("L1d single-run test")
 print("=" * 60)
 for label, val in zip(VAR_LABELS, x_phys):
     print(f"  {label}: {val:.4g}")
@@ -120,104 +129,7 @@ print()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2.  SPARK simulation
-# ─────────────────────────────────────────────────────────────────────────────
-# SPARK is a 0D ODE model of the driver: it tracks piston position/velocity
-# and driver pressure as scalars (no spatial resolution).  p_drvr from SPARK
-# is therefore the driver pressure everywhere in the driver — directly
-# comparable to history-loc-0000 (the primary-diaphragm station) in L1d.
-
-print("── SPARK simulation ─────────────────────────────────────")
-
-spark_ok = False
-spark_sim = None
-
-try:
-    spark_src = "/home/x-lab-user/spark/src"
-    if spark_src not in sys.path:
-        sys.path.insert(0, spark_src)
-    import spark
-
-    fill_condition = {
-        "p_drvr_0":         driver_p,
-        "T_drvr_0":         298.15,
-        "composition_drvr": {
-            "He": float(percent_He / 100.0),
-            "Ar": float(1.0 - percent_He / 100.0),
-        },
-        "composition_units": "molef",
-        "p_rsvr_0":         reservoir_p,
-        "T_rsvr_0":         298.15,
-        "p_rupture":        p4,
-    }
-
-    facility = {
-        "L_drvr":   4.475,
-        "D_piston": 0.2568,
-        "V_drvr_0": spark.calculateInitialDriverVolume(
-            4.475, 0.2568, 0.112, 85 / 1000,
-            L_buffer=float(buffer_length),
-            D_buffer=50 / 1000,
-        ),
-        "m_piston": 10.5,
-        "L_buffer": float(buffer_length),
-        "D_star":   D_throat,
-        "D_driven": 85 / 1000,
-    }
-
-    rupture_model = {
-        "model":      "drewry",
-        "K":          0.93,
-        "rho":        8649,
-        "time_model": "linear",
-        "tau":        2.0e-3,
-        "b":          0.06,
-    }
-
-    settings = {
-        "rsvr_gm":                                "ideal_air",
-        "drvr_gm":                                "mixed_he_ar",
-        "max_piston_cycles":                      3,
-        "percent_time_on_buffers_before_halting": 0.05,
-        "effective_inflection_velocity_tolerance": 3,
-        "t_hold_sim":                             True,
-    }
-
-    spark_sim = spark.createSimulation(
-        condition_dict=fill_condition,
-        facility_dict=facility,
-        simulation_settings_dict=settings,
-        diaphragm_model_dict=rupture_model,
-    )
-
-    _devnull = open(os.devnull, "w")
-    with contextlib.redirect_stdout(_devnull):
-        spark_sim.run()
-    _devnull.close()
-
-    spark_ok = spark_sim.flags.diaphragm_ruptured and spark_sim.flags.impact_occurred
-
-    if spark_ok:
-        print("SPARK RESULT: OK")
-        print(f"  t_hold       = {spark_sim.t_hold * 1e3:.3f} ms")
-        print(f"  impact_speed = {spark_sim.results.vel_buffer_strike_max:.1f} m/s")
-    else:
-        print("SPARK RESULT: incomplete — flags:")
-        print(f"  diaphragm_ruptured = {spark_sim.flags.diaphragm_ruptured}")
-        print(f"  impact_occurred    = {spark_sim.flags.impact_occurred}")
-        if spark_sim.results is not None and hasattr(spark_sim.results, 'p_drvr'):
-            p_max_MPa = max(spark_sim.results.p_drvr) * 1e-6
-            print(f"  max p_drvr reached = {p_max_MPa:.2f} MPa  (p_burst = {p4*1e-6:.2f} MPa)")
-        print("  (driver trace will still be overlaid in Figure 3 for diagnostics)")
-
-except Exception as exc:
-    print(f"SPARK RESULT: FAILED — {exc}")
-
-print()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3.  Plots
+# 2.  Plots
 # ─────────────────────────────────────────────────────────────────────────────
 
 output_root.mkdir(parents=True, exist_ok=True)
@@ -226,6 +138,7 @@ HISTORY_CONFIGS = [
     (0, f"x = {TRANSDUCER_XS[0]:.3f} m  (ToF station 1)", "ToF transducer 1"),
     (1, f"x = {TRANSDUCER_XS[1]:.3f} m  (ToF station 2)", "ToF transducer 2"),
 ]
+DRIVER_PROBE_IDXS = (2, 3, 4)   # all driver-side history locs, ordered for overlay
 
 
 def _load_history(idx):
@@ -313,10 +226,20 @@ for ax, (idx, x_label, description) in zip(axes1, HISTORY_CONFIGS):
         continue
 
     ax.plot(t_ms, p_MPa, lw=0.8, color="steelblue")
+    # The ±10 % hold band only has physical meaning on the driver-side
+    # probes (idx ∈ DRIVER_PROBE_IDXS), where p_burst is the reference
+    # pressure.  The shock-tube transducers see a totally different
+    # pressure range, so don't draw it on idx 0 and 1.
+    if idx in DRIVER_PROBE_IDXS:
+        p_lo_MPa = p4 * 0.90 * 1e-6
+        p_hi_MPa = p4 * 1.10 * 1e-6
+        ax.axhspan(p_lo_MPa, p_hi_MPa, alpha=0.12, color="orange",
+                   label=f"±10 % hold band  (p_burst = {p4*1e-6:.2f} MPa)")
+        ax.axhline(p4 * 1e-6, color="orange", lw=0.8, ls="--")
     if t_burst_ms is not None:
         ax.axvline(t_burst_ms, color="seagreen", lw=0.8, ls=":",
                    label=_burst_label)
-        ax.legend(fontsize=8, loc="upper left")
+    ax.legend(fontsize=8, loc="upper left")
 
 plt.tight_layout()
 p1 = output_root / "pressure_histories.png"
@@ -401,90 +324,62 @@ plt.close(fig2)
 print(f"Saved: {p2}")
 
 
-# ── Figure 3: SPARK driver pressure vs L1d primary-diaphragm pressure ─────────
-# SPARK p_drvr is the whole-driver pressure (0D model, no spatial variation).
-# L1d history-loc-0000 is sampled at x=0 (PD face) — the closest equivalent.
-
-fig3, ax3 = plt.subplots(figsize=(10, 4))
-fig3.suptitle("Driver pressure: SPARK (0D) vs L1d at primary diaphragm  [mid-bounds design]",
-              fontsize=11)
-
-t_pd_ms, p_pd_MPa = _load_history(0)
-if t_pd_ms is not None:
-    ax3.plot(t_pd_ms, p_pd_MPa, lw=0.8, color="steelblue", label="L1d  (history-loc-0000, x = 0 m)")
-
-if spark_sim is not None and hasattr(spark_sim.results, 'p_drvr'):
-    sp_t_ms  = np.array(spark_sim.results.time) * 1e3
-    sp_p_MPa = np.array(spark_sim.results.p_drvr) * 1e-6
-    label = "SPARK  (0D driver pressure)" if spark_ok else "SPARK  (incomplete — piston halted early)"
-    ax3.plot(sp_t_ms, sp_p_MPa, lw=0.8, color="darkorange", label=label)
-
-# Hold-time band
-p_lo = p4 * 0.90 * 1e-6
-p_hi = p4 * 1.10 * 1e-6
-ax3.axhspan(p_lo, p_hi, alpha=0.12, color="orange",
-            label=f"±10 % hold band  (p_burst = {p4*1e-6:.1f} MPa)")
-ax3.axhline(p4 * 1e-6, color="orange", lw=0.8, ls="--")
-
-if t_burst_ms is not None:
-    ax3.axvline(t_burst_ms, color="seagreen", lw=0.8, ls=":",
-                label=_burst_label)
-
-ax3.set_xlabel("Time (ms)")
-ax3.set_ylabel("Pressure (MPa)")
-ax3.legend(fontsize=8)
-ax3.grid(True, lw=0.4, alpha=0.5)
-
-plt.tight_layout()
-p3 = output_root / "spark_vs_l1d_driver.png"
-fig3.savefig(p3, dpi=150)
-plt.close(fig3)
-print(f"Saved: {p3}")
-
-
-# ── Figure 4: Driver pressure at PD + 5 upstream stations ────────────────────
-# Overlays all six driver-side history locations on one axes so you can see
-# the pressure wave build and propagate toward the PD as the piston compresses.
-# Indices 3-7 are appended after the ToF transducers in the job template and
-# are purely diagnostic — parse_l1d_outputs only reads indices 0-2.
-
-DRIVER_LOCS = [
-    (2,  "PD − 0.01 m"),
-    (3,  "PD − 0.02 m"),
-    (4,  "PD − 0.03 m"),
-    (5,  "PD − 0.04 m"),
-    (6,  "PD − 0.05 m"),
-    (7,  "PD − 0.06 m"),
-    (8,  "PD − 0.07 m"),
-    (9,  "PD − 0.08 m"),
-    (10, "PD − 0.09 m"),
-    (11, "PD − 0.10 m"),
-]
+# ── Figure 3: Driver-side pressure at history-loc-0002 ───────────────────────
+# Single-panel diagnostic for the t_hold metric.  We plot the raw trace, the
+# ±10 % hold band around p_burst, the burst instant, and a shaded interval
+# spanning the computed t_hold window — defined the same way as in
+# parse_l1d_outputs: from t_burst until the first sample where the trace
+# leaves the band (or to t_finish if it never does).  If t_hold's number
+# matches the visual width of the shaded interval, the parser is correct.
 
 fig4, ax4 = plt.subplots(figsize=(10, 5))
-fig4.suptitle("L1d driver pressure — PD + 5 upstream stations  [mid-bounds design]",
+fig4.suptitle("L1d driver-side pressure (PD − 0.02 m)  [mid-bounds design]",
               fontsize=11)
 
-colors = plt.cm.viridis(np.linspace(0.15, 0.85, len(DRIVER_LOCS)))
-for (idx, label), color in zip(DRIVER_LOCS, colors):
-    t_ms, p_MPa = _load_history(idx)
-    if t_ms is not None:
-        ax4.plot(t_ms, p_MPa, lw=0.8, color=color, label=label)
-    else:
-        print(f"  [Figure 4] history-loc-{idx:04d}.data not found — skipping {label}")
+# Canonical t_hold probe: history-loc-0002 (PD − 0.02 m) is what the
+# parser reads, and the t_hold window below is derived from it.
+t_drv_ms, p_drv_MPa = _load_history(2)
+if t_drv_ms is not None:
+    ax4.plot(t_drv_ms, p_drv_MPa, lw=1.0, color="steelblue",
+             label="L1d  (loc 2 — PD − 0.02 m, canonical t_hold probe)")
+else:
+    print("  [Figure 3] history-loc-0002.data not found")
+
+if t_drv_ms is None:
+    ax4.text(0.5, 0.5, "no driver-side history files found",
+             ha="center", va="center", transform=ax4.transAxes, color="red")
 
 ax4.axhspan(p4 * 0.90 * 1e-6, p4 * 1.10 * 1e-6, alpha=0.12, color="orange",
-            label=f"±10 % hold band  (p_burst = {p4*1e-6:.1f} MPa)")
+            label=f"±10 % hold band  (p_burst = {p4*1e-6:.2f} MPa)")
 ax4.axhline(p4 * 1e-6, color="orange", lw=0.8, ls="--")
+
+# Mirror parse_l1d_outputs's first-exit definition so the shaded interval
+# below visualises exactly the t_hold the parser computed.
+if t_drv_ms is not None and t_burst_ms is not None and ok:
+    p_lo_MPa = p4 * 0.90 * 1e-6
+    p_hi_MPa = p4 * 1.10 * 1e-6
+    post_burst  = t_drv_ms >= t_burst_ms
+    out_of_band = (p_drv_MPa < p_lo_MPa) | (p_drv_MPa > p_hi_MPa)
+    exit_idxs   = np.where(post_burst & out_of_band)[0]
+    t_exit_ms   = float(t_drv_ms[exit_idxs[0]]) if exit_idxs.size else float(t_drv_ms[-1])
+    ax4.axvspan(t_burst_ms, t_exit_ms, alpha=0.18, color="seagreen",
+                label=f"t_hold window  ({(t_exit_ms - t_burst_ms):.3f} ms)")
+
 if t_burst_ms is not None:
     ax4.axvline(t_burst_ms, color="seagreen", lw=0.8, ls=":",
                 label=_burst_label)
 
 ax4.set_xlabel("Time (ms)")
 ax4.set_ylabel("Pressure (MPa)")
-ax4.set_xlim(23, 35)
-ax4.legend(fontsize=8)
+ax4.legend(fontsize=8, loc="upper left")
 ax4.grid(True, lw=0.4, alpha=0.5)
+
+# Zoom the x-axis to ±3 ms around the diaphragm-burst instant — the only
+# physically interesting window for the t_hold metric.  Skip the zoom if
+# the diaphragm never burst, so the plot still shows the whole sim and
+# the failure is visually obvious.
+if t_burst_ms is not None:
+    ax4.set_xlim(t_burst_ms - 3.0, t_burst_ms + 3.0)
 
 plt.tight_layout()
 p4_path = output_root / "driver_pressure_profiles.png"
@@ -493,64 +388,165 @@ plt.close(fig4)
 print(f"Saved: {p4_path}")
 
 
-# ── Figure 5: Driver pressure subplots — one per history location ─────────────
+# ── Figures 4..N: Gas-path area profile at selected tindx ────────────────────
+# One PNG per chosen tindx, plotting cross-sectional area vs x for BOTH
+# the driver-gas slug (slug-0001) and the test-gas slug (slug-0002).
+# The gas-path order in the template is [reservoir(0), driver(1), test
+# gas(2)], so slugs 1 and 2 together cover everything from the piston
+# face to the shock-tube exit (the reservoir is on the upstream side of
+# the piston and is plotted separately if you ever need it).
+#
+# Schedule: burst-50, burst-45, ..., burst-5, burst-1, burst, burst+5,
+# burst+10, ..., burst+50.  That's 22 frames straddling the diaphragm
+# rupture, sampled every 5 dt_plot steps on either side plus a dense
+# pair (burst-1, burst) right at the event.  All 22 share the same x-
+# and y-axis limits so the Lagrangian drift of each slug is visible at
+# a glance instead of being normalised away by per-plot autoscaling.
 
-# Pre-load peak pressures for the two fixed reference locations.
-# These are always idx 2 (PD−0.01 m) and idx 11 (PD−0.10 m) regardless
-# of how many locations are in DRIVER_LOCS.
-_, _p_near = _load_history(2)   # PD − 0.01 m
-_, _p_far  = _load_history(11)  # PD − 0.10 m
-p_peak_near = float(np.max(_p_near)) if _p_near is not None else None
-p_peak_far  = float(np.max(_p_far))  if _p_far  is not None else None
+SLUG1_FACES_FILE = job_subdir / "slug-0001-faces.data"
+SLUG2_FACES_FILE = job_subdir / "slug-0002-faces.data"
+TIMES_FILE       = job_subdir / "times.data"
+_d_for_area      = job_subdir / "diaphragm-0000.data"
 
-n_locs = len(DRIVER_LOCS)
-n_cols  = 2
-n_rows  = (n_locs + 1) // n_cols   # ceiling division
-fig5, axes5_2d = plt.subplots(n_rows, n_cols, figsize=(14, 3 * n_rows), sharex=True)
-fig5.suptitle("L1d driver pressure — individual subplots per station  [mid-bounds design]",
-              fontsize=11)
 
-axes5_flat = axes5_2d.flatten()
+def _stream_slug_faces(path, wanted):
+    """Stream a slug-NNNN-faces.data file, returning {tindx: ndarray} only
+    for the tindx values in ``wanted``.
 
-colors = plt.cm.viridis(np.linspace(0.15, 0.85, n_locs))
-for ax, (idx, label), color in zip(axes5_flat, DRIVER_LOCS, colors):
-    t_ms, p_MPa = _load_history(idx)
-    ax.set_title(label, fontsize=9)
-    ax.set_ylabel("Pressure (MPa)")
-    ax.grid(True, lw=0.4, alpha=0.5)
-    ax.axhspan(p4 * 0.90 * 1e-6, p4 * 1.10 * 1e-6, alpha=0.12, color="orange")
-    ax.axhline(p4 * 1e-6, color="orange", lw=0.8, ls="--")
-    if p_peak_near is not None:
-        ax.axhline(p_peak_near, color="crimson", lw=0.9, ls="--",
-                   label=f"peak PD−0.01 m = {p_peak_near:.3f} MPa")
-    if p_peak_far is not None:
-        ax.axhline(p_peak_far, color="steelblue", lw=0.9, ls="--",
-                   label=f"peak PD−0.10 m = {p_peak_far:.3f} MPa")
-    if t_ms is not None:
-        ax.plot(t_ms, p_MPa, lw=0.8, color=color)
-        ax.set_xlim(15, 25)
+    Single linear pass over the file; only buffers rows for blocks we
+    actually want, so memory stays bounded by the size of one block
+    regardless of how large the file is.
+    """
+    out = {}
+    cur_tindx, cur_rows = None, []
+    with open(path) as fh:
+        for line in fh:
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("# tindx"):
+                if cur_tindx in wanted and cur_rows:
+                    out[cur_tindx] = np.array(cur_rows)
+                cur_tindx = int(s.split()[2])
+                cur_rows = []
+            elif s.startswith("#"):
+                continue
+            else:
+                if cur_tindx in wanted:
+                    parts = s.split()
+                    cur_rows.append((float(parts[0]), float(parts[1])))
+        if cur_tindx in wanted and cur_rows:
+            out[cur_tindx] = np.array(cur_rows)
+    return out
+
+
+# Re-derive burst tindx locally to decouple from the earlier block's locals.
+_burst_tindx_area = None
+if _d_for_area.exists():
+    _arr = np.loadtxt(_d_for_area, comments="#", dtype=int)
+    if _arr.ndim == 1:
+        _arr = _arr[np.newaxis, :]
+    _rows = np.where(_arr[:, 1] == 2)[0]
+    if _rows.size > 0:
+        _burst_tindx_area = int(_arr[_rows[0], 0])
+
+_have_any_slug = SLUG1_FACES_FILE.exists() or SLUG2_FACES_FILE.exists()
+
+if _burst_tindx_area is None or not _have_any_slug:
+    print("[Area profiles] skipped — burst tindx unknown or both slug-faces files missing")
+else:
+    area_dir = output_root / "area_profiles"
+    area_dir.mkdir(exist_ok=True)
+
+    schedule = (
+        [_burst_tindx_area - 5 * k for k in range(10, 0, -1)]   # burst-50 ... burst-5
+        + [_burst_tindx_area - 1, _burst_tindx_area]            # burst-1, burst
+        + [_burst_tindx_area + 5 * k for k in range(1, 11)]     # burst+5 ... burst+50
+    )
+    schedule = [t for t in schedule if t >= 0]   # drop any negative tindxs if burst < 50
+    wanted = set(schedule)
+
+    blocks_drv = _stream_slug_faces(SLUG1_FACES_FILE, wanted) if SLUG1_FACES_FILE.exists() else {}
+    blocks_tst = _stream_slug_faces(SLUG2_FACES_FILE, wanted) if SLUG2_FACES_FILE.exists() else {}
+
+    # Per-tindx wall-clock time for plot titles.
+    tindx_to_t_ms = {}
+    if TIMES_FILE.exists():
+        _ta = np.loadtxt(TIMES_FILE, comments="#")
+        if _ta.ndim == 1:
+            _ta = _ta[np.newaxis, :]
+        tindx_to_t_ms = {int(row[0]): float(row[1]) * 1e3 for row in _ta}
+
+    # Global axis limits across all selected frames AND both slugs, so
+    # every plot frames the same region of (x, area) space.  Without this,
+    # autoscaling would hide the slugs' Lagrangian drift in x.
+    _all_x, _all_a = [], []
+    for _src in (blocks_drv, blocks_tst):
+        for _t, _a in _src.items():
+            _all_x.append(_a[:, 0])
+            _all_a.append(_a[:, 1])
+    if _all_x:
+        _xs_all   = np.concatenate(_all_x)
+        _area_all = np.concatenate(_all_a)
+        _x_lo, _x_hi = float(_xs_all.min()), float(_xs_all.max())
+        _x_pad = 0.05 * (_x_hi - _x_lo) if _x_hi > _x_lo else 0.01
+        _area_cm2_hi = float(_area_all.max()) * 1e4 * 1.05   # m² → cm²
     else:
-        ax.text(0.5, 0.5, f"history-loc-{idx:04d}.data not found",
-                ha="center", va="center", transform=ax.transAxes, color="red")
-    if t_burst_ms is not None:
-        ax.axvline(t_burst_ms, color="seagreen", lw=0.8, ls=":",
-                   label=_burst_label)
-    if p_peak_near is not None or p_peak_far is not None or t_burst_ms is not None:
-        ax.legend(fontsize=7, loc="upper left")
+        _x_lo, _x_hi, _x_pad, _area_cm2_hi = -1.0, 1.0, 0.05, 1.0
 
-# x-axis label only on the bottom row
-for ax in axes5_2d[-1, :]:
-    ax.set_xlabel("Time (ms)")
+    print(f"[Area profiles] generating {len(schedule)} plots at "
+          f"tindx ∈ {schedule[0]}..{schedule[-1]}  "
+          f"(driver={len(blocks_drv)}, test={len(blocks_tst)})")
 
-# hide any unused axes (if n_locs is odd)
-for ax in axes5_flat[n_locs:]:
-    ax.set_visible(False)
+    for _tindx in schedule:
+        has_drv = _tindx in blocks_drv
+        has_tst = _tindx in blocks_tst
+        if not (has_drv or has_tst):
+            print(f"  tindx={_tindx}: not in either slug file — skipping")
+            continue
 
-plt.tight_layout()
-p5_path = output_root / "driver_pressure_subplots.png"
-fig5.savefig(p5_path, dpi=150)
-plt.close(fig5)
-print(f"Saved: {p5_path}")
+        _t_ms = tindx_to_t_ms.get(_tindx)
+        _t_label = f"t = {_t_ms:.3f} ms" if _t_ms is not None else "t = ?"
+        _delta = _tindx - _burst_tindx_area
+        if _delta == 0:
+            _rel = "burst"
+        elif _delta > 0:
+            _rel = f"burst + {_delta}"
+        else:
+            _rel = f"burst − {-_delta}"
+
+        fig_a, ax_a = plt.subplots(figsize=(10, 4))
+        fig_a.suptitle(
+            f"Gas-path area profile — tindx={_tindx} ({_rel})   [{_t_label}]",
+            fontsize=11,
+        )
+
+        if has_drv:
+            _ad = blocks_drv[_tindx]
+            ax_a.plot(_ad[:, 0], _ad[:, 1] * 1e4, lw=1.0, color="crimson",
+                      marker=".", ms=2, label="driver slug (slug-0001)")
+        if has_tst:
+            _at = blocks_tst[_tindx]
+            ax_a.plot(_at[:, 0], _at[:, 1] * 1e4, lw=1.0, color="seagreen",
+                      marker=".", ms=2, label="test-gas slug (slug-0002)")
+
+        # Primary-diaphragm marker — fixed reference between the two slugs.
+        ax_a.axvline(0.0, color="orange", ls="--", lw=0.8, alpha=0.6,
+                     label="primary diaphragm (x = 0)")
+
+        ax_a.set_xlim(_x_lo - _x_pad, _x_hi + _x_pad)
+        ax_a.set_ylim(0.0, _area_cm2_hi)
+        ax_a.set_xlabel("x  (m)")
+        ax_a.set_ylabel("Cross-sectional area  (cm²)")
+        ax_a.grid(True, lw=0.4, alpha=0.5)
+        ax_a.legend(fontsize=8, loc="upper right")
+        plt.tight_layout()
+        _out = area_dir / f"area_profile_tindx_{_tindx:04d}.png"
+        fig_a.savefig(_out, dpi=150)
+        plt.close(fig_a)
+
+    print(f"[Area profiles] saved to {area_dir}/")
+
 
 print()
 print("All outputs in: src/L1d_Outputs/DEAP_0/")

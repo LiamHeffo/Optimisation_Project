@@ -35,3 +35,14 @@ __pycache__/
 
 # LibreOffice lock files
 .~lock.*
+
+# L1d4 runtime simulation outputs.  The whole src/L1d_Outputs/ tree is
+# regenerated per run (per-individual .data/.png/.json/.txt traces, the
+# init_arnold.npz seed dump, and the generated DEAP_<n>/DEAP_<n>.py input
+# decks).  Ignore the entire tree EXCEPT the three hand-written helper
+# scripts that live at its top level — those are real source, the buried
+# DEAP_<n>.py decks are not.
+src/L1d_Outputs/**
+!src/L1d_Outputs/replot_l1d_outputs.py
+!src/L1d_Outputs/test_plotting.py
+!src/L1d_Outputs/x2_condition1.py

@@ -170,8 +170,9 @@ def evaluate(x):
             fit = ClosestValidPenalty.wrapper(x)
         return fit, g, None
 
-    if x.sim_type == "CHT_AL":
-        # AL path: delta_vs becomes the constraint; objectives are 2-D.
+    if x.sim_type in ("CHT_AL", "ArnoldCHT_AL"):
+        # AL family (Chocat or Arnold covariance): delta_vs becomes the
+        # AL constraint; objectives are 2-D (hold_time, impact).
         if not is_feasible(g):
             return None, g, None
         t_hold, impact, delta_vs = _evaluate_l1d(x, ind_number, x.bounds)

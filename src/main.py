@@ -57,7 +57,10 @@ from deap import base, creator, tools
 
 from algorithm.toolbox   import Toolbox
 from algorithm.hypervolume import HyperVolume
-from algorithm.cmaes     import StrategyMultiObjective
+from algorithm.cmaes     import (
+    StrategyMultiObjective,
+    is_al_active, is_cht_active, cht_method,
+)
 from problem.config      import (
     APPROX_IDEAL, APPROX_NADIR,
     APPROX_IDEAL_2D, APPROX_NADIR_2D,
@@ -75,6 +78,7 @@ from problem.evaluate    import evaluate, set_logbook
 # delta_vs1 against the same value the evaluator uses on failure.
 from problem.evaluate    import _PITOT3_FAILURE_SENTINEL
 from problem.feasibility import evaluate_constraints, is_feasible
+from problem            import l1d_job
 from plotting            import (
     plot_objective_space,
     plot_objective_space_3d,
@@ -90,7 +94,22 @@ from cht_diagnostics     import drain_and_persist as _cht_drain_and_persist
 from cht_diagnostics     import drain_and_persist_al as _al_drain_and_persist
 from cht_diagnostics     import plot_cht_diagnostics as _cht_plot
 from cht_diagnostics     import write_diversity_metrics as _write_diversity_metrics
+from arnold_diagnostics  import drain_and_persist as _arnold_drain_and_persist
+from arnold_diagnostics  import plot_all as _arnold_plot_all
 from utils               import parallelization_setup
+
+
+def _quiet_l1d_worker():
+    """Pool initializer: silence L1d streaming in every worker process.
+
+    Mirrors init_population_l1d._init_worker.  With λ workers evaluating in
+    parallel, letting each l1d4 subprocess inherit the parent's stdout would
+    interleave their per-step progress into unreadable noise, so we route it
+    to spooled tempfiles instead (see STREAM_L1D_OUTPUT in problem/l1d_job.py).
+    Must be a module-level function so multiprocessing can pickle it.
+    """
+    l1d_job.STREAM_L1D_OUTPUT = False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DEAP type registration  (runs once on import)
@@ -122,7 +141,7 @@ toolbox.register("evaluate", evaluate)
 
 # Reference point for HV computation: the all-zeros point in normalised
 # space.  Instantiated as 3-D for legacy sim_types; main() rebinds the
-# name to a 2-D HyperVolume when sim_type == 'CHT_AL'.
+# name to a 2-D HyperVolume when is_al_active(sim_type).
 pop_hypervolumes = HyperVolume(np.array((0, 0, 0)))
 
 normalised = True
@@ -153,6 +172,9 @@ OUTPUT_FOLDERS = [
     # CHT diagnostics (CSVs + per-SAVE_INTERVAL summary plots).  Created
     # for every run; only populated when sim_type == 'CovarianceCHT'.
     "cht_diagnostics",
+    # Arnold CHT diagnostics (per-gen CSVs + four end-of-run figures).
+    # Created for every run; only populated when cht_method == 'arnold'.
+    "arnold_diagnostics",
     # Per-generation strategy state (σ and psucc per parent slot).
     # Populated for ALL sim_types so the σ death-spiral hypothesis
     # can be verified independently of constraint-handling choice.
@@ -171,6 +193,7 @@ OUTPUT_FOLDERS_AL = [
     "convergence",
     "summary",
     "cht_diagnostics",
+    "arnold_diagnostics",
     "strategy_diagnostics",
     "al_diagnostics",
 ]
@@ -189,7 +212,9 @@ def _run_constants(sim_type):
         in the summary writer; they match the dimensionality of the
         selected Individual_cls.
     """
-    if sim_type == 'CHT_AL':
+    if is_al_active(sim_type):
+        # Both CHT_AL and ArnoldCHT_AL use the 2-objective (hold_time,
+        # impact) tree with delta_vs1 handled by the Augmented Lagrangian.
         return (
             RESULTS_CATEGORY_AL, RUN_PREFIX_AL, OUTPUT_FOLDERS_AL,
             creator.Individual2D,
@@ -296,6 +321,25 @@ def _cheap_al_proxy(strategy):
         "F_proxy_abs_max":    float(np.max(np.abs(F_arr))),
     }
     return float(np.mean(F_arr)), np.mean(g_arr, axis=0), stats
+
+
+def _store_raw_delta_vs1(ind, g_al):
+    """Cache the schedule-independent delta_vs1 measurement on ``ind``.
+
+    ``g_al`` is ``[delta_vs1 - al_tol]`` computed at evaluation with the
+    individual's birth-generation ``al_tol``, so the underlying physics
+    measurement is ``delta_vs1 = g_al[0] + ind.al_tol``.  Caching it lets
+    ``strategy.refresh_al_constraints`` recompute ``g_al`` against a moving
+    ``al_tol`` schedule each generation without re-running L1d (Task 2).
+
+    Set to ``None`` when there is no measurement (box/phys-infeasible
+    individual — ``g_al is None``) so the refresh skips it cleanly.
+    """
+    if g_al is None:
+        ind._raw_delta_vs1 = None
+        return
+    ind._raw_delta_vs1 = float(np.asarray(g_al)[0]) + getattr(ind, "al_tol", 100.0)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Snapshot helpers
@@ -745,7 +789,16 @@ def _append_strategy_per_gen_row(out_dir, gen, strategy):
 # Main evolution loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main(experiment_type):
+def main(experiment_type, seed_population=None):
+    """Run one experiment.
+
+    seed_population : array-like (n, 6) or None
+        If given, rows are used as the initial population in NORMALISED
+        [1, 2]^6 space (e.g. ``x_norm`` from init_population_l1d.py).  When
+        there are at least MU rows the first MU are used; fewer are padded
+        with random feasible individuals.  None ⇒ the legacy random
+        uniform initialisation.
+    """
     s1 = time.time()
 
     # ── Experiment parameters ─────────────────────────────────────────────
@@ -757,7 +810,7 @@ def main(experiment_type):
     p4_treatment = experiment_type[3]
     step_size   = experiment_type[2]
     # AL constraint tolerance (m/s on delta_vs1).  Only consumed when
-    # sim_type == 'CHT_AL'; legacy sim_types ignore it.  Default 100 m/s
+    # is_al_active(sim_type); legacy sim_types ignore it.  Default 100 m/s
     # per the user-confirmed setting.  experiment_type may be a 4-tuple
     # for legacy YAML entries; fall back to the default in that case.
     al_tol = experiment_type[4] if len(experiment_type) > 4 else 100.0
@@ -770,13 +823,21 @@ def main(experiment_type):
     # default off so omitting the field reproduces baseline behaviour.
     # See the YAML header for the full schema.
     features = experiment_type[6] if len(experiment_type) > 6 else {}
+    # Arnold & Hansen 2012 coefficients (ArnoldCHT / ArnoldCHT_AL only).
+    # None ⇒ let the strategy fall back to the paper defaults
+    # (β = 0.1/(n+2), c_c = 1/(n+2)).  Ignored by non-Arnold sim_types.
+    arnold_beta = experiment_type[7] if len(experiment_type) > 7 else None
+    arnold_cc   = experiment_type[8] if len(experiment_type) > 8 else None
 
     print(f"Step Size = {step_size}")
     print(f'Pop Size = {pop_size}\n')
-    if sim_type == 'CHT_AL':
+    if is_al_active(sim_type):
         print(f'AL tolerance (delta_vs1 ≤): {al_tol} m/s')
-    if sim_type in ('CovarianceCHT', 'CHT_AL'):
+    if cht_method(sim_type) == 'chocat':
         print(f'cht_gamma = {cht_gamma if cht_gamma is not None else "default (0.5/(n+2))"}')
+    if cht_method(sim_type) == 'arnold':
+        print(f'arnold_beta = {arnold_beta if arnold_beta is not None else "default (0.1/(n+2))"}, '
+              f'arnold_cc = {arnold_cc if arnold_cc is not None else "default (1/(n+2))"}')
     if features:
         active_features = [k for k, v in features.items() if v not in (None, False, 0)]
         if active_features:
@@ -817,7 +878,7 @@ def main(experiment_type):
     #                                   rewards both convergence toward
     #                                   ideal AND front spread.  This is
     #                                   the headline convergence metric.
-    n_obj = 2 if sim_type == 'CHT_AL' else 3
+    n_obj = 2 if is_al_active(sim_type) else 3
     pop_hypervolumes       = HyperVolume(np.zeros(n_obj))
     pop_hypervolumes_nadir = HyperVolume(np.ones(n_obj))
 
@@ -884,8 +945,27 @@ def main(experiment_type):
         ]
 
     i = 0
-    init_pop_untransformed = pop_init(MU)
-    init_pop_transformed   = variable_transformation(init_pop_untransformed, bounds)
+    if seed_population is not None:
+        # Seeded start: rows are already in normalised [1, 2]^6 space, so
+        # they are NOT re-transformed.  Use the first MU; if too few were
+        # supplied, pad with random feasible individuals so the per-parent
+        # state arrays still have length MU.
+        seed = [list(map(float, row))
+                for row in np.asarray(seed_population, dtype=float)]
+        if len(seed) >= MU:
+            init_pop_transformed = seed[:MU]
+            if len(seed) > MU:
+                print(f"Seed population has {len(seed)} individuals; using the "
+                      f"first {MU} to match pop_size.")
+        else:
+            pad = variable_transformation(pop_init(MU - len(seed)), bounds)
+            init_pop_transformed = seed + list(pad)
+            print(f"Seed population has {len(seed)} individuals (< MU={MU}); "
+                  f"padded with {MU - len(seed)} random feasible individuals.")
+        print(f"Seeded initial population from provided individuals (MU={MU}).")
+    else:
+        init_pop_untransformed = pop_init(MU)
+        init_pop_transformed   = variable_transformation(init_pop_untransformed, bounds)
 
     # The strategy assumes every parent it starts with is feasible — Pareto
     # selection later relies on every parent having a valid fitness, and
@@ -930,32 +1010,49 @@ def main(experiment_type):
 
     parallelization_setup(population)
 
+    # Silence L1d subprocess streaming for the whole run.  The initial
+    # population is evaluated serially here in the PARENT (before the Pool
+    # exists), so the flag must be set in the parent too — not just in the
+    # Pool initializer.  On Linux's default fork start-method the workers
+    # spawned below also inherit this False; the explicit initializer makes
+    # it robust under spawn as well.
+    l1d_job.STREAM_L1D_OUTPUT = False
+
     for ind in population:
         ind.sim_type   = sim_type
         ind.normalised = normalised
         fit, g, g_al = toolbox.evaluate(ind)
         ind._g = g
         ind._g_al = g_al
+        _store_raw_delta_vs1(ind, g_al)   # Task 2: cache delta_vs1 for refresh
         ind._feasible = fit is not None
         if ind._feasible:
             ind.fitness.values = fit
         # Detect PITOT3 / SPARK sentinels for downstream filters.
         # Only meaningful in CHT_AL mode (legacy modes route failures
         # through a different sentinel-recovery path).
-        if sim_type == 'CHT_AL':
+        if is_al_active(sim_type):
             _detect_sentinels(ind, fit, g_al)
         else:
             ind._pitot3_sentinel = False
             ind._spark_sentinel = False
 
     # ── Strategy and multiprocessing setup ────────────────────────────────
+    # n_constraints is the length of the box+physical constraint vector;
+    # the Arnold modes need it to size one v_j accumulator per constraint
+    # per parent.  Compute once from a feasible seed (every initial
+    # individual is feasible by construction here).
+    n_constraints = len(evaluate_constraints(initial_population[0], bounds))
     strategy = StrategyMultiObjective(
         population, sigma=step_size,
         mu=MU, lambda_=LAMBDA,
         sim_type=sim_type, p4_treatment=p4_treatment,
         bounds=bounds,
-        al_tol=al_tol,                # consumed only when sim_type=='CHT_AL'
-        cht_gamma=cht_gamma,          # None ⇒ strategy default (0.5/(n+2))
+        al_tol=al_tol,                # consumed only when AL family
+        cht_gamma=cht_gamma,          # None ⇒ strategy default (0.5/(n+2)); Chocat only
+        arnold_beta=arnold_beta,      # None ⇒ paper default 0.1/(n+2); Arnold only
+        arnold_cc=arnold_cc,          # None ⇒ paper default 1/(n+2); Arnold only
+        n_constraints=n_constraints,  # required by the Arnold modes
         features=features,            # anti-degeneration toggles (see YAML header)
         logbook=toolbox.logbook,      # injected — no global access inside cmaes.py
     )
@@ -971,7 +1068,7 @@ def main(experiment_type):
     # encoded as fitness ≈ (1, 1)) from the bootstrap sample.  Their
     # g_al is a sentinel-implied value (PITOT3 → +3400 m/s) that
     # inflates iqr(G) and biases the initial μ_AL too small.
-    if sim_type == 'CHT_AL':
+    if is_al_active(sim_type):
         F_pop, G_AL = [], []
         for ind in population:
             if not ind._feasible:
@@ -1001,7 +1098,8 @@ def main(experiment_type):
     # small enough that any single worker's heap stays bounded.  At
     # pop_size=12, each worker handles ~4 generations before being
     # recycled.
-    pool = multiprocessing.Pool(maxtasksperchild=50)
+    pool = multiprocessing.Pool(maxtasksperchild=50,
+                                initializer=_quiet_l1d_worker)
     toolbox.register("map", pool.map)
 
     # ── Snapshot bookkeeping ──────────────────────────────────────────────
@@ -1072,10 +1170,10 @@ def main(experiment_type):
         # ._g and ._feasible so the post-eval loop and update()'s
         # post-resample CHT can both consume them.
         #
-        # In CHT_AL the resample only operates on box+physical g (the
+        # In the AL modes the CHT only operates on box+physical g (the
         # 18-element vector); delta_vs1 is handled separately by the AL
         # in selection, not via CHT shrinkage.
-        if sim_type in ('CovarianceCHT', 'CHT_AL'):
+        if is_cht_active(sim_type):
             # Feature C1 (cht_resample_tol): permit slight constraint
             # violations during the CHT-resample loop.  Offspring with
             # max(g) ≤ tol pass through without invoking another CHT
@@ -1092,11 +1190,23 @@ def main(experiment_type):
             def _check(ind):
                 g = evaluate_constraints(ind, bounds)
                 return is_feasible(g, tol=resample_tol), g
-            n_iter = strategy.resample_infeasibles(
-                population, feasibility_check=_check, max_iterations=5,
-            )
-            print(f"resample iterations this gen = {n_iter}")
-            toolbox.logbook.bookshelf['resample_iterations'][gen] = n_iter
+
+            if cht_method(sim_type) == 'chocat':
+                n_iter = strategy.resample_infeasibles(
+                    population, feasibility_check=_check, max_iterations=5,
+                )
+                print(f"resample iterations this gen = {n_iter}")
+                toolbox.logbook.bookshelf['resample_iterations'][gen] = n_iter
+            else:
+                # Arnold (ArnoldCHT / ArnoldCHT_AL): one-shot per parent.
+                # Infeasibles are consumed via Eq. 6 + Eq. 7 BEFORE
+                # evaluation and marked _feasible=False so evaluate()
+                # short-circuits them (fit=None) and selection drops them.
+                # No resample loop — the slot contributes no candidate.
+                strategy.apply_arnold_infeasibility(
+                    population, feasibility_check=_check,
+                )
+                toolbox.logbook.bookshelf['resample_iterations'][gen] = 0
 
         # Retry logic for transient evaluation failures
         try:
@@ -1118,6 +1228,7 @@ def main(experiment_type):
             fit, g, g_al = result
             ind._g = g
             ind._g_al = g_al
+            _store_raw_delta_vs1(ind, g_al)   # Task 2: cache delta_vs1 for refresh
 
             if fit is None:
                 # Skipped by feasibility short-circuit.  Leave fitness
@@ -1136,7 +1247,7 @@ def main(experiment_type):
             # be real even when delta_vs1 is the PITOT3 sentinel (SPARK
             # succeeded, PITOT3 failed) — detecting this case requires
             # checking g_al + al_tol, not fit alone.
-            if sim_type == 'CHT_AL':
+            if is_al_active(sim_type):
                 _detect_sentinels(ind, fit, g_al)
             else:
                 ind._pitot3_sentinel = False
@@ -1148,7 +1259,7 @@ def main(experiment_type):
             # check rather than indexing a 2-tuple at slot [0] which would
             # be hold_time, not delta_vs1.
             normalised_shock_speed = (
-                fit[0] if sim_type != 'CHT_AL' else None
+                fit[0] if not is_al_active(sim_type) else None
             )
 
             if normalised_shock_speed == 1.0:
@@ -1220,6 +1331,16 @@ def main(experiment_type):
             sigmas_per_slot, parent_idx_per_slot, bounds,
         )
 
+        # Task 2: refresh AL constraints against the CURRENT scheduled
+        # al_tol before selection.  Offspring were just evaluated at
+        # current_al_tol (no-op here), but surviving parents were evaluated
+        # in earlier, wider-tol generations — recompute their g_al from the
+        # fixed raw delta_vs1 so the AL penalty (inside update()'s
+        # selection) and the proxy mean see a consistent, current
+        # constraint.  Kills the stale-ε / frozen-parent-residual artifact.
+        if is_al_active(sim_type):
+            strategy.refresh_al_constraints(population)
+
         toolbox.update(population)
 
         # Persist post-update strategy state (σ, psucc, lineage per slot)
@@ -1243,7 +1364,7 @@ def main(experiment_type):
         # decides it is fully initialised (sign_average balanced, see the
         # _initialized array) — pycma short-circuits idempotently once
         # the initial-conditions are met, so the cost is negligible.
-        if sim_type == 'CHT_AL':
+        if is_al_active(sim_type):
             F_proxy, g_al_proxy, proxy_stats = _cheap_al_proxy(strategy)
             if F_proxy is not None:
                 # Refine bootstrap on additional g_al samples whilst not
@@ -1273,7 +1394,7 @@ def main(experiment_type):
         # the buffer.  drain_and_persist clears the buffer in place, so
         # next generation starts clean.  Cheap when sim_type isn't
         # CovarianceCHT or CHT_AL (buffer is always empty).
-        if sim_type in ('CovarianceCHT', 'CHT_AL'):
+        if cht_method(sim_type) == 'chocat':
             _cht_drain_and_persist(
                 strategy,
                 gen=bookshelf_gen,
@@ -1283,10 +1404,25 @@ def main(experiment_type):
                 n_lambda=LAMBDA,
             )
 
+        # Drain Arnold CHT diagnostics for this generation.  Mirrors the
+        # Chocat block but writes arnold_per_*.csv.  n_infeasible = the
+        # offspring that produced no selection candidate this gen (Arnold
+        # drops infeasibles rather than resampling them).  Figures are NOT
+        # drawn here — only the CSVs are appended every gen; the four
+        # figures are generated once at end-of-run (see plot_all below).
+        elif cht_method(sim_type) == 'arnold':
+            _arnold_drain_and_persist(
+                strategy,
+                gen=bookshelf_gen,
+                out_dir=folders["arnold_diagnostics"],
+                n_infeasible=(LAMBDA - n_feasible),
+                n_lambda=LAMBDA,
+            )
+
         # Drain AL diagnostics (one row per generation) — only writes
-        # anything when sim_type == 'CHT_AL'; for other sim_types the
+        # anything when is_al_active(sim_type); for other sim_types the
         # buffer is empty and this is a no-op write of zero rows.
-        if sim_type == 'CHT_AL':
+        if is_al_active(sim_type):
             _al_drain_and_persist(
                 strategy,
                 gen=bookshelf_gen,
@@ -1318,7 +1454,7 @@ def main(experiment_type):
         # us compare runs on equal footing.  Excludes both PITOT3-only
         # and SPARK sentinels — for the cross-run HV comparison we want
         # only individuals whose entire heavy-eval succeeded.
-        if sim_type == 'CHT_AL':
+        if is_al_active(sim_type):
             non_sent_fits = np.array([
                 ind.fitness.values for ind in strategy.parents
                 if ind.fitness.valid and not _is_sentinel(ind)
@@ -1374,12 +1510,23 @@ def main(experiment_type):
     # parent set and the external archive.  Dumped to a human-readable
     # txt file alongside convergence_data.txt.  Only meaningful for
     # 2-objective sim_types (CHT_AL); the writer no-ops for 3-obj runs.
-    if sim_type == 'CHT_AL':
+    if is_al_active(sim_type):
         _write_diversity_metrics(
             out_path=summary_dir / "diversity_metrics.txt",
             final_parents=strategy.parents,
             archive=getattr(strategy, "external_archive", []),
         )
+
+    # ── D3: Arnold diagnostic figures (once, at end of run) ───────────────
+    # The arnold_per_*.csv files have been appended every generation by the
+    # drain block.  Here we read them back and emit the four standalone
+    # figures exactly once — the violation heatmap, infeasibility rate,
+    # mean ‖v_j‖ per active constraint, and κ(C) by lineage.  Each is its
+    # own PNG in folders["arnold_diagnostics"].
+    if cht_method(sim_type) == 'arnold':
+        figs = _arnold_plot_all(folders["arnold_diagnostics"])
+        print(f"Arnold diagnostics: wrote {len(figs)} figure(s) to "
+              f"{folders['arnold_diagnostics']}")
 
     # ── Convergence data ──────────────────────────────────────────────────
     convergence_dir = folders["convergence"]
@@ -1407,7 +1554,7 @@ def main(experiment_type):
             )
 
         # Diag-4: non-sentinel HV trace (only meaningful for CHT_AL).
-        if sim_type == 'CHT_AL':
+        if is_al_active(sim_type):
             file.write("\nHypervolume (non-sentinel parents) per generation:\n")
             for gen in range(NGEN):
                 file.write(
@@ -1484,11 +1631,11 @@ def main(experiment_type):
     # is a constraint, not an objective) — so the header omits it.
     objectives_header = (
         "Driver Hold Time (ms) | Piston Impact Speed (m/s)"
-        if sim_type == 'CHT_AL'
+        if is_al_active(sim_type)
         else "Residual of Shock Speed (m/s) | Driver Hold Time (ms) | Piston Impact Speed (m/s)"
     )
     # ms-conversion column index (hold_time): index 1 in 3-D, index 0 in 2-D.
-    holdtime_col_idx = 0 if sim_type == 'CHT_AL' else 1
+    holdtime_col_idx = 0 if is_al_active(sim_type) else 1
 
     sig_figs = 6
 
@@ -1586,15 +1733,14 @@ if __name__ == "__main__":
     with open(_config_path) as _f:
         _config = yaml.safe_load(_f)
 
-    # 7-tuple: (sim_type, pop_size, step_size, p4_treatment, al_tol,
-    #           cht_gamma, features_dict).
-    # ``al_tol``    : (CHT_AL only) constraint tolerance ε (m/s).
-    # ``cht_gamma`` : (CovarianceCHT / CHT_AL) shrinkage strength; None means
-    #                 "use the strategy's dimension-dependent default".
-    # ``features``  : dict of optional anti-degeneration feature toggles
-    #                 (eigenvalue floor, lam floor, etc.).  See the YAML
-    #                 header comment for the full menu.  Empty dict =
-    #                 baseline behaviour (no features enabled).
+    # 9-tuple: (sim_type, pop_size, step_size, p4_treatment, al_tol,
+    #           cht_gamma, features_dict, arnold_beta, arnold_cc).
+    # ``al_tol``      : (AL family) constraint tolerance ε (m/s).
+    # ``cht_gamma``   : (Chocat family) shrinkage strength; None ⇒ default.
+    # ``features``    : dict of optional anti-degeneration toggles.  See the
+    #                   YAML header comment.  Empty dict = baseline.
+    # ``arnold_beta`` / ``arnold_cc`` : (Arnold family) Eq. 7 / Eq. 6
+    #                   coefficients; None ⇒ paper defaults.
     experiment_types = [
         (
             exp["sim_type"],
@@ -1604,9 +1750,28 @@ if __name__ == "__main__":
             exp.get("al_tol", 100.0),
             exp.get("cht_gamma", None),
             exp.get("features", {}) or {},
+            exp.get("arnold_beta", None),
+            exp.get("arnold_cc", None),
         )
         for exp in _config["experiments"]
     ]
+
+    # Optional seed population: a .npz from init_population_l1d.py.  Its
+    # ``x_norm`` array (normalised [1,2]^6 designs) replaces the random
+    # initial population.  Threaded through the worker subprocess via the
+    # same flag so dispatcher and worker stay in lockstep.
+    def _load_seed_npz(path):
+        with np.load(path) as data:
+            if "x_norm" not in data:
+                raise KeyError(
+                    f"{path} has no 'x_norm' array — expected an "
+                    f"init_population_l1d.py output (.npz)."
+                )
+            return np.asarray(data["x_norm"], dtype=float)
+
+    _seed_npz = None
+    if "--seed-npz" in sys.argv:
+        _seed_npz = sys.argv[sys.argv.index("--seed-npz") + 1]
 
     if "--experiment-index" in sys.argv:
         # ── Worker mode ───────────────────────────────────────────────────
@@ -1614,7 +1779,8 @@ if __name__ == "__main__":
         # subprocess.  We execute exactly one experiment and then exit,
         # letting the OS reclaim every byte of RAM the run accumulated.
         idx = int(sys.argv[sys.argv.index("--experiment-index") + 1])
-        solutions = main(experiment_types[idx])
+        _seed_pop = _load_seed_npz(_seed_npz) if _seed_npz else None
+        solutions = main(experiment_types[idx], seed_population=_seed_pop)
 
     else:
         # ── Dispatcher mode ───────────────────────────────────────────────
@@ -1635,8 +1801,13 @@ if __name__ == "__main__":
             print(f"\n{'=' * 60}")
             print(f"Experiment {i + 1} / {len(experiment_types)}: {experiment_type}")
             print(f"{'=' * 60}\n")
+            _cmd = [sys.executable, str(_script), "--experiment-index", str(i)]
+            if _seed_npz:
+                # Forward the seed so every worker starts from the same
+                # init_population_l1d.py population.
+                _cmd += ["--seed-npz", _seed_npz]
             result = subprocess.run(
-                [sys.executable, str(_script), "--experiment-index", str(i)],
+                _cmd,
                 check=False,           # don't raise — report and continue
             )
             if result.returncode != 0:

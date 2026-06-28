@@ -143,6 +143,37 @@
 #                        directly promotes objective-space diversity.
 
 experiments:
+  # ════════════════════════════════════════════════════════════════════════
+  # ACTIVE: ArnoldCHT_AL seeded from the L1d init population.
+  #   • sim_type ArnoldCHT_AL  — Arnold & Hansen 2012 covariance update
+  #                              (per-parent v_j, Eq. 6/7) + Augmented
+  #                              Lagrangian on delta_vs1 (2-objective
+  #                              hold_time / impact problem).
+  #   • HV indicator           — default selection (no `selection: crowding`).
+  #   • al_tol_schedule        — the ε schedule [4900 → 100 over gens
+  #                              100..250].
+  #   • arnold_beta / arnold_cc omitted ⇒ paper defaults 0.1/(n+2), 1/(n+2).
+  # Seed with:  python3 src/init_population_l1d.py --pop-size 24 ... \
+  #                 --launch-cmaes
+  # (the seed pop_size must match this block's pop_size — see --seed-npz).
+  #
+  # TWO IDENTICAL REPLICATES: the `&arnold` anchor defines the config once
+  # and `*arnold` repeats it, so `python3 src/main.py --seed-npz <npz>`
+  # (dispatcher mode) runs both back-to-back in fresh subprocesses — same
+  # seed population + hyperparameters, differing only by CMA-ES RNG draws.
+  # Delete the `*arnold` line to run a single simulation.
+  # ════════════════════════════════════════════════════════════════════════
+  - &arnold
+    sim_type: ArnoldCHT_AL
+    pop_size: 24
+    step_size: 0.1
+    p4_treatment: null
+    al_tol: 4900
+    features:
+      psucc_sentinel_as_failure: true
+      al_tol_schedule: [4900, 100.0, 100, 250]
+  - *arnold
+
   # ────────────────────────────────────────────────────────────────────────
   # Anti-degeneration feature sweep — each entry enables exactly ONE
   # feature against the same baseline (pop=12, step=0.05, cht_gamma=0.0125,
@@ -225,31 +256,86 @@ experiments:
   # more offspring → more sentinel events per gen but also more
   # information per gen.  pop scaling probes the small-population
   # hypothesis as a separate cause of front clustering.
-  - sim_type: CHT_AL
-    pop_size: 24
-    step_size: 0.1
-    p4_treatment: null
-    al_tol: 1500.0
-    cht_gamma: 0.0125
-    features:
-      psucc_sentinel_as_failure: true
-      al_tol_schedule: [1500.0, 100.0, 100, 450]
+  # - sim_type: CHT_AL          # (disabled for the seeded ArnoldCHT_AL run)
+  #   pop_size: 24
+  #   step_size: 0.1
+  #   p4_treatment: null
+  #   al_tol: 1500.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     psucc_sentinel_as_failure: true
+  #     al_tol_schedule: [2000.0, 100.0, 100, 250]
 
-  # T5 — T3 with pop=24.  The full stack: psucc-as-failure + delayed ε
+  # T5 — T3 with pop=36.  The full stack: psucc-as-failure + delayed ε
   # tightening + γ-decay + doubled population.  Expected to be the
   # highest-budget run of the set and the strongest test of whether
   # the combined mechanisms can produce a well-spread Pareto front
   # without the κ inflation or σ collapse pathologies.
-  - sim_type: CHT_AL
-    pop_size: 24
-    step_size: 0.1
-    p4_treatment: null
-    al_tol: 1500.0
-    cht_gamma: 0.0125
-    features:
-      psucc_sentinel_as_failure: true
-      al_tol_schedule:    [1500.0,  100.0, 100, 450]
-      cht_gamma_schedule: [0.0125,  0.0,   100, 450]
+  # - sim_type: CHT_AL          # (disabled for the seeded ArnoldCHT_AL run)
+  #   pop_size: 36
+  #   step_size: 0.1
+  #   p4_treatment: null
+  #   al_tol: 1500.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     psucc_sentinel_as_failure: true
+  #     al_tol_schedule:    [2000.0,  100.0, 100, 250]
+  #     cht_gamma_schedule: [0.0125,  0.0,   100, 250]
+
+  # - sim_type: CHT_AL          # (disabled for the seeded ArnoldCHT_AL run)
+  #   pop_size: 36
+  #   step_size: 0.1
+  #   p4_treatment: null
+  #   al_tol: 1500.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     psucc_sentinel_as_failure: true
+  #     al_tol_schedule:    [2000.0,  100.0, 100, 250]
+  #     cht_gamma_schedule: [0.0125,  0.0,   100, 250]
+
+  # - sim_type: CHT_AL          # (disabled for the seeded ArnoldCHT_AL run)
+  #   pop_size: 36
+  #   step_size: 0.1
+  #   p4_treatment: null
+  #   al_tol: 1500.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     psucc_sentinel_as_failure: true
+  #     al_tol_schedule:    [2000.0,  100.0, 100, 250]
+  #     cht_gamma_schedule: [0.0125,  0.0,   100, 250]
+
+  # - sim_type: CHT_AL          # (disabled for the seeded ArnoldCHT_AL run)
+  #   pop_size: 36
+  #   step_size: 0.1
+  #   p4_treatment: null
+  #   al_tol: 1500.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     psucc_sentinel_as_failure: true
+  #     al_tol_schedule:    [2000.0,  100.0, 100, 250]
+  #     cht_gamma_schedule: [0.0125,  0.0,   100, 250]
+
+  # - sim_type: CHT_AL          # (disabled for the seeded ArnoldCHT_AL run)
+  #   pop_size: 36
+  #   step_size: 0.1
+  #   p4_treatment: null
+  #   al_tol: 1500.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     psucc_sentinel_as_failure: true
+  #     al_tol_schedule:    [2000.0,  100.0, 100, 250]
+  #     cht_gamma_schedule: [0.0125,  0.0,   100, 250]
+
+  # - sim_type: CHT_AL          # (disabled for the seeded ArnoldCHT_AL run)
+  #   pop_size: 36
+  #   step_size: 0.1
+  #   p4_treatment: null
+  #   al_tol: 1500.0
+  #   cht_gamma: 0.0125
+  #   features:
+  #     psucc_sentinel_as_failure: true
+  #     al_tol_schedule:    [2000.0,  100.0, 100, 250]
+  #     cht_gamma_schedule: [0.0125,  0.0,   100, 250]
 
   # ────────────────────────────────────────────────────────────────────────
   # Previous rerun set (0028-0033) — commented out.  These were the

@@ -24,14 +24,14 @@ Per-individual filesystem layout::
     L1d_Outputs/DEAP_<i>/
     ├── DEAP_<i>.py                  ← the templated job script
     ├── ideal_air.lua                ← symlinked gas models
-    ├── mixed_he_ar.lua
+    ├── he-ar-gas-model.lua
     ├── cea-lut-air.lua
     ├── piston-0000-history.data     ← produced by --piston-history
     └── DEAP_<i>/                    ← L1d's job-name subdirectory
         ├── diaphragm-0000.data
-        ├── history-loc-0000.data    ← primary-diaphragm station
-        ├── history-loc-0001.data    ← shock-tube transducer 1
-        ├── history-loc-0002.data    ← shock-tube transducer 2
+        ├── history-loc-0000.data    ← shock-tube transducer 1 (vs1 ToF)
+        ├── history-loc-0001.data    ← shock-tube transducer 2 (vs1 ToF)
+        ├── history-loc-0002.data    ← driver-side probe (t_hold)
         ├── piston-0000.data
         └── slug-*.data
 """
@@ -41,6 +41,8 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +53,7 @@ from problem.l1d_geometry import (
     LAUNCHER_LARGE_D,
     BUFFER_PLATE_X_NOMINAL,
 )
+from problem.t_hold import compute_t_hold
 
 # Piston half-length: distance from the centre (what L1d tracks) to either face.
 # L1d's x_buffer triggers when piston CENTRE crosses x_buffer, so to stop the
@@ -69,40 +72,79 @@ PISTON_HALF_LENGTH = (PISTON_FRONT_X - LAUNCHER_LARGE_D[0]) / 2   # = 0.1105 m
 # Failure sentinels — must match the values the rest of the pipeline
 # (evaluate.py, main.py _detect_sentinels) expects.
 SENTINEL_OBJECTIVE = (0.0, 350.0)
-SENTINEL_VS_DELTA  = 3500.0
+SENTINEL_VS_DELTA  = 4900.0
 SENTINEL_TUPLE     = (*SENTINEL_OBJECTIVE, SENTINEL_VS_DELTA, False)
 VS1_TARGET         = 4900.0
 
 # Gas-model file names (these match the user's existing prep-gas outputs
 # in the project root).  cea-lut-air.lua is not yet generated; absence
 # raises a clear error rather than silently failing inside l1d4-prep.
-GAS_MODEL_FILES = ("ideal_air.lua", "mixed_he_ar.lua", "cea-lut-air.lua")
+GAS_MODEL_FILES = ("ideal_air.lua", "he-ar-gas-model.lua", "cea-lut-air.lua")
 
 # Per-evaluation budget.  L1d's t_finish is set to 28 ms simulated time;
-# wall-clock varies with mesh.  The 15-min wall budget mirrors the SPARK
+# wall-clock varies with mesh.  The 60-min wall budget mirrors the SPARK
 # path; widen if mesh_scale_factor is raised.
-EVAL_TIMEOUT_S       = 15 * 60
+EVAL_TIMEOUT_S       = 60 * 60
 PREP_TIMEOUT_S       = 2 * 60
 POSTPROCESS_TIMEOUT_S = 60
 
+# ─── Watchdog (early-termination) parameters ──────────────────────────────
+# The --run-simulation step writes piston-0000.data, diaphragm-0000.data
+# and times.data continuously while the sim advances.  A side-channel
+# watchdog re-reads those files every WATCHDOG_POLL_S seconds and SIGTERMs
+# the child early on any of:
+#   (a) FAIL-FAST (reversal): the piston's velocity has changed sign at
+#       least once (it has turned around) without the diaphragm reaching
+#       state==2.  Driver pressure is MAXIMISED at the turnaround -- the
+#       instant v first crosses zero -- because the driver gas is then
+#       most compressed; the piston rebounds afterwards and no later
+#       stroke recovers that pressure (energy only dissipates).  So if
+#       p4 was not beaten at the first turnaround it never will be.
+#       Gated by FAIL_ON_PISTON_REVERSAL.
+#   (b) FAIL-FAST (legacy): the piston has inflected (sign-flipped
+#       velocity) MAX_INFLECTIONS_NO_RUPTURE times without rupture.  This
+#       is the more conservative predecessor of (a); with (a) enabled it
+#       is subsumed (1 reversal fires before 3 inflections) and acts only
+#       as a fallback when FAIL_ON_PISTON_REVERSAL is False.
+#   (c) SUCCESS-AND-DONE: the diaphragm has burst AND simulated time has
+#       advanced GRACE_SIM_TIME_S past t_burst.  t_exit and both shock
+#       arrivals all fall inside that window in practice.
+# All three predicates short-circuit L1d's natural t_finish run, saving
+# wall clock on clearly-doomed and clearly-finished evaluations alike.
+# The outer EVAL_TIMEOUT_S budget remains the hard safety ceiling.
+WATCHDOG_POLL_S            = 60
+FAIL_ON_PISTON_REVERSAL    = True   # gate (a): kill on first v sign change pre-rupture
+MAX_INFLECTIONS_NO_RUPTURE = 3      # gate (b): legacy fallback, see note above
+GRACE_SIM_TIME_S           = 5.0e-3
+WATCHDOG_KILL_GRACE_S      = 5
+
 # Mesh & wall-resolution controls.
-MESH_SCALE_FACTOR    = 2      # per-slug ncells multiplier
+MESH_SCALE_FACTOR    = 4      # per-slug ncells multiplier
 TUBE_N               = 4000   # tube-wall mesh resolution
 
 # Time-stepping constants.
-T_FINISH             = 30.0e-3
-T_SWITCH             = 19.0e-3
+T_FINISH             = 70.0e-3
+T_SWITCH             = 20.0e-3
 
 # Provisional X2-default transducer x-positions (relative to PD at x=0).
-TRANSDUCER_XS = (4.231, 4.746)
+# TRANSDUCER_XS = (4.231, 4.746)
+TRANSDUCER_XS = (1.5, 2.5)
 
-# Keep failed job directories on disk for post-hoc debugging.
+# Keep failed (sentinel) job directories on disk for post-hoc debugging.
 KEEP_FAILED_JOBS     = False
+
+# Keep successful (non-sentinel) job directories on disk.  Lets a
+# high-volume sweep retain only the FEW designs that ruptured while
+# discarding the many no-rupture jobs per-eval — the no-rupture runs go
+# the full t_finish and write the largest files, so they are exactly the
+# ones that must NOT accumulate (see the disk-blowup note for KEEP_ALL_JOBS).
+KEEP_SUCCESSFUL_JOBS = False
 
 # Keep every job directory (successful or failed) on disk.  Useful during
 # bring-up when you want to inspect the L1d outputs after each call.
-# Must be False before kicking off parallel CMA-ES runs — otherwise
-# L1d_Outputs/ grows unbounded (λ workers × hundreds of generations).
+# Must be False before kicking off parallel CMA-ES runs OR the population
+# initialiser — otherwise L1d_Outputs/ grows unbounded (λ workers × many
+# evaluations) and fills the disk mid-run (OSError 28).
 KEEP_ALL_JOBS        = True
 
 # Stream the stdout/stderr of every L1d subprocess directly to the parent
@@ -131,7 +173,7 @@ config.title = "X2 driver opt: individual {ind_number}"
 
 # ─── Gas models ──────────────────────────────────────────────────────────
 gm_ideal_air = add_gas_model("ideal_air.lua")
-gm_he_ar     = add_gas_model("mixed_he_ar.lua")
+gm_he_ar     = add_gas_model("he-ar-gas-model.lua")
 gm_cea_air   = add_gas_model("cea-lut-air.lua")
 
 # Per-individual He/Ar mass fractions derived from percent_He.
@@ -167,7 +209,7 @@ piston = Piston(
 driver_gas = GasSlug(
     gmodel_id=gm_he_ar,
     p={driver_p:.6e}, T=T_amb, vel=0.0, massf=massf_he_ar,
-    ncells={n_drv}, cluster_strength=1.01, to_end_R=True,
+    ncells={n_drv}, cluster_strength=1.1, to_end_R=True,
     viscous_effects=1, hcells=1,
     label="driver gas",
 )
@@ -177,7 +219,7 @@ primary_diaphragm = Diaphragm(x0={pd_x:.4f}, p_burst={p4:.6e}, state=0)
 test_gas = GasSlug(
     gmodel_id=gm_cea_air,
     p={test_gas_p1:.6e}, T=T_amb, vel=0.0,
-    ncells={n_test}, cluster_strength=1.01, to_end_L=True,
+    ncells={n_test}, cluster_strength=1.1, to_end_L=True,
     viscous_effects=0, hcells=1,
     label="test gas",
 )
@@ -188,30 +230,22 @@ assemble_gas_path(left_wall, res_gas, piston, driver_gas,
                   primary_diaphragm, test_gas, right_free)
 
 # ─── Loss regions ───────────────────────────────────────────────────────
-add_loss_region({launcher_loss_x0:.4f}, {launcher_loss_x1:.4f}, 0.1)
+add_loss_region({launcher_loss_x0:.4f}, {launcher_loss_x1:.4f}, 3.1)
 add_loss_region({diaphragm_loss_x0:.6f}, {pd_x:.4f}, 0.7)
 
 # ─── History locations (indices wired in parse_l1d_outputs) ──────────────
 add_history_loc({transducer_x_1:.4f})        # idx 0 — vs1 ToF station 1
 add_history_loc({transducer_x_2:.4f})        # idx 1 — vs1 ToF station 2
-add_history_loc({pd_x:.4f} - 0.01)           # idx 2 — driver, 0.01 m upstream of PD
-add_history_loc({pd_x:.4f} - 0.02)           # idx 3 — driver, 0.02 m upstream of PD
-add_history_loc({pd_x:.4f} - 0.03)           # idx 4 — driver, 0.03 m upstream of PD
-add_history_loc({pd_x:.4f} - 0.04)           # idx 5 — driver, 0.04 m upstream of PD
-add_history_loc({pd_x:.4f} - 0.05)           # idx 6 — driver, 0.05 m upstream of PD
-add_history_loc({pd_x:.4f} - 0.06)           # idx 7 — driver, 0.06 m upstream of PD
-add_history_loc({pd_x:.4f} - 0.07)           # idx 8 — driver, 0.07 m upstream of PD
-add_history_loc({pd_x:.4f} - 0.08)           # idx 9 — driver, 0.08 m upstream of PD
-add_history_loc({pd_x:.4f} - 0.09)           # idx 10 — driver, 0.09 m upstream of PD
-add_history_loc({pd_x:.4f} - 0.10)           # idx 11 — driver, 0.10 m upstream of PD
+add_history_loc({pd_x:.4f} - 0.156)           # idx 2 — driver, 0.0005 m upstream of PD (t_hold probe)
+
 
 # ─── Time stepping ──────────────────────────────────────────────────────
-config.dt_init   = 1.0e-9
+config.dt_init   = 1.0e-10
 config.max_time  = {t_finish:.4e}
 config.max_step  = 25_000_000
 add_cfl_value(0.0, 0.25)
 add_dt_plot(0.0,         2.0e-4, 2.0e-4)
-add_dt_plot({t_switch:.4e}, 5.0e-5, 5.0e-6)
+add_dt_plot({t_switch:.4e}, 1.0e-5, 1.0e-6)
 '''
 
 
@@ -253,7 +287,7 @@ def write_job_script(out_path, params, ind_number):
         piston_xR0=derived["piston_xR0"],
         x_buffer=x_stud_tip - PISTON_HALF_LENGTH,
         pd_x=derived["pd_x"],
-        shock_tube_end_x=4.0,
+        shock_tube_end_x=3.0,
         launcher_loss_x0=launcher_loss_x0,
         launcher_loss_x1=launcher_loss_x1,
         diaphragm_loss_x0=derived["x_outer_buffer"],
@@ -261,9 +295,9 @@ def write_job_script(out_path, params, ind_number):
         transducer_x_2=params["transducer_xs"][1],
         t_finish=T_FINISH,
         t_switch=T_SWITCH,
-        n_res=30 * params["mesh_scale"],
+        n_res=40 * params["mesh_scale"],
         n_drv=60 * params["mesh_scale"],
-        n_test=30 * params["mesh_scale"],
+        n_test=40 * params["mesh_scale"],
         percent_He=params["percent_He"],
         driver_p=params["driver_p"],
         reservoir_p=params["reservoir_p"],
@@ -331,7 +365,13 @@ def parse_l1d_outputs(job_dir, p_burst, transducer_xs, p_band=0.10):
     parent = os.path.dirname(job_dir)
     piston_file = os.path.join(parent, "piston-0000-history.data")
 
-    # 1. Impact speed: first row in piston-history where on_buffer == 1.
+    # 1. Impact speed: piston-history is sampled at dt_history; the buffer
+    #    collision is resolved by L1d's internal sub-stepping between two
+    #    output samples.  The FIRST on_buffer==1 row already shows the
+    #    post-impact (~zero) velocity, not the impact velocity itself.
+    #    The closest proxy for the impact-instant value is the velocity at
+    #    the LAST on_buffer==0 row — i.e. the sample immediately before
+    #    contact_idx.
     try:
         piston = np.loadtxt(piston_file, comments="#")
     except OSError:
@@ -341,11 +381,20 @@ def parse_l1d_outputs(job_dir, p_burst, transducer_xs, p_band=0.10):
     impact_rows = np.where(piston[:, 6] == 1)[0]
     if impact_rows.size == 0:
         return SENTINEL_TUPLE
-    impact_speed = abs(float(piston[impact_rows[0], 3]))
+    contact_idx = int(impact_rows[0])
+    if contact_idx == 0:
+        # Piston was already on the buffer at t=0 — pathological initial
+        # condition, cannot recover an impact speed.
+        return SENTINEL_TUPLE
+    impact_speed = abs(float(piston[contact_idx - 1, 3]))
 
     # 2. t_burst from diaphragm state-flip.  L1d writes diaphragm state
     #    as just (tindx, state); the time is in a separate times.data
     #    file and must be joined by tindx.
+    #
+    #    With L1d's default (instantaneous) diaphragm model the state
+    #    sequence is 0 → 2, never visiting 1.  State 1 only appears in
+    #    finite-rupture-time models.  Match on state==2 (fully ruptured).
     diaphragm_file = os.path.join(job_dir, "diaphragm-0000.data")
     try:
         diaphragm = np.loadtxt(diaphragm_file, comments="#")
@@ -354,7 +403,7 @@ def parse_l1d_outputs(job_dir, p_burst, transducer_xs, p_band=0.10):
         return SENTINEL_TUPLE
     if diaphragm.ndim == 1:
         diaphragm = diaphragm[np.newaxis, :]
-    burst_rows = np.where(diaphragm[:, 1] == 1)[0]
+    burst_rows = np.where(diaphragm[:, 1] == 2)[0]
     if burst_rows.size == 0:
         return SENTINEL_TUPLE
     burst_tindx = int(diaphragm[burst_rows[0], 0])
@@ -362,25 +411,34 @@ def parse_l1d_outputs(job_dir, p_burst, transducer_xs, p_band=0.10):
         return SENTINEL_TUPLE
     t_burst = times_map[burst_tindx]
 
-    # 3. Hold time: pressure trace at PD station (history-loc-0000),
-    #    integrating dt over samples where p ∈ [(1-p_band), (1+p_band)] · p_burst.
+    # 3. Hold time: driver-side pressure trace (history-loc-0002).
+    #    The algorithm itself lives in problem.t_hold.compute_t_hold and
+    #    is shared with the workshop replotter so both stay in sync.
+    #    Two-phase:
+    #       Phase 0  Savitzky-Golay low-pass smoothing
+    #       Phase 1  delayed-start (if trace still settling at burst)
+    #       Phase 2  first-exit from the ±p_band window
+    #    t_hold = 0.0 is a legitimate result (design failed to establish
+    #    a hold) -- we return it directly rather than mapping to the
+    #    sentinel, so CMA-ES sees a continuous fitness landscape.
     try:
-        t_pd, p_pd = _load_history_loc(job_dir, idx=0)
+        t_drv, p_drv = _load_history_loc(job_dir, idx=2)
     except OSError:
         return SENTINEL_TUPLE
-    in_band = (p_pd >= (1.0 - p_band) * p_burst) & (p_pd <= (1.0 + p_band) * p_burst)
-    in_band[t_pd < t_burst] = False
-    if not in_band.any():
-        t_hold = 0.0
-    else:
-        dt = np.diff(t_pd)
-        t_hold = float(np.sum(dt[in_band[:-1]]))
+    if not (t_drv >= t_burst).any():
+        # No post-burst data at all -- sim integrity failure, not a
+        # design failure.  Keep the sentinel here.
+        return SENTINEL_TUPLE
+    t_hold, _t_start, _t_exit = compute_t_hold(
+        t_drv, p_drv, p_burst, t_burst, band_frac=p_band,
+    )
 
-    # 4. vs1: shock arrival times at the two transducer stations.  Use
-    #    a "first-crossing of 2× quiescent fill pressure" detector — the
-    #    quiescent region is the first 50 samples (well before burst).
+    # 4. vs1: shock arrival times at the two shock-tube transducer
+    #    stations (history-loc-0000, 0001).  Use a "first-crossing of
+    #    2× quiescent fill pressure" detector — the quiescent region is
+    #    the first 50 samples (well before burst).
     arrivals = []
-    for hist_idx in (1, 2):
+    for hist_idx in (0, 1):
         try:
             t_s, p_s = _load_history_loc(job_dir, idx=hist_idx)
         except OSError:
@@ -422,6 +480,235 @@ def _stage_gas_models(job_root, source_dir):
         if dst.exists() or dst.is_symlink():
             dst.unlink()
         dst.symlink_to(src.resolve())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live-data predicates + side-channel watchdog
+# ─────────────────────────────────────────────────────────────────────────────
+# The two predicates below are pure file readers — they take only paths to
+# files that L1d is updating live, and return small scalars/flags.  Keeping
+# them side-effect-free makes them straightforward to unit-test against
+# synthetic data without needing a running L1d subprocess.
+
+def _count_piston_inflections(piston_file):
+    """Return the number of velocity sign-flips in the live piston file.
+
+    The file layout is the slug-level live dump:
+        tindx  x  vel  is_restrain  brakes_on  on_buffer
+    (velocity in column index 2 — NOT column 3, which is the layout of
+    piston-0000-history.data produced later by --piston-history).
+
+    Sign flips are counted on the non-zero-velocity subsequence: the
+    initial v=0 sample and the v≈0 post-buffer-impact rest samples
+    would otherwise be counted as their own "sign change" and inflate
+    the inflection count.
+
+    Returns 0 if the file is absent or has fewer than two non-zero
+    samples — i.e. "not enough information yet, don't trigger".
+    """
+    try:
+        arr = np.loadtxt(piston_file, comments="#")
+    except OSError:
+        return 0
+    if arr.ndim == 1:
+        arr = arr[np.newaxis, :]
+    if arr.shape[0] < 2:
+        return 0
+    s = np.sign(arr[:, 2])
+    s = s[s != 0]
+    if s.size < 2:
+        return 0
+    return int(np.count_nonzero(np.diff(s) != 0))
+
+
+def _piston_velocity_reversed(piston_file):
+    """True once the piston velocity has changed sign at least once.
+
+    The piston launches forward (v>0) and the driver gas reaches PEAK
+    pressure at the turnaround -- the instant v first crosses zero to
+    negative -- since the gas is then most compressed.  So a single sign
+    change is the signature that peak compression has come and gone; if
+    the diaphragm has not burst by then it never will (later strokes only
+    dissipate energy).
+
+    Implemented in terms of _count_piston_inflections so the v=0 launch /
+    at-rest filtering (which keeps the initial and post-buffer zeros from
+    being miscounted as a sign change) lives in exactly one place.  The
+    first inflection IS the first reversal, so ``>= 1`` is the test.
+
+    Returns False when the file is absent or has too few non-zero samples
+    -- "not enough information yet, don't trigger".
+    """
+    return _count_piston_inflections(piston_file) >= 1
+
+
+def _diaphragm_burst_time(diaphragm_file, times_file):
+    """Sim time at which the diaphragm first reached state==2, or None.
+
+    Returns None if either file is unreadable, if no state==2 row has
+    been written yet, or if the matching tindx isn't in times.data yet
+    (a transient mid-write inconsistency — we just wait for the next
+    poll cycle).
+    """
+    try:
+        dia = np.loadtxt(diaphragm_file, comments="#")
+        times = np.loadtxt(times_file, comments="#")
+    except OSError:
+        return None
+    if dia.ndim == 1:
+        dia = dia[np.newaxis, :]
+    if times.ndim == 1:
+        times = times[np.newaxis, :]
+    if dia.size == 0 or times.size == 0:
+        return None
+    burst_rows = np.where(dia[:, 1] == 2)[0]
+    if burst_rows.size == 0:
+        return None
+    burst_tindx = int(dia[burst_rows[0], 0])
+    match = np.where(times[:, 0] == burst_tindx)[0]
+    if match.size == 0:
+        return None
+    return float(times[match[0], 1])
+
+
+def _current_sim_time(times_file):
+    """Largest sim time written so far, or None if the file is empty."""
+    try:
+        arr = np.loadtxt(times_file, comments="#")
+    except OSError:
+        return None
+    if arr.ndim == 1:
+        arr = arr[np.newaxis, :]
+    if arr.size == 0:
+        return None
+    return float(arr[-1, 1])
+
+
+def _run_l1d_with_watchdog(cmd, *, job_inner, timeout, capture):
+    """Drop-in replacement for ``subprocess.run`` on the L1d run-simulation
+    step, with a side-channel watchdog that may SIGTERM the child early.
+
+    The child is launched with ``Popen``; the parent ``wait``s with a
+    timeout equal to WATCHDOG_POLL_S so we get immediate wake-up the
+    moment the child exits naturally, and otherwise fall through to
+    predicate evaluation every WATCHDOG_POLL_S seconds.
+
+    Outcomes
+    --------
+    'completed'       child exited on its own with rc 0.
+    'aborted_success' diaphragm has burst and (sim_t - t_burst) ≥
+                      GRACE_SIM_TIME_S; we SIGTERMed.  Output files are
+                      complete enough for parse_l1d_outputs.
+    'aborted_fail'    no rupture and the piston has either reversed
+                      direction (FAIL_ON_PISTON_REVERSAL) or inflected
+                      ≥ MAX_INFLECTIONS_NO_RUPTURE times; we SIGTERMed.
+                      Caller should return SENTINEL without parsing.
+
+    Errors are re-raised in the same shapes ``subprocess.run`` would
+    have used, so the existing except clauses in ``run_l1d`` catch
+    them unchanged:
+      - non-zero exit       → subprocess.CalledProcessError
+      - wall-clock exhausted → subprocess.TimeoutExpired
+    """
+    piston_file    = os.path.join(job_inner, "piston-0000.data")
+    diaphragm_file = os.path.join(job_inner, "diaphragm-0000.data")
+    times_file     = os.path.join(job_inner, "times.data")
+
+    # When capturing, route stdout/stderr to spooled tempfiles rather
+    # than subprocess.PIPE.  PIPE has a ~64 kB kernel buffer; if neither
+    # parent thread is reading it, a chatty L1d run will eventually
+    # block on its own stdout write and deadlock.  Tempfiles have no
+    # such limit.  Inheriting parent fds (capture=False) has no buffer
+    # issue.
+    out_buf = (tempfile.SpooledTemporaryFile(max_size=4 * 1024 * 1024)
+               if capture else None)
+    err_buf = (tempfile.SpooledTemporaryFile(max_size=4 * 1024 * 1024)
+               if capture else None)
+
+    proc = subprocess.Popen(cmd, stdout=out_buf, stderr=err_buf)
+    deadline = time.monotonic() + timeout
+
+    def _stderr_tail():
+        if err_buf is None:
+            return None
+        err_buf.seek(0)
+        data = err_buf.read()
+        return data[-2000:] if data else b""
+
+    def _terminate(reason):
+        try:
+            proc.terminate()
+            proc.wait(timeout=WATCHDOG_KILL_GRACE_S)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        if STREAM_L1D_OUTPUT:
+            print(f"L1d watchdog: terminated child ({reason})",
+                  file=sys.stderr)
+
+    try:
+        while True:
+            poll_window = min(
+                WATCHDOG_POLL_S,
+                max(deadline - time.monotonic(), 0.0),
+            )
+            if poll_window <= 0.0:
+                _terminate("eval timeout")
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            try:
+                rc = proc.wait(timeout=poll_window)
+            except subprocess.TimeoutExpired:
+                pass   # child still running — evaluate predicates
+            else:
+                if rc != 0:
+                    raise subprocess.CalledProcessError(
+                        rc, cmd, stderr=_stderr_tail(),
+                    )
+                return 'completed'
+
+            # ── predicate evaluation ─────────────────────────────────
+            burst_t = _diaphragm_burst_time(diaphragm_file, times_file)
+            sim_t   = _current_sim_time(times_file)
+
+            if burst_t is not None and sim_t is not None:
+                # Success path — wait the grace window past rupture.
+                if (sim_t - burst_t) >= GRACE_SIM_TIME_S:
+                    _terminate(
+                        f"rupture at {burst_t*1e3:.3f} ms + "
+                        f"{GRACE_SIM_TIME_S*1e3:.1f} ms grace elapsed"
+                    )
+                    return 'aborted_success'
+            else:
+                # Fail-fast — no rupture yet.  Two gates, tightest first.
+                n_inf = _count_piston_inflections(piston_file)
+                # (a) reversal gate: the piston has turned around at least
+                #     once, so peak driver pressure has been reached and
+                #     passed without rupture — it can never rupture now.
+                if FAIL_ON_PISTON_REVERSAL and n_inf >= 1:
+                    _terminate(
+                        "piston velocity reversed (turnaround) before rupture"
+                    )
+                    return 'aborted_fail'
+                # (b) legacy inflection gate: subsumed by (a) when enabled,
+                #     retained as a fallback when the reversal gate is off.
+                if n_inf >= MAX_INFLECTIONS_NO_RUPTURE:
+                    _terminate(
+                        f"{n_inf} piston inflections, no rupture"
+                    )
+                    return 'aborted_fail'
+    finally:
+        # Belt-and-braces: if we exit via an exception, never leak the
+        # child.  poll() returns None iff the process is still running.
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        if out_buf is not None:
+            out_buf.close()
+        if err_buf is not None:
+            err_buf.close()
 
 
 def run_l1d(x_phys, ind_number, *, test_gas_p1, transducer_xs=TRANSDUCER_XS,
@@ -509,10 +796,19 @@ def run_l1d(x_phys, ind_number, *, test_gas_p1, transducer_xs=TRANSDUCER_XS,
                 ["l1d4-prep", f"--job={job_name}"],
                 check=True, timeout=PREP_TIMEOUT_S, capture_output=capture,
             )
-            subprocess.run(
+            outcome = _run_l1d_with_watchdog(
                 ["l1d4", "--run-simulation", f"--job={job_name}"],
-                check=True, timeout=EVAL_TIMEOUT_S, capture_output=capture,
+                job_inner=job_inner,
+                timeout=EVAL_TIMEOUT_S,
+                capture=capture,
             )
+            if outcome == 'aborted_fail':
+                # No rupture occurred and the piston has stopped doing
+                # useful work.  Skip the piston-history postprocess and
+                # the parser — we already know the answer.  success
+                # stays False, so the outer finally cleans up the dir
+                # (unless KEEP_ALL_JOBS / KEEP_FAILED_JOBS override).
+                return SENTINEL_TUPLE
             subprocess.run(
                 ["l1d4", "--piston-history",
                  f"--job={job_name}", "--pindx=0"],
@@ -548,6 +844,8 @@ def run_l1d(x_phys, ind_number, *, test_gas_p1, transducer_xs=TRANSDUCER_XS,
               file=sys.stderr)
         return SENTINEL_TUPLE
     finally:
-        keep = KEEP_ALL_JOBS or ((not success) and KEEP_FAILED_JOBS)
+        keep = (KEEP_ALL_JOBS
+                or (success and KEEP_SUCCESSFUL_JOBS)
+                or ((not success) and KEEP_FAILED_JOBS))
         if not keep:
             shutil.rmtree(job_root, ignore_errors=True)

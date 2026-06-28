@@ -53,23 +53,52 @@ D_BUFFER_STUD  = 0.050
 # Hodson methodology constant.
 M_ASPECT = 2.0
 
-# Provisional orifice-plate parameters.
+# Orifice-plate parameters.  Calibrated against two Hodson reference
+# files (x2_condition1.py with buffer = 100 mm, at D_throat = 65 mm and
+# D_throat = 77 mm).  The plate's geometry is ASYMMETRIC across the
+# upstream and downstream sides:
 #
-# L_ORIFICE_THROAT is the actual axial extent of the constant-D_throat
-# section between the two flanking ramps — i.e., the gap between break-
-# points 14 and 15 in plot_geometry().  Held constant regardless of D_throat
-# so that the throat is always resolved by the same number of driver-gas
-# cells (otherwise the throat width would scale with the volume-conserving
-# correction (r − a)/m and shrink to ~7 mm at D_throat ≈ 75 mm).
-L_ORIFICE_THROAT = 0.010
+#   * Upstream side: volume-conserving ramp (Eq 4.12-4.15) with a fixed
+#     sharp-transition position X_ORIFICE_UPSTREAM_NOMINAL and fixed
+#     chamfer slope 1/M_ORIFICE.  As D_throat shrinks, the chamfer gets
+#     longer (more radial distance to cover at slope 1) and both ramp
+#     endpoints move outward, but the implicit sharp-transition stays
+#     put.  Verified across both reference D_throat values.
+#
+#   * Downstream side: fixed throat-side and outer endpoints.  The
+#     plate's downstream face is hardware-bolted to the shock tube at
+#     X_ORIFICE_DOWNSTREAM_OUTER, and the constant-D bore always ends
+#     at X_ORIFICE_DOWNSTREAM_BORE_END (100 mm of bore measured from
+#     the downstream face).  The chamfer slope adjusts with D_throat
+#     to span the variable radial step between these two fixed points.
+#
+# This asymmetric model reproduces both reference files' four orifice
+# break-points exactly (up to 16 microns, which is below mesh
+# resolution and reflects rounding in the reference).
+X_ORIFICE_UPSTREAM_NOMINAL    = -0.010    # x_nominal of upstream volume-conserving ramp
+X_ORIFICE_DOWNSTREAM_BORE_END = +0.100    # x_r_T7: small-D end of downstream ramp
+X_ORIFICE_DOWNSTREAM_OUTER    = +0.110    # x_R_T7: large-D end of downstream ramp
 
-# Aspect ratio (radius:length) of the orifice plate's contraction and
-# expansion ramps.  Smaller than M_ASPECT (= 2.0, used for the
-# reservoir/launcher/buffer-plate ramps) so each orifice ramp spans
-# multiple driver-gas cells rather than collapsing inside one cell.
-# At M_ORIFICE = 0.5 the ramp axial length is 2·(R_SHOCK − R_throat),
-# i.e., 10 mm at D_throat = 75 mm and 35 mm at D_throat = 50 mm.
+# Slope (radius:length) of the upstream volume-conserving chamfer.
+# m = 1 matches both reference files.
 M_ORIFICE = 1.0
+
+# Bulk x-shift applied to the entire orifice plate (upstream nominal,
+# downstream bore end, and downstream outer all translate together as
+# a rigid body).  Negative shifts the plate UPSTREAM relative to the
+# primary diaphragm at x = 0, keeping PD comfortably inside the
+# constant-bore throat across the full D_throat optimisation range.
+#
+# At ORIFICE_X_SHIFT = 0 the geometry reproduces the Hodson reference
+# files exactly.  Non-zero shifts are a deliberate divergence and the
+# smoke-test reference assertions are skipped accordingly.
+#
+# Tuned for the optimisation's D_throat lower bound of 0.050 m: at
+# that lower bound the upstream throat-side endpoint x_r_T6 sits
+# ~10 mm upstream of PD, so the diaphragm rupture happens cleanly
+# inside the constant-D throat instead of inside the variable-area
+# upstream chamfer.
+ORIFICE_X_SHIFT = -0.010
 
 # Minimal-model shock-tube extent past the primary diaphragm.
 L_SHOCK_TUBE_END = 5.0
@@ -183,53 +212,78 @@ def build_break_points(buffer_length, D_throat=None):
     }
 
     # Orifice plate, if a D_throat is supplied and is strictly smaller
-    # than the shock-tube diameter.  At D_throat == 2*R_SHOCK the orifice
-    # is degenerate (no area change), so we skip the gradient calls and
-    # treat the design as if no orifice were present.
+    # than the shock-tube diameter.  At D_throat == 2*R_SHOCK the
+    # orifice is degenerate (no area change), so we skip the ramp calls.
     #
-    # We do NOT call volume_conserving_ramp here: that API fixes x_nominal
-    # and solves for (x_R, x_r), which makes the throat span depend on
-    # (r − a)/m and shrink with smaller D_throat.  Instead, we fix the
-    # throat endpoints x_r_T6, x_r_T7 at ±L_ORIFICE_THROAT/2 about the
-    # orifice centre and the ramp slope at M_ORIFICE, which gives a
-    # throat width independent of D_throat and ramps long enough to be
-    # resolved by ≥1 driver-gas cell each.  Volume conservation still
-    # holds — the implicit x_nominal just slides to make it work.
+    # Asymmetric geometry calibrated against two Hodson reference files:
+    #
+    #   * Upstream side: volume-conserving ramp with x_nominal fixed at
+    #     X_ORIFICE_UPSTREAM_NOMINAL and slope 1/M_ORIFICE.  Both ramp
+    #     endpoints (x_R_T6, x_r_T6) move outward as D_throat shrinks.
+    #
+    #   * Downstream side: fixed throat-side endpoint at
+    #     X_ORIFICE_DOWNSTREAM_BORE_END and fixed outer endpoint at
+    #     X_ORIFICE_DOWNSTREAM_OUTER.  The chamfer slope varies with
+    #     D_throat (flatter at smaller D_throat).
+    #
+    # See the constant block above for derivation.  This model
+    # reproduces both reference files' break-points exactly.
     if D_throat is not None and D_throat < 2 * R_SHOCK:
-        x_orifice_centre = x_r_T5 / 2.0          # midpoint(x_inner_buffer, PD_X=0)
         R_throat = D_throat / 2.0
 
-        # Throat endpoints — gap between break-points 14 and 15 fixed.
-        x_r_T6 = x_orifice_centre - L_ORIFICE_THROAT / 2.0
-        x_r_T7 = x_orifice_centre + L_ORIFICE_THROAT / 2.0
+        # Upstream ramp: volume-conserving with direction=-1.
+        # Returns (x_R, x_r) with x_R upstream (D=2*R_SHOCK side) and
+        # x_r downstream (D=D_throat side).  ORIFICE_X_SHIFT translates
+        # the implicit sharp-transition position upstream by a fixed
+        # amount; both ramp endpoints shift with it.
+        x_R_T6, x_r_T6 = volume_conserving_ramp(
+            R_SHOCK, R_throat, X_ORIFICE_UPSTREAM_NOMINAL + ORIFICE_X_SHIFT,
+            direction=-1, m=M_ORIFICE,
+        )
 
-        # Ramp endpoints — axial length set by M_ORIFICE alone.
-        ramp_axial = (R_SHOCK - R_throat) / M_ORIFICE
-        x_R_T6 = x_r_T6 - ramp_axial             # upstream end of contraction
-        x_R_T7 = x_r_T7 + ramp_axial             # downstream end of expansion
+        # Downstream ramp: hard-coded hardware endpoints, also shifted
+        # by ORIFICE_X_SHIFT so the entire plate translates as a rigid
+        # body (slope, bore length, and chamfer footprint unchanged).
+        x_r_T7 = X_ORIFICE_DOWNSTREAM_BORE_END + ORIFICE_X_SHIFT
+        x_R_T7 = X_ORIFICE_DOWNSTREAM_OUTER    + ORIFICE_X_SHIFT
 
-        # Feasibility — ramps must not overlap the buffer-plate small-D
-        # end upstream or the primary diaphragm downstream.
+        # Feasibility -- upstream chamfer must not encroach on the
+        # buffer-plate small-D end; the two ramps must not eat the
+        # entire throat span; downstream chamfer must end before the
+        # shock-tube exit.
         if x_R_T6 <= x_r_T5:
             raise ValueError(
-                f"Orifice contraction ramp infeasible at "
-                f"D_throat={D_throat:.4f} m, M_ORIFICE={M_ORIFICE}: "
-                f"x_R_T6={x_R_T6:.6f} <= x_inner_buffer={x_r_T5:.6f}."
+                f"Orifice upstream chamfer infeasible at "
+                f"D_throat={D_throat:.4f} m: x_R_T6={x_R_T6:.6f} "
+                f"<= x_inner_buffer={x_r_T5:.6f}."
             )
-        if x_R_T7 >= PD_X:
+        if x_r_T6 >= x_r_T7:
             raise ValueError(
-                f"Orifice expansion ramp infeasible at "
-                f"D_throat={D_throat:.4f} m, M_ORIFICE={M_ORIFICE}: "
-                f"x_R_T7={x_R_T7:.6f} >= PD_X={PD_X:.6f}."
+                f"Orifice throat degenerate at D_throat={D_throat:.4f} m: "
+                f"upstream chamfer ends at x_r_T6={x_r_T6:.6f} which is "
+                f">= downstream bore end x_r_T7={x_r_T7:.6f}."
+            )
+        if x_R_T7 >= L_SHOCK_TUBE_END:
+            raise ValueError(
+                f"Orifice downstream chamfer infeasible: "
+                f"x_R_T7={x_R_T7:.6f} >= L_SHOCK_TUBE_END={L_SHOCK_TUBE_END:.6f}."
             )
 
         bps.append((x_R_T6, 2 * R_SHOCK))
         bps.append((x_r_T6, D_throat))
         bps.append((x_r_T7, D_throat))
         bps.append((x_R_T7, 2 * R_SHOCK))
-        derived["x_orifice_centre"] = x_orifice_centre
+        derived["x_orifice_centre"] = 0.5 * (x_r_T6 + x_r_T7)
 
-    bps.append((PD_X,             2 * R_SHOCK))
+    # Without an orifice we add an explicit anchor at PD so the tube is
+    # well-defined (D = 2*R_SHOCK) at x = 0.  With the orifice, the four
+    # orifice break-points already specify D(x) across the PD station;
+    # adding (PD_X, 2*R_SHOCK) here would inject a spike back up to the
+    # shock-tube diameter at the primary diaphragm and corrupt the
+    # geometry seen by L1d.  The reference x2_condition1.py likewise
+    # omits any add_break_point at x = 0 when the orifice is present.
+    if "x_orifice_centre" not in derived:
+        bps.append((PD_X, 2 * R_SHOCK))
     bps.append((L_SHOCK_TUBE_END, 2 * R_SHOCK))
     bps.sort(key=lambda xd: xd[0])
     return bps, derived
@@ -451,9 +505,11 @@ def plot_geometry(
         fontsize=11,
     )
 
-    # Zoom — buffer plate + orifice region.
+    # Zoom — buffer plate + orifice region.  Right edge sized to show
+    # the full orifice plate (the expansion ramp now extends past the
+    # PD to X_ORIFICE_DOWNSTREAM_FACE + a few mm of headroom).
     zoom_x0 = derived["x_outer_buffer"] - 0.03
-    zoom_x1 = pd_x + 0.02
+    zoom_x1 = X_ORIFICE_DOWNSTREAM_OUTER + 0.03 if "x_orifice_centre" in derived else pd_x + 0.02
     ax_zoom.set_xlim(zoom_x0, zoom_x1)
     ax_zoom.set_ylim(-0.15, 0.15)
     ax_zoom.set_title("Zoom — buffer plate, studs, and orifice region",
@@ -510,29 +566,106 @@ if __name__ == "__main__":
         if not match:
             raise SystemExit("Table 4.5 mismatch — methodology not reproduced")
 
-    # Orifice sanity check across the D_throat bound.  At the upper
-    # bound (D_throat == 2*R_SHOCK) the orifice is degenerate and is
-    # skipped; at smaller D_throat the orifice break-points are added.
-    # Verify the new invariants: throat span (14↔15) == L_ORIFICE_THROAT
-    # for every D_throat, and each ramp axial length == (R_SHOCK − R_throat)
-    # / M_ORIFICE.
-    for D_th in (0.085, 0.07, 0.05):
+    # Orifice sanity check.
+    #
+    # Reference matches required:
+    #   * D_throat = 0.065: match x2_condition1.py (original) exactly.
+    #   * D_throat = 0.077: match x2_condition1.py (D=77mm variant)
+    #     to within ~16 microns (rounding tolerance in reference).
+    # At smaller D_throat the upstream chamfer keeps slope 1 and grows
+    # outward; the downstream endpoints stay fixed and its slope
+    # flattens.  At D_throat == 2*R_SHOCK the orifice is degenerate
+    # and the block is skipped.
+    expected_orifice = {
+        0.065: [
+            (-0.014778, 0.085),
+            (-0.004778, 0.065),
+            (+0.100000, 0.065),
+            (+0.110000, 0.085),
+        ],
+        0.077: [
+            (-0.011967, 0.085),
+            (-0.007967, 0.077),
+            (+0.100000, 0.077),
+            (+0.110000, 0.085),
+        ],
+    }
+    for D_th in (0.085, 0.077, 0.065, 0.05, 0.04):
         bps_o, derived_o = build_break_points(0.10, D_throat=D_th)
         has_orifice = "x_orifice_centre" in derived_o
         print(f"\nOrifice config: D_throat={D_th:.3f} m, buffer_length=0.10 m")
         print(f"  total break-points = {len(bps_o)}  (orifice inserted: {has_orifice})")
         print(f"  x_inner_buffer     = {derived_o['x_inner_buffer']:+.5f}")
-        if has_orifice:
-            print(f"  x_orifice_centre   = {derived_o['x_orifice_centre']:+.5f}")
-            throat_bps = [bp for bp in bps_o if abs(bp[1] - D_th) < 1e-9]
-            shock_d_bps = [bp for bp in bps_o
-                           if abs(bp[1] - 2 * R_SHOCK) < 1e-9
-                           and derived_o["x_inner_buffer"] < bp[0] < 0.0]
-            throat_span = throat_bps[-1][0] - throat_bps[0][0]
-            ramp_axial  = throat_bps[0][0] - shock_d_bps[0][0]
-            print(f"  throat span (14↔15) = {throat_span * 1e3:.3f} mm  "
-                  f"(expected {L_ORIFICE_THROAT * 1e3:.3f} mm)")
-            print(f"  ramp axial length   = {ramp_axial * 1e3:.3f} mm  "
-                  f"(expected {(R_SHOCK - D_th / 2) / M_ORIFICE * 1e3:.3f} mm)")
+        if not has_orifice:
+            continue
+        print(f"  x_orifice_centre   = {derived_o['x_orifice_centre']:+.5f}")
+
+        # Recover the four orifice break-points: the two throat
+        # (D == D_throat) points plus the shock-D points immediately
+        # upstream and downstream of them.
+        throat_bps = [bp for bp in bps_o if abs(bp[1] - D_th) < 1e-9]
+        i_contr_throat = bps_o.index(throat_bps[0])
+        i_expan_throat = bps_o.index(throat_bps[-1])
+        upstream_shock   = bps_o[i_contr_throat - 1]
+        downstream_shock = bps_o[i_expan_throat + 1]
+        orifice_bps = [upstream_shock, throat_bps[0],
+                       throat_bps[-1], downstream_shock]
+        throat_span = orifice_bps[2][0] - orifice_bps[1][0]
+        ramp_up_len = orifice_bps[1][0] - orifice_bps[0][0]
+        ramp_dn_len = orifice_bps[3][0] - orifice_bps[2][0]
+        print(f"  contraction ramp ({orifice_bps[0][0]:+.6f}, {orifice_bps[0][1]:.4f}) "
+              f"-> ({orifice_bps[1][0]:+.6f}, {orifice_bps[1][1]:.4f}) "
+              f"[len {ramp_up_len*1e3:.3f} mm]")
+        print(f"  throat span      {throat_span * 1e3:.3f} mm "
+              f"({orifice_bps[1][0]:+.6f} -> {orifice_bps[2][0]:+.6f})")
+        print(f"  expansion ramp   ({orifice_bps[2][0]:+.6f}, {orifice_bps[2][1]:.4f}) "
+              f"-> ({orifice_bps[3][0]:+.6f}, {orifice_bps[3][1]:.4f}) "
+              f"[len {ramp_dn_len*1e3:.3f} mm]")
+
+        if D_th in expected_orifice:
+            if abs(ORIFICE_X_SHIFT) < 1e-12:
+                print("  Checking against reference (x2_condition1.py):")
+                # 20 micron tolerance covers the rounding in the D=77mm
+                # reference file (~16 micron deltas on the upstream side).
+                tol = 2e-5
+                for got, exp in zip(orifice_bps, expected_orifice[D_th]):
+                    ok = abs(got[0] - exp[0]) < tol and abs(got[1] - exp[1]) < 1e-6
+                    flag = "OK" if ok else "FAIL"
+                    print(f"    got=({got[0]:+.6f}, {got[1]:.4f})  "
+                          f"exp=({exp[0]:+.6f}, {exp[1]:.4f})  {flag}")
+                    if not ok:
+                        raise SystemExit(
+                            f"Reference orifice mismatch at D_throat={D_th}"
+                        )
+            else:
+                print(f"  Reference comparison skipped: ORIFICE_X_SHIFT="
+                      f"{ORIFICE_X_SHIFT:+.4f} m (deliberate divergence "
+                      f"from reference for PD-throat margin).")
+                for got, exp in zip(orifice_bps, expected_orifice[D_th]):
+                    delta_x = got[0] - exp[0]
+                    print(f"    got=({got[0]:+.6f}, {got[1]:.4f})  "
+                          f"exp=({exp[0]:+.6f}, {exp[1]:.4f})  "
+                          f"dx={delta_x*1e3:+.3f} mm")
+
+    # Buffer-plate cross-check.  The new buffer = 130 mm reference file
+    # (no orifice) gives buffer-plate break-points (-0.163085, 0.2568)
+    # and (-0.120135, 0.085).  Verify our volume_conserving_ramp +
+    # buffer_stud_volume reproduces those positions as well.
+    expected_buffer_at_130 = [(-0.163085, 0.2568), (-0.120135, 0.085)]
+    bps_b, derived_b = build_break_points(buffer_length=0.130, D_throat=None)
+    # The buffer-plate ramp lives between the compression-tube anchor
+    # (PISTON_FRONT_X, D=2*R_COMPRESSION) and the first shock-tube-D
+    # anchor downstream of it.
+    i_pf = bps_b.index((PISTON_FRONT_X, 2 * R_COMPRESSION))
+    buffer_bps = [bps_b[i_pf + 1], bps_b[i_pf + 2]]
+    print("\nBuffer plate check at buffer_length = 0.130 m:")
+    tol = 2e-5
+    for got, exp in zip(buffer_bps, expected_buffer_at_130):
+        ok = abs(got[0] - exp[0]) < tol and abs(got[1] - exp[1]) < 1e-6
+        flag = "OK" if ok else "FAIL"
+        print(f"  got=({got[0]:+.6f}, {got[1]:.4f})  "
+              f"exp=({exp[0]:+.6f}, {exp[1]:.4f})  {flag}")
+        if not ok:
+            raise SystemExit("Buffer-plate mismatch at buffer_length=0.130")
 
     print("\nAll smoke tests passed.")

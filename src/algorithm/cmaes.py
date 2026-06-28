@@ -40,6 +40,46 @@ from problem.transforms import variable_untransformation
 from cma.constraints_handler import AugmentedLagrangian
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# sim_type classification
+# ─────────────────────────────────────────────────────────────────────────────
+# Centralise the "which constraint-handling family is this sim_type?"
+# question.  Two prior bring-up failures traced back to a guard tuple
+# that forgot a sim_type, so every CHT / AL conditional should route
+# through these tuples + helpers rather than enumerating strings inline.
+#
+#   chocat : Chocat 2015 covariance-shrink path (CovarianceCHT / CHT_AL).
+#            Infeasibles are resampled from a tightened distribution and
+#            their g-vectors feed a post-eval covariance update.
+#   arnold : Arnold & Hansen 2012 (ArnoldCHT / ArnoldCHT_AL).  Infeasibles
+#            are consumed BEFORE evaluation via Eq. 6 + Eq. 7 (one v_j per
+#            constraint per parent); the slot then contributes no selection
+#            candidate that generation — no resample.
+CHOCAT_SIM_TYPES      = ('CovarianceCHT', 'CHT_AL')
+ARNOLD_SIM_TYPES      = ('ArnoldCHT', 'ArnoldCHT_AL')
+CHT_ENABLED_SIM_TYPES = CHOCAT_SIM_TYPES + ARNOLD_SIM_TYPES
+AL_ENABLED_SIM_TYPES  = ('CHT_AL', 'ArnoldCHT_AL')
+
+
+def is_cht_active(sim_type):
+    """True iff a CHT (Chocat or Arnold family) is engaged."""
+    return sim_type in CHT_ENABLED_SIM_TYPES
+
+
+def is_al_active(sim_type):
+    """True iff the Augmented Lagrangian is layered on top (CHT_AL family)."""
+    return sim_type in AL_ENABLED_SIM_TYPES
+
+
+def cht_method(sim_type):
+    """Return 'chocat' | 'arnold' | None for the CHT family in use."""
+    if sim_type in ARNOLD_SIM_TYPES:
+        return 'arnold'
+    if sim_type in CHOCAT_SIM_TYPES:
+        return 'chocat'
+    return None
+
+
 def _eval_schedule(schedule, current_gen, fallback):
     """Linearly interpolate a scheduled parameter at ``current_gen``.
 
@@ -180,12 +220,59 @@ class StrategyMultiObjective(object):
             else 0.5 / (self.dim + 2.0)
         )
 
+        # ─────────────────────────────────────────────────────────────────
+        # Arnold & Hansen 2012 parameters (Table 1 of the paper)
+        # ─────────────────────────────────────────────────────────────────
+        # Consumed only when sim_type is in ARNOLD_SIM_TYPES.  Per the paper:
+        #   β    = 0.1 / (n + 2)   (Eq. 7 subtractive-update magnitude)
+        #   c_c  = 1 / (n + 2)     (Eq. 6 low-pass filter for v_j)
+        # arnold_cc is DISTINCT from self.cc (the CMA-ES search-path
+        # cumulation constant 2/(n+2)); same name in the paper, different
+        # role.  None ⇒ "use the paper default" so main.py can pass the
+        # YAML value through (or omit it) without knowing the dimension.
+        _arnold_beta = params.get("arnold_beta")
+        self.arnold_beta = (
+            _arnold_beta if _arnold_beta is not None
+            else 0.1 / (self.dim + 2.0)
+        )
+        _arnold_cc = params.get("arnold_cc")
+        self.arnold_cc = (
+            _arnold_cc if _arnold_cc is not None
+            else 1.0 / (self.dim + 2.0)
+        )
+        # Number of constraints (length of evaluate_constraints(...)),
+        # supplied by main.py.  Required by the Arnold modes — one v_j
+        # accumulator per constraint per parent.  Informational otherwise.
+        self.n_constraints = params.get("n_constraints")
+        if cht_method(self.sim_type) == 'arnold' and self.n_constraints is None:
+            raise ValueError(
+                "Arnold sim_type requires n_constraints to be passed into "
+                "StrategyMultiObjective(...). Compute it once via "
+                "len(evaluate_constraints(seed_x, bounds))."
+            )
+
         # Per-parent internal state
         self.sigmas      = [sigma] * len(population)
         self.A           = [np.identity(self.dim) for _ in range(len(population))]
         self.invCholesky = [np.identity(self.dim) for _ in range(len(population))]
         self.pc          = [np.zeros(self.dim)    for _ in range(len(population))]
         self.psucc       = [self.ptarg]            * len(population)
+
+        # Per-parent Arnold constraint vectors v_{j,i}.  Allocated only when
+        # the Arnold family is active; the empty list keeps the attribute
+        # always-present so any consumer can rely on it existing.
+        if cht_method(self.sim_type) == 'arnold':
+            self.v = [
+                [np.zeros(self.dim) for _ in range(self.n_constraints)]
+                for _ in range(len(population))
+            ]
+        else:
+            self.v = []
+        # Diagnostic buffer for Arnold update events.  Always present so
+        # drain code stays sim_type-agnostic (we don't write the Arnold
+        # diagnostics CSVs on this branch, but the records are kept in
+        # memory for tests / ad-hoc inspection).
+        self.arnold_diag_buffer = []
 
         self.indicator = params.get("indicator", tools.hypervolume)
         self.time_spent_fixing = 0
@@ -218,7 +305,7 @@ class StrategyMultiObjective(object):
         # set_dufosse2020() then overrides chi_domega = 2^(1/sqrt(n)) and
         # k1 = 10 per Section 4.2 of Dufossé & Hansen 2020.
         self.al_tol = float(params.get("al_tol", 100.0))
-        if self.sim_type == 'CHT_AL':
+        if is_al_active(self.sim_type):
             self.al = AugmentedLagrangian(self.dim, equality=False)
             self.al.set_algorithm(3)
             self.al.set_dufosse2020()
@@ -388,6 +475,44 @@ class StrategyMultiObjective(object):
             self.al_tol_schedule, self._generation, self.al_tol,
         )
 
+    def refresh_al_constraints(self, offspring):
+        """Recompute g_al for ``offspring`` + parents against the CURRENT al_tol.
+
+        The raw physics measurement ``delta_vs1`` is fixed at evaluation
+        time, but the AL constraint it feeds is
+        ``g_al = delta_vs1 - al_tol(gen)`` — and ``al_tol`` moves under the
+        B3 schedule.  Offspring are evaluated fresh each generation at the
+        current ``al_tol`` (so they are already correct here — a no-op), but
+        surviving (elitist) parents are evaluated ONCE and carried forward.
+        Without this refresh their ``_g_al`` stays frozen at their
+        birth-generation ``al_tol``, which is the stale-ε /
+        frozen-parent-residual artifact: the AL penalty and the proxy mean
+        see a constraint that no longer matches the schedule.
+
+        Recompute from the cached ``_raw_delta_vs1`` (set in main.py right
+        after evaluation) so no L1d re-run is needed.  Individuals lacking a
+        cached measurement (box/phys-infeasible — never L1d-evaluated) are
+        skipped.  Each refreshed individual's ``al_tol`` is synced to the
+        current value so downstream reconstructions
+        (``raw = g_al + al_tol``) stay correct.
+
+        No-op when AL is inactive (``self.al is None``) and, with no
+        schedule configured, ``current_al_tol()`` returns the static
+        ``al_tol`` so the recompute reproduces the birth value — harmless.
+
+        Called once per generation from main.py BEFORE ``update()`` runs
+        selection, so the AL-augmented Pareto sort sees current constraints.
+        """
+        if self.al is None:
+            return
+        cur = self.current_al_tol()
+        for ind in list(offspring) + list(self.parents):
+            raw = getattr(ind, "_raw_delta_vs1", None)
+            if raw is None:
+                continue
+            ind._g_al = np.array([raw - cur], dtype=float)
+            ind.al_tol = cur
+
     def update_al(self, F_proxy_scalar, g_al_proxy, proxy_stats=None):
         """Per-generation update of γ and μ from the parent-centroid proxy.
 
@@ -524,15 +649,14 @@ class StrategyMultiObjective(object):
                                 new_individual[k] = 4.0 - new_individual[k]
                             reflections += 1
 
-                # CovarianceCHT (and CHT_AL, which layers AL on top of CHT)
-                # replace the repair while-loop: infeasible offspring pass
-                # through and feed the CHT covariance update (Phase 3).
-                # Without this guard, CHT_AL would enter the loop, call
-                # crossover() — which has no CHT_AL branch — get the
-                # individual back unchanged, and spin forever.
-                # Penalty mode also bypasses repair (its handler is in
-                # evaluate.py).
-                if self.sim_type not in ('Penalty', 'CovarianceCHT', 'CHT_AL'):
+                # Any CHT-active sim_type (Chocat or Arnold family) and the
+                # Penalty mode bypass the in-generate() repair while-loop.
+                # Chocat consumes infeasibles via covariance shrinkage in
+                # resample_infeasibles()/update(); Arnold consumes them via
+                # Eq. 6 + Eq. 7 in apply_arnold_infeasibility().  crossover()
+                # has no branch for either, so without this guard CHT modes
+                # would spin forever.  Penalty's handler lives in evaluate.py.
+                if self.sim_type != 'Penalty' and not is_cht_active(self.sim_type):
                     s = time.time()
                     while True:
                         if not self.check_feasibility(new_individual)[0]:
@@ -561,6 +685,11 @@ class StrategyMultiObjective(object):
                 individuals[-1]._ps = "o", i
                 individuals[-1]._repaired = repaired
                 individuals[-1]._lineage_id = self._next_lineage_id
+                # ind._Az is the raw step σ_i·A_i·z_i that produced this
+                # offspring.  Consumed by the Arnold constraint-vector
+                # update (Eq. 6).  Stored for ALL sim_types: one length-n
+                # array, cheap, keeps the consumer sim_type-agnostic.
+                individuals[-1]._Az = np.array(mutation, copy=True)
                 self._next_lineage_id += 1
 
         else:
@@ -569,15 +698,14 @@ class StrategyMultiObjective(object):
             for i in range(self.lambda_):
                 j = np.random.randint(0, len(ndom))
                 _, p_idx = ndom[j]._ps
+                _mutation = self.sigmas[p_idx] * np.dot(self.A[p_idx], arz[i])
                 individuals.append(
-                    ind_init(
-                        self.parents[p_idx]
-                        + self.sigmas[p_idx] * np.dot(self.A[p_idx], arz[i])
-                    )
+                    ind_init(self.parents[p_idx] + _mutation)
                 )
                 individuals[-1]._ps = "o", p_idx
                 individuals[-1]._repaired = False
                 individuals[-1]._lineage_id = self._next_lineage_id
+                individuals[-1]._Az = np.array(_mutation, copy=True)
                 self._next_lineage_id += 1
 
         return individuals
@@ -1081,6 +1209,191 @@ class StrategyMultiObjective(object):
         return max_iterations
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Arnold & Hansen 2012 CHT — one-shot infeasibility consumer
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def apply_arnold_infeasibility(self, population, feasibility_check):
+        """Consume infeasible offspring via Eq. 6 + Eq. 7 (no resampling).
+
+        Faithful to the (1+1) lifecycle of Arnold & Hansen 2012 mapped onto
+        the (μ+λ) batched setting: each parent gets exactly one sample per
+        generation.  When that sample is infeasible:
+
+          1. For each violated constraint j, update v_{j,i} (Eq. 6).
+          2. Apply the multi-rank subtractive update to A_i (Eq. 7), with a
+             Cholesky-PSD guard.
+          3. Mark the offspring infeasible so it bypasses both the heavy
+             L1d evaluation and the selection pool — no resample, the slot
+             simply contributes no candidate this generation (paper Fig. 3
+             step 3: "the iteration is complete").
+
+        After this returns, ``ind._g`` and ``ind._feasible`` are set for
+        every individual, mirroring the post-condition of
+        ``resample_infeasibles`` so downstream code stays sim_type-agnostic.
+
+        ``feasibility_check`` has the same contract as for
+        ``resample_infeasibles``: a CHEAP check that does not call L1d.
+        """
+        for ind in population:
+            feasible, g = feasibility_check(ind)
+            ind._g = g
+            ind._feasible = feasible
+            if feasible:
+                continue
+            # Only offspring (not parents looped in for selection) carry
+            # _Az; parents survive untouched by definition.
+            if not hasattr(ind, "_Az") or not hasattr(ind, "_ps"):
+                continue
+            p_idx = ind._ps[1]
+            # The covariance being shrunk belongs to parent slot p_idx; the
+            # κ-by-lineage trajectory is keyed by that slot's current
+            # occupant, so we attribute the record to its lineage.
+            lineage_id = getattr(self.parents[p_idx], "_lineage_id", None)
+            active_js = self._arnold_update_v(p_idx, ind._Az, g)
+            if not active_js:
+                # No finite, positive g_j (e.g. every violation is a +inf
+                # box-bound cascade) — no direction to shrink, skip Eq. 7.
+                # Still record the event so the infeasibility rate and the
+                # κ snapshot for this lineage stay faithful.
+                self._record_arnold_diag(p_idx, lineage_id,
+                                         active_js=[], v_norms=[])
+                continue
+            self.A[p_idx], self.invCholesky[p_idx], upd = self._arnold_update_A(
+                self.A[p_idx], self.invCholesky[p_idx], p_idx, active_js,
+            )
+            # ‖v_j‖ of each active constraint, read AFTER the Eq. 6 filter
+            # update — this is the quantity the mean-‖v_j‖ figure tracks.
+            v_norms = [float(np.linalg.norm(self.v[p_idx][j])) for j in active_js]
+            self._record_arnold_diag(
+                p_idx, lineage_id, active_js, v_norms,
+                A_delta_fro=upd["A_delta_fro"],
+                shrink_applied=upd["shrink_applied"],
+                psd_fallback=upd["psd_fallback"],
+            )
+
+    def _record_arnold_diag(self, parent_idx, lineage_id, active_js, v_norms,
+                            A_delta_fro=None, shrink_applied=False,
+                            psd_fallback=False):
+        """Append one Arnold diagnostic record to ``self.arnold_diag_buffer``.
+
+        One record per infeasible offspring consumed this generation.  Holds
+        everything the four end-of-run figures read back from CSV:
+
+          * ``active_js``               → per-constraint violation heatmap
+          * ``active_js`` + ``v_norms`` → mean ‖v_j‖ per active constraint
+          * ``lineage_id`` + ``condition_number_after`` → κ(C) by lineage
+          (the infeasibility rate is aggregated per-gen from the record
+           count vs λ, so it needs no extra field here.)
+
+        ``condition_number_after`` is computed from the parent slot's
+        *current* A (post Eq. 7, or pre-update on a PSD rollback), so the κ
+        curve always reflects that lineage's live covariance.  Mirrors the
+        Chocat ``_cond`` definition: κ(C) = λ_max / λ_min over C = A Aᵀ.
+        """
+        eps = 1e-300
+        A = self.A[parent_idx]
+        C = A @ A.T
+        C = 0.5 * (C + C.T)
+        vp = np.linalg.eigvalsh(C)
+        vmax = float(np.max(vp))
+        vmin = float(np.min(vp[vp > 0])) if np.any(vp > 0) else eps
+        cond_after = vmax / max(vmin, eps)
+        self.arnold_diag_buffer.append({
+            "parent_idx":             int(parent_idx),
+            "lineage_id":             int(lineage_id) if lineage_id is not None else None,
+            "m_active":               int(len(active_js)),
+            "active_js":              [int(j) for j in active_js],
+            "v_norms":                [float(v) for v in v_norms],
+            "A_delta_fro":            float(A_delta_fro) if A_delta_fro is not None else None,
+            "condition_number_after": cond_after,
+            "shrink_applied":         bool(shrink_applied),
+            "psd_fallback":           bool(psd_fallback),
+        })
+
+    def _arnold_update_v(self, parent_idx, Az, g):
+        """Eq. 6: low-pass filter of violation steps into v_{j,i}.
+
+        For each constraint j with ``g[j]`` finite and strictly positive,
+        v_{j,i} ← (1 − c_c) v_{j,i} + c_c · Az.  Returns the active
+        constraint indices for the subsequent Eq. 7 update.
+
+        ``+inf`` entries in g are skipped: feasibility.evaluate_constraints
+        emits them for the physical-space slots when a box bound is
+        violated (the un-transformation is ill-defined outside the box).
+        The box violation itself still carries the directional signal via
+        its own finite-positive g entry, so dropping the +inf cascade is
+        consistent with the Chocat handling.
+        """
+        cc = self.arnold_cc
+        active_js = []
+        Az = np.asarray(Az, dtype=float)
+        for j in range(len(g)):
+            gj = g[j]
+            if np.isfinite(gj) and gj > 0.0:
+                v_j = self.v[parent_idx][j]
+                self.v[parent_idx][j] = (1.0 - cc) * v_j + cc * Az
+                active_js.append(j)
+        return active_js
+
+    def _arnold_update_A(self, A, invCholesky, parent_idx, active_js):
+        """Eq. 7: multi-rank subtractive update of the Cholesky factor.
+
+        A ← A − (β / m_active) Σ_j (v_j w_j^T) / (w_j^T w_j),
+        with w_j = A^{-1} v_j.
+
+        PSD guard: re-Cholesky from C_new = A_new A_new^T.  If it fails
+        (the subtractive form is unbounded; rare, for near-collinear v_j),
+        roll back to (A, invCholesky) unchanged.
+
+        Returns ``(A_out, invCholesky_out, diag)`` where ``diag`` carries the
+        per-call signals the diagnostics need:
+          * ``A_delta_fro``    — ‖A_new − A‖_F, the magnitude of the step
+          * ``shrink_applied`` — True iff the update committed
+          * ``psd_fallback``   — True iff the re-Cholesky failed and we
+                                  rolled back.
+        The recorder (``_record_arnold_diag``) merges this with the
+        violation / lineage info to produce one buffer entry per offspring.
+        """
+        n = self.dim
+        beta = self.arnold_beta
+        m_active = len(active_js)
+        if m_active == 0:
+            return A, invCholesky, {"A_delta_fro": None,
+                                    "shrink_applied": False,
+                                    "psd_fallback": False}
+
+        delta = np.zeros((n, n))
+        for j in active_js:
+            v_j = self.v[parent_idx][j]
+            w_j = invCholesky @ v_j
+            denom = float(w_j @ w_j)
+            if denom < 1e-30:
+                # v_j (near-)zero or A·invCholesky drift — skip this term.
+                continue
+            delta += np.outer(v_j, w_j) / denom
+
+        A_new = A - (beta / m_active) * delta
+
+        # PSD check via re-Cholesky on the implied C.  Symmetrise first to
+        # guard against round-off before the decomposition.
+        C_new = A_new @ A_new.T
+        C_new = 0.5 * (C_new + C_new.T)
+        try:
+            A_new = np.linalg.cholesky(C_new)
+        except np.linalg.LinAlgError:
+            return A, invCholesky, {"A_delta_fro": None,
+                                    "shrink_applied": False,
+                                    "psd_fallback": True}
+
+        invCholesky_new = scipy.linalg.solve_triangular(
+            A_new, np.eye(n), lower=True,
+        )
+        A_delta_fro = float(np.linalg.norm(A_new - A))
+        return A_new, invCholesky_new, {"A_delta_fro": A_delta_fro,
+                                        "shrink_applied": True,
+                                        "psd_fallback": False}
+
+    # ─────────────────────────────────────────────────────────────────────────
     # X2-specific feasibility repair (p4 pressure constraint)
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -1174,7 +1487,7 @@ class StrategyMultiObjective(object):
         # first generation runs raw, since lam=0 and mu=0 make AL == 0
         # anyway and the bootstrapping happens after gen 0 selection).
         original_fitness = {}
-        if self.sim_type == 'CHT_AL' and self.al is not None and self.al.is_initialized:
+        if is_al_active(self.sim_type) and self.al is not None and self.al.is_initialized:
             for ind in candidates:
                 if not ind.fitness.valid:
                     continue
@@ -1207,13 +1520,24 @@ class StrategyMultiObjective(object):
         DEAP's ``tools.sortLogNondominated`` requires every individual to
         have a valid fitness — including infeasibles would crash the sort.
 
-        Filtered infeasibles are appended directly to ``not_chosen`` so they
-        still surface to ``update()`` via the population it received, and
-        their ``_g`` vectors feed the CHT covariance update.
+        Disposition of filtered infeasibles depends on the CHT family:
+
+        * Chocat (CovarianceCHT / CHT_AL): appended to ``not_chosen`` so
+          they surface to ``update()`` — their ``_g`` vectors feed the
+          post-eval CHT call and the σ-down failure branch.
+        * Arnold (ArnoldCHT / ArnoldCHT_AL): dropped entirely.  All Arnold
+          CHT work already happened in ``apply_arnold_infeasibility()``
+          before evaluation, and the paper specifies infeasibles
+          contribute nothing to σ in either direction.  Surfacing them to
+          ``update()`` would drive σ down via the not_chosen branch — wrong.
         """
         # Partition: feasibles drive selection; infeasibles bypass it.
         feasible    = [ind for ind in candidates if getattr(ind, "_feasible", True)]
         infeasibles = [ind for ind in candidates if not getattr(ind, "_feasible", True)]
+
+        # Arnold: infeasibles must not influence σ in either direction.
+        if cht_method(self.sim_type) == 'arnold':
+            infeasibles = []
 
         if len(feasible) <= self.mu:
             return feasible, infeasibles
