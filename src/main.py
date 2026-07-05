@@ -234,7 +234,7 @@ def _detect_sentinels(ind, fit, g_al):
     sentinel modes are independent:
 
     - **PITOT3 sentinel**: the shock-speed solver hit its failure
-      marker, encoded as ``delta_vs1 = 3500 m/s``.  Recovered from
+      marker, encoded as ``delta_vs1 = 4900 m/s``.  Recovered from
       ``g_al + ind.al_tol``.  This case can leave the per-individual
       ``fitness`` *real* (SPARK succeeded), so detecting it on fitness
       alone (the original Fix-S3 filter) misses these individuals.
@@ -259,8 +259,9 @@ def _detect_sentinels(ind, fit, g_al):
     if g_al is None:
         ind._pitot3_sentinel = False
     else:
-        # Threshold 1 m/s below the exact 3500 sentinel; real PITOT3
-        # results are well below 3000 so this never false-positives.
+        # Threshold 1 m/s below the exact 4900 sentinel; a genuinely
+        # measured delta_vs1 only reaches 4900 when vs1 -> 0, which already
+        # returns the sentinel, so this never false-positives on a real run.
         al_tol = getattr(ind, "al_tol", 100.0)
         delta_vs = float(np.asarray(g_al)[0]) + al_tol
         ind._pitot3_sentinel = delta_vs >= (_PITOT3_FAILURE_SENTINEL - 1.0)
@@ -284,7 +285,7 @@ def _cheap_al_proxy(strategy):
     **Fix-S1: sentinel filter.** Parents whose fitness.values are at
     the (1, 1) reference (heavy-evaluator failures) are excluded from
     the proxy mean.  Their g_al is a sentinel-implied value
-    (PITOT3 → +3400 m/s) that does not reflect the true geometric
+    (PITOT3 → +4800 m/s, i.e. 4900 - al_tol) that does not reflect the true geometric
     state of the population; including them skews the mean and
     pollutes pycma's CDF-based μ-update.
 
@@ -781,7 +782,7 @@ def _append_strategy_per_gen_row(out_dir, gen, strategy):
         floor is not None and silent >= silent_thresh
     )
 
-    # Diag-1 (split): differentiate PITOT3 sentinels (delta_vs1 = 3500;
+    # Diag-1 (split): differentiate PITOT3 sentinels (delta_vs1 = 4900;
     # fit may be real) from SPARK sentinels (fit ≈ (1, 1); g_al may be
     # real).  Reading flags rather than re-computing keeps the
     # definitions consistent with the filters in _cheap_al_proxy etc.
@@ -849,7 +850,7 @@ def main(experiment_type, seed_population=None):
     N           = 6
     pop_size    = experiment_type[1]
     MU, LAMBDA  = pop_size, pop_size
-    NGEN        = 350
+    NGEN        = 300
     sim_type    = experiment_type[0]
     p4_treatment = experiment_type[3]
     step_size   = experiment_type[2]
@@ -1110,8 +1111,9 @@ def main(experiment_type, seed_population=None):
     #
     # Fix-S2: filter sentinel individuals (heavy-evaluator failures
     # encoded as fitness ≈ (1, 1)) from the bootstrap sample.  Their
-    # g_al is a sentinel-implied value (PITOT3 → +3400 m/s) that
-    # inflates iqr(G) and biases the initial μ_AL too small.
+    # g_al is a sentinel-implied value (PITOT3 → +4800 m/s, i.e.
+    # 4900 - al_tol) that inflates iqr(G) and biases the initial μ_AL
+    # too small.
     if is_al_active(sim_type):
         F_pop, G_AL = [], []
         for ind in population:
@@ -1298,7 +1300,7 @@ def main(experiment_type, seed_population=None):
                 ind._spark_sentinel = False
             # Failure-sentinel detection in legacy 3-objective mode:
             # fit[0] is normalised delta_vs1 and == 1.0 means PITOT3 hit
-            # its 3500 m/s sentinel.  In CHT_AL mode that path is already
+            # its 4900 m/s sentinel.  In CHT_AL mode that path is already
             # caught inside evaluate() (returns fit=None), so skip the
             # check rather than indexing a 2-tuple at slot [0] which would
             # be hold_time, not delta_vs1.

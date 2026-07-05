@@ -25,7 +25,6 @@ Per-individual filesystem layout::
     ├── DEAP_<i>.py                  ← the templated job script
     ├── ideal_air.lua                ← symlinked gas models
     ├── he-ar-gas-model.lua
-    ├── cea-lut-air.lua
     ├── piston-0000-history.data     ← produced by --piston-history
     └── DEAP_<i>/                    ← L1d's job-name subdirectory
         ├── diaphragm-0000.data
@@ -77,9 +76,12 @@ SENTINEL_TUPLE     = (*SENTINEL_OBJECTIVE, SENTINEL_VS_DELTA, False)
 VS1_TARGET         = 4900.0
 
 # Gas-model file names (these match the user's existing prep-gas outputs
-# in the project root).  cea-lut-air.lua is not yet generated; absence
-# raises a clear error rather than silently failing inside l1d4-prep.
-GAS_MODEL_FILES = ("ideal_air.lua", "he-ar-gas-model.lua", "cea-lut-air.lua")
+# in the project root) and are symlinked into each per-individual job dir.
+# Both the driver gas and the shock-tube test gas use he-ar-gas-model.lua
+# (the test gas is pure He via a massf override); the reservoir uses
+# ideal_air.lua.  A missing file raises a clear error rather than silently
+# failing inside l1d4-prep.
+GAS_MODEL_FILES = ("ideal_air.lua", "he-ar-gas-model.lua")
 
 # Per-evaluation budget.  L1d's t_finish is set to 28 ms simulated time;
 # wall-clock varies with mesh.  The 60-min wall budget mirrors the SPARK
@@ -123,7 +125,7 @@ MESH_SCALE_FACTOR    = 4      # per-slug ncells multiplier
 TUBE_N               = 4000   # tube-wall mesh resolution
 
 # Time-stepping constants.
-T_FINISH             = 70.0e-3
+T_FINISH             = 90.0e-3
 T_SWITCH             = 20.0e-3
 
 # Provisional X2-default transducer x-positions (relative to PD at x=0).
@@ -174,7 +176,6 @@ config.title = "X2 driver opt: individual {ind_number}"
 # ─── Gas models ──────────────────────────────────────────────────────────
 gm_ideal_air = add_gas_model("ideal_air.lua")
 gm_he_ar     = add_gas_model("he-ar-gas-model.lua")
-gm_cea_air   = add_gas_model("cea-lut-air.lua")
 
 # Per-individual He/Ar mass fractions derived from percent_He.
 massf_he_ar = config.gmodels[gm_he_ar].molef2massf(
@@ -217,8 +218,9 @@ driver_gas = GasSlug(
 primary_diaphragm = Diaphragm(x0={pd_x:.4f}, p_burst={p4:.6e}, state=0)
 
 test_gas = GasSlug(
-    gmodel_id=gm_cea_air,
+    gmodel_id=gm_he_ar,
     p={test_gas_p1:.6e}, T=T_amb, vel=0.0,
+    massf={{"He": 1.0, "Ar": 0.0}},
     ncells={n_test}, cluster_strength=1.1, to_end_L=True,
     viscous_effects=0, hcells=1,
     label="test gas",

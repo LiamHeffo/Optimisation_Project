@@ -17,8 +17,9 @@ logbook counters) is untouched.
 
 Sentinel encoding (preserved across the SPARK → L1d port):
     objectives  : (hold_time, impact_speed) = (0, 350) on failure
-    constraint  : delta_vs1 = 3500 on failure (the _PITOT3_FAILURE_SENTINEL
-                  constant that main._detect_sentinels grep against).
+    constraint  : delta_vs1 = 4900 on failure (the _PITOT3_FAILURE_SENTINEL
+                  constant that main._detect_sentinels greps against; equals
+                  VS1_TARGET, i.e. |vs1 - 4900| with vs1 -> 0).
 """
 import sys
 
@@ -31,19 +32,25 @@ from problem.config import (
 )
 from problem.feasibility import evaluate_constraints, is_feasible
 from problem.transforms import variable_untransformation, normalise_fitness
-from problem.l1d_job import run_l1d, TRANSDUCER_XS
+from problem.l1d_job import run_l1d, TRANSDUCER_XS, SENTINEL_VS_DELTA
 from utils import valid
 from algorithm.penalty import ClosestValidPenalty
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sentinel constant — name retained for main._detect_sentinels (which still
-# imports it as _PITOT3_FAILURE_SENTINEL).  Semantically it is now the L1d
-# vs1-failure sentinel, but the numerical value is the same so the rest of
-# the pipeline does not need to change.
+# imports it as _PITOT3_FAILURE_SENTINEL).  Semantically it is the L1d
+# vs1-failure sentinel: the delta_vs1 = |vs1 - VS1_TARGET| recorded when no
+# shock is detected (vs1 -> 0), i.e. VS1_TARGET (= 4900) itself.
+#
+# Single-sourced from l1d_job.SENTINEL_VS_DELTA — the value run_l1d already
+# returns on failure — so the run's sentinel and the value the rest of the
+# pipeline matches against can never drift apart (they previously did:
+# run_l1d said 4900 while this constant said 3500, so every failure was
+# silently recorded as 3500).
 # ─────────────────────────────────────────────────────────────────────────────
 
-_PITOT3_FAILURE_SENTINEL = 3500
+_PITOT3_FAILURE_SENTINEL = SENTINEL_VS_DELTA
 
 
 # ─────────────────────────────────────────────────────────────────────────────
