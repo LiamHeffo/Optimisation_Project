@@ -61,6 +61,7 @@ USAGE
 from __future__ import annotations
 
 import argparse
+import io
 import re
 import sys
 from pathlib import Path
@@ -231,7 +232,12 @@ def load_tindx_to_t(job_subdir: Path, piston_file: Path | None) -> dict[int, flo
     """
     times_file = job_subdir / "times.data"
     if times_file.exists():
-        arr = np.loadtxt(times_file, comments="#")
+        # Strip blank/whitespace-only lines before parsing — L1d can leave a
+        # partial blank row when a simulation terminates at tindx=0.
+        clean = "\n".join(
+            ln for ln in times_file.read_text().splitlines() if ln.strip()
+        )
+        arr = np.loadtxt(io.StringIO(clean), comments="#")
         if arr.ndim == 1:
             arr = arr[np.newaxis, :]
         return {int(row[0]): float(row[1]) for row in arr}

@@ -71,9 +71,9 @@ PISTON_HALF_LENGTH = (PISTON_FRONT_X - LAUNCHER_LARGE_D[0]) / 2   # = 0.1105 m
 # Failure sentinels — must match the values the rest of the pipeline
 # (evaluate.py, main.py _detect_sentinels) expects.
 SENTINEL_OBJECTIVE = (0.0, 350.0)
-SENTINEL_VS_DELTA  = 4900.0
+SENTINEL_VS_DELTA  = 3585.0
 SENTINEL_TUPLE     = (*SENTINEL_OBJECTIVE, SENTINEL_VS_DELTA, False)
-VS1_TARGET         = 4900.0
+VS1_TARGET         = 3585.0
 
 # Gas-model file names (these match the user's existing prep-gas outputs
 # in the project root) and are symlinked into each per-individual job dir.
@@ -121,7 +121,7 @@ GRACE_SIM_TIME_S           = 5.0e-3
 WATCHDOG_KILL_GRACE_S      = 5
 
 # Mesh & wall-resolution controls.
-MESH_SCALE_FACTOR    = 4      # per-slug ncells multiplier
+MESH_SCALE_FACTOR    = 1      # per-slug ncells multiplier
 TUBE_N               = 4000   # tube-wall mesh resolution
 
 # Time-stepping constants.

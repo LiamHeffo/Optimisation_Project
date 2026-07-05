@@ -52,12 +52,12 @@ from problem.l1d_job import run_l1d, TRANSDUCER_XS, SENTINEL_TUPLE
 # ])
 
 x_phys = np.array([
-    88.0,       # percent_He     [%]
-    170.3e3,      # driver_p       [Pa]
-    21.5e6,     # p4 (burst)     [Pa]
-    0.075,      # D_throat       [m]
-    2.94e6,      # reservoir_p    [Pa]
-    0.08,       # buffer_length  [m]
+    80.0,       # percent_He     [%]
+    92.8e3,      # driver_p       [Pa]
+    27.9e6,     # p4 (burst)     [Pa]
+    0.085,      # D_throat       [m]
+    6.85e6,      # reservoir_p    [Pa]
+    0.045,       # buffer_length  [m]
 ])
 
 
@@ -117,7 +117,7 @@ else:
     print("L1d RESULT: OK")
     print(f"  t_hold       = {t_hold * 1e3:.3f} ms")
     print(f"  impact_speed = {impact_speed:.1f} m/s")
-    print(f"  delta_vs     = {delta_vs:.1f} m/s  (|vs1 - 4900|; target = 0)")
+    print(f"  delta_vs     = {delta_vs:.1f} m/s  (|vs1 - 3585|; target = 0)")
     if t_hold <= 0:
         print("  WARNING: t_hold = 0 — diaphragm may not have burst or window never entered")
     if impact_speed >= sentinel_imp:

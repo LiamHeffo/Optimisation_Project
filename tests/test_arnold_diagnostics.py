@@ -49,7 +49,7 @@ def _make_parents(x_norms):
         ind.ind_number = i
         ind.bounds = BOUNDS
         ind.sim_type = 'ArnoldCHT_AL'
-        ind.al_tol = 4900.0
+        ind.al_tol = 3585.0
         ind.fitness.values = (0.5 + 0.01 * i, 0.5 - 0.005 * i)
         ind._feasible = True
         ind._g = evaluate_constraints(x, BOUNDS)
@@ -65,7 +65,7 @@ def _run_synthetic(out_dir, n_gen=8, mu=6):
     strat = StrategyMultiObjective(
         pop, sigma=0.6, mu=mu, lambda_=mu,           # big σ ⇒ many infeasibles
         sim_type='ArnoldCHT_AL', p4_treatment=None, bounds=BOUNDS,
-        al_tol=4900.0, n_constraints=n_constraints,
+        al_tol=3585.0, n_constraints=n_constraints,
     )
     assert cht_method('ArnoldCHT_AL') == 'arnold'
 

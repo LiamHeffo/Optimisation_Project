@@ -43,7 +43,7 @@ def _make_parents(x_norms, sim_type):
         ind.ind_number = i
         ind.bounds = BOUNDS
         ind.sim_type = sim_type
-        ind.al_tol = 4900.0
+        ind.al_tol = 3585.0
         # synthetic 2-objective fitness (both minimised, in [0,1])
         ind.fitness.values = (0.5 + 0.01 * i, 0.5 - 0.005 * i)
         ind._feasible = True
@@ -60,7 +60,7 @@ def test_arnold_constructs_with_v_accumulators():
     strat = StrategyMultiObjective(
         pop, sigma=0.1, mu=4, lambda_=4,
         sim_type='ArnoldCHT_AL', p4_treatment=None, bounds=BOUNDS,
-        al_tol=4900.0, n_constraints=n_constraints,
+        al_tol=3585.0, n_constraints=n_constraints,
     )
     assert is_al_active('ArnoldCHT_AL')
     assert cht_method('ArnoldCHT_AL') == 'arnold'
@@ -78,7 +78,7 @@ def test_arnold_requires_n_constraints():
         StrategyMultiObjective(
             pop, sigma=0.1, mu=4, lambda_=4,
             sim_type='ArnoldCHT_AL', p4_treatment=None, bounds=BOUNDS,
-            al_tol=4900.0,  # n_constraints omitted on purpose
+            al_tol=3585.0,  # n_constraints omitted on purpose
         )
     except ValueError as e:
         assert 'n_constraints' in str(e)
@@ -93,7 +93,7 @@ def test_arnold_consume_updates_A_and_keeps_it_psd():
     strat = StrategyMultiObjective(
         pop, sigma=0.5, mu=4, lambda_=4,            # big σ ⇒ some infeasibles
         sim_type='ArnoldCHT_AL', p4_treatment=None, bounds=BOUNDS,
-        al_tol=4900.0, n_constraints=n_constraints,
+        al_tol=3585.0, n_constraints=n_constraints,
     )
     A_before = [A.copy() for A in strat.A]
 
@@ -129,7 +129,7 @@ def test_arnold_full_generation_runs():
     strat = StrategyMultiObjective(
         pop, sigma=0.15, mu=6, lambda_=6,
         sim_type='ArnoldCHT_AL', p4_treatment=None, bounds=BOUNDS,
-        al_tol=4900.0, n_constraints=n_constraints,
+        al_tol=3585.0, n_constraints=n_constraints,
     )
 
     def _check(ind):

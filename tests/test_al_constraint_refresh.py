@@ -58,18 +58,18 @@ def _make_strategy(parents, schedule):
     return StrategyMultiObjective(
         parents, sigma=0.1, mu=len(parents), lambda_=len(parents),
         sim_type='ArnoldCHT_AL', p4_treatment=None, bounds=BOUNDS,
-        al_tol=4900.0, n_constraints=n_constraints,
+        al_tol=3585.0, n_constraints=n_constraints,
         features={'al_tol_schedule': schedule},
     )
 
 
 def test_refresh_unstales_parent_g_al():
-    """A parent born at al_tol=4900 must be re-evaluated against the
+    """A parent born at al_tol=3585 must be re-evaluated against the
     current (tighter) al_tol once the schedule has progressed."""
     rng = np.random.default_rng(0)
     raw = [2412.0, 3000.0, 1800.0, 2600.0]
-    parents = _make_parents(_feasible_norm_pop(4, rng), raw, birth_tol=4900.0)
-    strat = _make_strategy(parents, schedule=[4900.0, 100.0, 100, 250])
+    parents = _make_parents(_feasible_norm_pop(4, rng), raw, birth_tol=3585.0)
+    strat = _make_strategy(parents, schedule=[3585.0, 100.0, 100, 250])
 
     # Jump to gen 250 where al_tol has tightened to its floor of 100.
     strat._generation = 250
@@ -88,23 +88,23 @@ def test_refresh_unstales_parent_g_al():
 def test_refresh_intermediate_generation_interpolates():
     rng = np.random.default_rng(1)
     raw = [2412.0, 3000.0]
-    parents = _make_parents(_feasible_norm_pop(2, rng), raw, birth_tol=4900.0)
-    strat = _make_strategy(parents, schedule=[4900.0, 100.0, 100, 250])
+    parents = _make_parents(_feasible_norm_pop(2, rng), raw, birth_tol=3585.0)
+    strat = _make_strategy(parents, schedule=[3585.0, 100.0, 100, 250])
 
     strat._generation = 175           # midpoint of [100, 250]
     cur = strat.current_al_tol()
-    assert np.isclose(cur, 2500.0)    # 4900 + (100-4900)*0.5
+    assert np.isclose(cur, 1842.5)    # 3585 + (100-3585)*0.5
 
     strat.refresh_al_constraints(offspring=[])
     for p, r in zip(strat.parents, raw):
-        assert np.isclose(p._g_al[0], r - 2500.0)
+        assert np.isclose(p._g_al[0], r - 1842.5)
 
 
 def test_refresh_offspring_noop_at_birth_tol():
     """An offspring evaluated this gen at current al_tol is unchanged."""
     rng = np.random.default_rng(2)
-    parents = _make_parents(_feasible_norm_pop(2, rng), [2412.0, 3000.0], 4900.0)
-    strat = _make_strategy(parents, schedule=[4900.0, 100.0, 100, 250])
+    parents = _make_parents(_feasible_norm_pop(2, rng), [2412.0, 3000.0], 3585.0)
+    strat = _make_strategy(parents, schedule=[3585.0, 100.0, 100, 250])
     strat._generation = 175
     cur = strat.current_al_tol()
 
@@ -123,8 +123,8 @@ def test_refresh_skips_individuals_without_measurement():
     """Box/phys-infeasible individuals (never L1d-evaluated) carry no raw
     measurement and must be left untouched."""
     rng = np.random.default_rng(3)
-    parents = _make_parents(_feasible_norm_pop(2, rng), [2412.0, 3000.0], 4900.0)
-    strat = _make_strategy(parents, schedule=[4900.0, 100.0, 100, 250])
+    parents = _make_parents(_feasible_norm_pop(2, rng), [2412.0, 3000.0], 3585.0)
+    strat = _make_strategy(parents, schedule=[3585.0, 100.0, 100, 250])
     strat._generation = 250
 
     ghost = creator.Individual2D(parents[0][:])
@@ -140,9 +140,9 @@ def test_refresh_noop_without_schedule_reproduces_birth_value():
     reproduces the birth g_al exactly (a safe no-op)."""
     rng = np.random.default_rng(4)
     raw = [2412.0, 3000.0]
-    parents = _make_parents(_feasible_norm_pop(2, rng), raw, birth_tol=4900.0)
-    strat = _make_strategy(parents, schedule=None)     # static al_tol = 4900
+    parents = _make_parents(_feasible_norm_pop(2, rng), raw, birth_tol=3585.0)
+    strat = _make_strategy(parents, schedule=None)     # static al_tol = 3585
     strat._generation = 300
     strat.refresh_al_constraints(offspring=[])
     for p, r in zip(strat.parents, raw):
-        assert np.isclose(p._g_al[0], r - 4900.0)
+        assert np.isclose(p._g_al[0], r - 3585.0)

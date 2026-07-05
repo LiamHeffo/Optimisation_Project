@@ -30,12 +30,12 @@ MAX_BOUND = np.ones(N) + 1
 APPROX_IDEAL = (0, 0.005, 0)
 
 # Nadir point: worst expected values for each objective
-#   (delta_vs1=4900 m/s, hold_time=0 s, impact_speed=350 m/s)
-# delta_vs1's nadir matches the vs1-failure sentinel (|vs1 - 4900| with
-# vs1 -> 0 = 4900) so a sentinel individual normalises to exactly 1.0,
+#   (delta_vs1=3585 m/s, hold_time=0 s, impact_speed=350 m/s)
+# delta_vs1's nadir matches the vs1-failure sentinel (|vs1 - 3585| with
+# vs1 -> 0 = 3585) so a sentinel individual normalises to exactly 1.0,
 # which the legacy/Penalty-mode detection (normalised delta_vs1 == 1.0)
 # relies on.
-APPROX_NADIR = (4900, 0, 350)
+APPROX_NADIR = (3585, 0, 350)
 
 # 2-objective reference points used by the AL constraint-handling path
 # (CHT_AL sim_type), where delta_vs1 is no longer a Pareto objective but a

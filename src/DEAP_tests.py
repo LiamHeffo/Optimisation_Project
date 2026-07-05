@@ -411,7 +411,7 @@ def constraint_function(x1, bounds):
     # print(f"The end working directory is {os.getcwd()}\n")
 
 
-    return np.abs(shock_tube.vs - 4900)
+    return np.abs(shock_tube.vs - 3585)
 
 def objective_function(x, bounds):
     ####################################################################################################################
