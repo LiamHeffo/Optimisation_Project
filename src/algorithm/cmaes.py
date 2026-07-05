@@ -299,15 +299,18 @@ class StrategyMultiObjective(object):
         # 18-element box+physical g vector; AL adapts a Lagrangian on the
         # 1-element g_AL = delta_vs1 - al_tol.  The two never share data.
         #
-        # set_algorithm(3) selects the g-CDF-based mu-update (muplus3 /
-        # muminus3), which has no scalar-f dependency — making it usable
-        # in multi-objective settings where there is no single fitness.
-        # set_dufosse2020() then overrides chi_domega = 2^(1/sqrt(n)) and
-        # k1 = 10 per Section 4.2 of Dufossé & Hansen 2020.
+        # set_algorithm(1) selects the published Dufossé & Hansen 2020
+        # Method 1 μ-update: increase μ by χ^¼ when μg² < k1·|Δh|/n or
+        # the constraint looks inactive (k2·|Δg| < |g|), else divide by χ.
+        # The self-limiting equilibrium μ ≈ k1·|Δh|/(n·g²) keeps the AL
+        # penalty term comparable in magnitude to the objective, preventing
+        # the ratcheting growth seen with the CDF rule (algorithm 3) in the
+        # all-infeasible regime.  set_dufosse2020() then sets chi_domega =
+        # 2^(1/√n) and k1 = 10 per Section 4.2 of that paper.
         self.al_tol = float(params.get("al_tol", 100.0))
         if is_al_active(self.sim_type):
             self.al = AugmentedLagrangian(self.dim, equality=False)
-            self.al.set_algorithm(3)
+            self.al.set_algorithm(1)
             self.al.set_dufosse2020()
             # Quiet pycma's internal logging — we maintain our own
             # per-generation diagnostics (see al_diag_buffer below).
@@ -575,11 +578,9 @@ class StrategyMultiObjective(object):
     def update_al(self, F_proxy_scalar, g_al_proxy, proxy_stats=None):
         """Per-generation update of γ and μ from the parent-centroid proxy.
 
-        With ``set_algorithm(3)`` the μ-update is g-only (muplus3 /
-        muminus3 use the empirical CDF of recent g values).  ``F_proxy_scalar``
-        is therefore unused inside pycma's update branch we selected, but
-        we still pass it through so the ``self.f`` cached state stays
-        consistent for any future algorithm switch.
+        With ``set_algorithm(1)`` (Dufossé & Hansen 2020 Method 1) the
+        μ-update uses the ΔH term (change in augmented objective), so
+        ``F_proxy_scalar`` is actively consumed by pycma's update.
 
         Gating rationale: we used to short-circuit on
         ``not self.al.is_initialized``, but that flag stays False until
