@@ -58,12 +58,25 @@ from cma.constraints_handler import AugmentedLagrangian
 CHOCAT_SIM_TYPES      = ('CovarianceCHT', 'CHT_AL')
 ARNOLD_SIM_TYPES      = ('ArnoldCHT', 'ArnoldCHT_AL')
 CHT_ENABLED_SIM_TYPES = CHOCAT_SIM_TYPES + ARNOLD_SIM_TYPES
-AL_ENABLED_SIM_TYPES  = ('CHT_AL', 'ArnoldCHT_AL')
+# resample : pure rejection sampling.  Infeasible offspring are neither
+#            repaired (crossover) nor learned from (Arnold/Chocat cov
+#            update); they are simply redrawn from the UNCHANGED (σ, A)
+#            until feasible.  The rejection baseline that active-adaptation
+#            CHTs are measured against.  NOT a member of CHT_ENABLED_SIM_TYPES
+#            on purpose: cht_method() returns None, so the Arnold/Chocat
+#            per-generation branches in main.py never fire for it.
+RESAMPLE_SIM_TYPES    = ('Resampling', 'Resampling_AL')
+AL_ENABLED_SIM_TYPES  = ('CHT_AL', 'ArnoldCHT_AL', 'Resampling_AL')
 
 
 def is_cht_active(sim_type):
     """True iff a CHT (Chocat or Arnold family) is engaged."""
     return sim_type in CHT_ENABLED_SIM_TYPES
+
+
+def is_resample_active(sim_type):
+    """True iff pure rejection resampling handles pre-eval infeasibility."""
+    return sim_type in RESAMPLE_SIM_TYPES
 
 
 def is_al_active(sim_type):
@@ -714,14 +727,19 @@ class StrategyMultiObjective(object):
                                 new_individual[k] = 4.0 - new_individual[k]
                             reflections += 1
 
-                # Any CHT-active sim_type (Chocat or Arnold family) and the
-                # Penalty mode bypass the in-generate() repair while-loop.
-                # Chocat consumes infeasibles via covariance shrinkage in
+                # Any CHT-active sim_type (Chocat or Arnold family), the
+                # rejection-resampling family, and Penalty mode bypass the
+                # in-generate() crossover-repair while-loop.  Chocat consumes
+                # infeasibles via covariance shrinkage in
                 # resample_infeasibles()/update(); Arnold consumes them via
-                # Eq. 6 + Eq. 7 in apply_arnold_infeasibility().  crossover()
-                # has no branch for either, so without this guard CHT modes
-                # would spin forever.  Penalty's handler lives in evaluate.py.
-                if self.sim_type != 'Penalty' and not is_cht_active(self.sim_type):
+                # Eq. 6 + Eq. 7 in apply_arnold_infeasibility(); Resampling
+                # redraws them in resample_infeasibles_rejection().  crossover()
+                # has no branch for any of these, so without this guard those
+                # modes would spin forever.  Penalty's handler lives in
+                # evaluate.py.
+                if (self.sim_type != 'Penalty'
+                        and not is_cht_active(self.sim_type)
+                        and not is_resample_active(self.sim_type)):
                     s = time.time()
                     while True:
                         if not self.check_feasibility(new_individual)[0]:
@@ -1272,6 +1290,79 @@ class StrategyMultiObjective(object):
 
         # Cap reached; return how many iterations were spent.
         return max_iterations
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Pure rejection resampling — the active-adaptation baseline
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def resample_infeasibles_rejection(self, population, feasibility_check,
+                                       max_iterations=100):
+        """Redraw infeasible offspring from the UNCHANGED distribution.
+
+        The rejection baseline that active-adaptation CHTs (Arnold, Chocat)
+        are measured against.  Under rejection, an infeasible sample carries
+        no information: its slot is simply resampled from the donor parent's
+        *unchanged* (σ_i, A_i) until a feasible draw appears or
+        ``max_iterations`` is reached.  Contrast:
+
+          * Chocat  (resample_infeasibles):        shrinks Cᵢ, then resamples.
+          * Arnold  (apply_arnold_infeasibility):  shrinks Aᵢ, then drops.
+          * here    (rejection):                   touches only the genes.
+
+        Because the accepted sample is a bona-fide draw from the (truncated)
+        parent Gaussian, resampled-feasible offspring participate fully in
+        selection AND step-size / rank-mu adaptation — nothing else about the
+        strategy changes, which is what makes this a clean one-variable
+        contrast against Arnold.
+
+        Post-conditions mirror the other pre-eval handlers so downstream code
+        stays sim_type-agnostic: every individual has ``_g`` and ``_feasible``
+        set.  A slot still infeasible after the cap is left ``_feasible=False``
+        so ``_select()`` drops it (the same end-state as an Arnold slot that
+        contributes no candidate); with the default cap of 100 this is rare.
+
+        ``feasibility_check`` has the same contract as for the other handlers:
+        a CHEAP check that does NOT call L1d.
+
+        Returns
+        -------
+        n_redraws : int
+            Total resample draws performed this generation (summed across all
+            slots) — the rejection analogue of resample_infeasibles()'s
+            iteration count, useful as a per-generation diagnostic.
+        """
+        n = self.dim
+        n_redraws = 0
+
+        for ind in population:
+            feasible, g = feasibility_check(ind)
+            ind._g = g
+            ind._feasible = feasible
+            # Parents looped in for selection carry no _ps; leave untouched.
+            if feasible or not hasattr(ind, "_ps"):
+                continue
+
+            p_idx = ind._ps[1]
+            for _ in range(max_iterations):
+                z = np.random.randn(n)
+                mutation = self.sigmas[p_idx] * np.dot(self.A[p_idx], z)
+                new_x = self.parents[p_idx] + mutation
+                for k in range(n):
+                    ind[k] = float(new_x[k])
+                n_redraws += 1
+                # Keep _Az consistent with the step that actually produced
+                # these genes (truthful, though no consumer needs it in this
+                # mode since cht_method() is None).
+                ind._Az = np.array(mutation, copy=True)
+                feasible, g = feasibility_check(ind)
+                ind._g = g
+                ind._feasible = feasible
+                if feasible:
+                    break
+            # Loop exhausted while still infeasible ⇒ ind._feasible is False;
+            # _select() drops the slot, no further action needed.
+
+        return n_redraws
 
     # ─────────────────────────────────────────────────────────────────────────
     # Arnold & Hansen 2012 CHT — one-shot infeasibility consumer

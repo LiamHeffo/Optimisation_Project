@@ -190,6 +190,36 @@ experiments:
       # al_proxy_front_only: true
       # al_proxy_g_quantile: 0.9
   - *arnold
+  # ════════════════════════════════════════════════════════════════════════
+  # CONTRAST: Resampling_AL — the rejection-sampling baseline for the CHT
+  # comparison.  IDENTICAL to the &arnold block above in every respect
+  # (pop_size, step_size, al_tol, features, ε-schedule) so the ONLY variable
+  # is the pre-eval constraint handler:
+  #   • Arnold      — infeasible offspring shrink the parent covariance
+  #                   (Eq. 6/7), then the slot is dropped.
+  #   • Resampling  — infeasible offspring are redrawn from the UNCHANGED
+  #                   (σ, A) until feasible (pure rejection); no covariance
+  #                   surgery.  Cap via features.resample_max_iterations
+  #                   (default 100); a slot still infeasible after the cap is
+  #                   dropped by selection.
+  # Dispatch both families from the SAME seed population so the contrast is
+  # not confounded by initial conditions:
+  #     python3 src/main.py --seed-npz <same npz as arnold>
+  # Two replicates (&resample / *resample) mirror the arnold pair, differing
+  # only by CMA-ES RNG draws.  Comment these two lines out to skip.
+  # ════════════════════════════════════════════════════════════════════════
+  - &resample
+    sim_type: Resampling_AL
+    pop_size: 24
+    step_size: 0.1
+    p4_treatment: null
+    al_tol: 3585
+    features:
+      psucc_sentinel_as_failure: true
+      al_tol_schedule: [3585, 100.0, 100, 250]
+      # resample_max_iterations: 100   # rejection cap (default 100)
+  - *resample
+
 
   # ────────────────────────────────────────────────────────────────────────
   # Anti-degeneration feature sweep — each entry enables exactly ONE

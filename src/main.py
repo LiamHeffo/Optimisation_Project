@@ -59,7 +59,7 @@ from algorithm.toolbox   import Toolbox
 from algorithm.hypervolume import HyperVolume
 from algorithm.cmaes     import (
     StrategyMultiObjective,
-    is_al_active, is_cht_active, cht_method,
+    is_al_active, is_cht_active, cht_method, is_resample_active,
 )
 from problem.config      import (
     APPROX_IDEAL, APPROX_NADIR,
@@ -1219,7 +1219,7 @@ def main(experiment_type, seed_population=None):
         # In the AL modes the CHT only operates on box+physical g (the
         # 18-element vector); delta_vs1 is handled separately by the AL
         # in selection, not via CHT shrinkage.
-        if is_cht_active(sim_type):
+        if is_cht_active(sim_type) or is_resample_active(sim_type):
             # Feature C1 (cht_resample_tol): permit slight constraint
             # violations during the CHT-resample loop.  Offspring with
             # max(g) ≤ tol pass through without invoking another CHT
@@ -1229,7 +1229,11 @@ def main(experiment_type, seed_population=None):
             # vector mixes box bounds (∼[−1, 1]) and physical
             # constraints (∼Pa, m); a scalar tol applies uniformly.
             # Calibrate tol with the smallest meaningful violation in
-            # mind — see problem/feasibility.py for the layout.
+            # mind — see problem/feasibility.py for the layout.  The same
+            # _check is shared by every pre-eval handler (Chocat / Arnold /
+            # rejection) so they reject on an identical feasibility set —
+            # the property that makes swapping the handler a clean
+            # one-variable experiment.
             resample_tol = (
                 features.get("cht_resample_tol") if isinstance(features, dict) else None
             ) or 0.0
@@ -1243,7 +1247,7 @@ def main(experiment_type, seed_population=None):
                 )
                 print(f"resample iterations this gen = {n_iter}")
                 toolbox.logbook.bookshelf['resample_iterations'][gen] = n_iter
-            else:
+            elif cht_method(sim_type) == 'arnold':
                 # Arnold (ArnoldCHT / ArnoldCHT_AL): one-shot per parent.
                 # Infeasibles are consumed via Eq. 6 + Eq. 7 BEFORE
                 # evaluation and marked _feasible=False so evaluate()
@@ -1253,6 +1257,21 @@ def main(experiment_type, seed_population=None):
                     population, feasibility_check=_check,
                 )
                 toolbox.logbook.bookshelf['resample_iterations'][gen] = 0
+            else:
+                # Resampling / Resampling_AL: pure rejection.  Infeasible
+                # slots are redrawn from the UNCHANGED (σ, A) until feasible
+                # or the cap is hit; no covariance surgery, no repair.  A
+                # still-infeasible slot after the cap is dropped by selection.
+                resample_cap = (
+                    features.get("resample_max_iterations")
+                    if isinstance(features, dict) else None
+                ) or 100
+                n_redraws = strategy.resample_infeasibles_rejection(
+                    population, feasibility_check=_check,
+                    max_iterations=resample_cap,
+                )
+                print(f"rejection resample draws this gen = {n_redraws}")
+                toolbox.logbook.bookshelf['resample_iterations'][gen] = n_redraws
 
         # Retry logic for transient evaluation failures
         try:

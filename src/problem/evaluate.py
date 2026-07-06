@@ -177,9 +177,13 @@ def evaluate(x):
             fit = ClosestValidPenalty.wrapper(x)
         return fit, g, None
 
-    if x.sim_type in ("CHT_AL", "ArnoldCHT_AL"):
-        # AL family (Chocat or Arnold covariance): delta_vs becomes the
-        # AL constraint; objectives are 2-D (hold_time, impact).
+    if x.sim_type in ("CHT_AL", "ArnoldCHT_AL", "Resampling_AL"):
+        # AL family: delta_vs becomes the AL constraint; objectives are 2-D
+        # (hold_time, impact).  The pre-eval handler differs by sim_type
+        # (Chocat cov-shrink / Arnold cov-shrink / pure rejection) but the
+        # evaluation contract here is identical.  NOTE: this tuple must track
+        # AL_ENABLED_SIM_TYPES in algorithm/cmaes.py — a missing member here
+        # silently routes an AL run into the legacy 3-objective branch below.
         if not is_feasible(g):
             return None, g, None
         t_hold, impact, delta_vs = _evaluate_l1d(x, ind_number, x.bounds)
