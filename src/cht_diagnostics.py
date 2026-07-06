@@ -512,7 +512,18 @@ def _displayed_constraints(n_constraints: int) -> tuple[list[int], list[str]]:
         "res_p ≤ res_p_max",
         "L_buf ≤ L_buf_max",
     ]
-    return lower_indices + upper_indices, lower_labels + upper_labels
+    # Interleave so each variable's lower/upper pair are adjacent rows
+    # (lower then upper — with the heatmap's origin="lower" this puts the
+    # "var ≥ min" row directly beneath its "var ≤ max" row).  Reads far
+    # more naturally than the old "all lowers, then all uppers" split.
+    paired_indices: list[int] = []
+    paired_labels:  list[str] = []
+    for lo_i, lo_l, up_i, up_l in zip(
+        lower_indices, lower_labels, upper_indices, upper_labels
+    ):
+        paired_indices += [lo_i, up_i]
+        paired_labels  += [lo_l, up_l]
+    return paired_indices, paired_labels
 
 
 def plot_cht_diagnostics(out_dir: Path, current_gen: int) -> Path | None:
