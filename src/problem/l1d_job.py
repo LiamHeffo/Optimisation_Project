@@ -121,7 +121,7 @@ GRACE_SIM_TIME_S           = 5.0e-3
 WATCHDOG_KILL_GRACE_S      = 5
 
 # Mesh & wall-resolution controls.
-MESH_SCALE_FACTOR    = 1      # per-slug ncells multiplier
+MESH_SCALE_FACTOR    = 1     # per-slug ncells multiplier
 TUBE_N               = 4000   # tube-wall mesh resolution
 
 # Time-stepping constants.
@@ -297,9 +297,9 @@ def write_job_script(out_path, params, ind_number):
         transducer_x_2=params["transducer_xs"][1],
         t_finish=T_FINISH,
         t_switch=T_SWITCH,
-        n_res=40 * params["mesh_scale"],
-        n_drv=60 * params["mesh_scale"],
-        n_test=40 * params["mesh_scale"],
+        n_res=60 * params["mesh_scale"],
+        n_drv=90 * params["mesh_scale"],
+        n_test=60 * params["mesh_scale"],
         percent_He=params["percent_He"],
         driver_p=params["driver_p"],
         reservoir_p=params["reservoir_p"],

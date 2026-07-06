@@ -94,6 +94,14 @@ from cht_diagnostics     import drain_and_persist as _cht_drain_and_persist
 from cht_diagnostics     import drain_and_persist_al as _al_drain_and_persist
 from cht_diagnostics     import plot_cht_diagnostics as _cht_plot
 from cht_diagnostics     import write_diversity_metrics as _write_diversity_metrics
+# Single-source the diversity metric (Deb's Δ) used both for the
+# end-of-run text dump and the new per-generation diversity plot.
+from cht_diagnostics     import _diversity_for_set
+from al_plots            import (
+    plot_archive_pareto,
+    plot_epsilon_and_gal,
+    plot_diversity,
+)
 from arnold_diagnostics  import drain_and_persist as _arnold_drain_and_persist
 from arnold_diagnostics  import plot_all as _arnold_plot_all
 from utils               import parallelization_setup
@@ -196,6 +204,10 @@ OUTPUT_FOLDERS_AL = [
     "arnold_diagnostics",
     "strategy_diagnostics",
     "al_diagnostics",
+    # End-of-run post-processing figures (.eps): archive Pareto scatter,
+    # ε-schedule + per-individual g_AL, and per-generation diversity.
+    # Populated once at end of run for the AL family; see al_plots.py.
+    "postprocessing",
 ]
 
 
@@ -850,7 +862,7 @@ def main(experiment_type, seed_population=None):
     N           = 6
     pop_size    = experiment_type[1]
     MU, LAMBDA  = pop_size, pop_size
-    NGEN        = 300
+    NGEN        = 350
     sim_type    = experiment_type[0]
     p4_treatment = experiment_type[3]
     step_size   = experiment_type[2]
@@ -1160,6 +1172,17 @@ def main(experiment_type, seed_population=None):
     # Seed fitness_history with the initial population so the "every individual
     # ever sampled" plots include the starting points, not just offspring.
     fitness_history = [tuple(ind.fitness.values) for ind in population]
+
+    # Per-generation history for the end-of-run post-processing figures
+    # (AL family only; stays empty and unused otherwise).  Each is a small
+    # list appended to once per generation from the elitist parent set —
+    # negligible memory/CPU next to the heavy evaluations.
+    #   epsilon_history   : [(gen, al_tol), ...]        — ε schedule
+    #   gal_history       : [(gen, [g_al, ...]), ...]   — per-parent g_AL
+    #   diversity_history : [(gen, delta), ...]         — Deb's Δ of the front
+    epsilon_history   = []
+    gal_history       = []
+    diversity_history = []
 
     # ── Evolution ─────────────────────────────────────────────────────────
     for gen in range(NGEN):
@@ -1499,6 +1522,33 @@ def main(experiment_type, seed_population=None):
         # surviving older parents.
         _mark_chosen(gen_snapshots, strategy.parents)
 
+        # ── Post-processing history (AL family only) ─────────────────────
+        # Record, for THIS generation's elitist parent set: the scheduled ε
+        # (al_tol), each real parent's g_AL, and Deb's Δ of the parent
+        # front.  Parents carry the CURRENT-tol g_al because
+        # refresh_al_constraints() ran before update() this generation.
+        # Sentinels (heavy-evaluator failures) are excluded so the cloud
+        # and the spread metric reflect only trustworthy points — matching
+        # the archive / proxy filters elsewhere.
+        if is_al_active(sim_type):
+            gal_vals = [
+                float(np.asarray(p._g_al)[0])
+                for p in strategy.parents
+                if p.fitness.valid
+                and getattr(p, "_g_al", None) is not None
+                and not _is_sentinel(p)
+            ]
+            parent_pairs = [
+                tuple(p.fitness.values)
+                for p in strategy.parents
+                if p.fitness.valid and not _is_sentinel(p)
+            ]
+            epsilon_history.append((bookshelf_gen, current_al_tol))
+            gal_history.append((bookshelf_gen, gal_vals))
+            diversity_history.append(
+                (bookshelf_gen, _diversity_for_set(parent_pairs)["delta"])
+            )
+
         # HV is computed on the elitist parent set (size = mu, constant across
         # generations) rather than raw offspring. This removes the cardinality
         # noise that produced the discrete-plateau jumps in the convergence trace.
@@ -1581,6 +1631,29 @@ def main(experiment_type, seed_population=None):
             final_parents=strategy.parents,
             archive=getattr(strategy, "external_archive", []),
         )
+
+    # ── Post-processing figures (.eps) — AL family only ───────────────────
+    # Render the three end-of-run figures from the archive and the
+    # per-generation history collected in the loop above.  Each returns
+    # None (and writes nothing) if its input is empty, which is fine for
+    # a run that never populated the archive / bootstrapped the AL.
+    if is_al_active(sim_type):
+        postproc_dir = folders["postprocessing"]
+        p_arc = plot_archive_pareto(
+            getattr(strategy, "external_archive", []),
+            postproc_dir / "archive_pareto.eps",
+        )
+        p_eps = plot_epsilon_and_gal(
+            epsilon_history, gal_history,
+            postproc_dir / "epsilon_gal_per_gen.eps",
+        )
+        p_div = plot_diversity(
+            diversity_history,
+            postproc_dir / "diversity_per_gen.eps",
+        )
+        written = [str(p) for p in (p_arc, p_eps, p_div) if p is not None]
+        print(f"Post-processing figures: wrote {len(written)} .eps file(s) "
+              f"to {postproc_dir}")
 
     # ── D3: Arnold diagnostic figures (once, at end of run) ───────────────
     # The arnold_per_*.csv files have been appended every generation by the

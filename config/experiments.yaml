@@ -43,7 +43,7 @@
 #
 #   al_tol       : (CHT_AL only) tolerance ε in m/s for the AL constraint
 #                  g_AL(x) = delta_vs1(x) - ε ≤ 0.  Default 100 m/s
-#                  (≈ 2% of the 4900 m/s shock-speed target).  Smaller values
+#                  (≈ 2% of the 3585 m/s shock-speed target).  Smaller values
 #                  drive the AL toward a tighter delta_vs1 at the cost of
 #                  longer convergence; larger values relax the constraint.
 #
@@ -163,7 +163,7 @@ experiments:
   #                              Lagrangian on delta_vs1 (2-objective
   #                              hold_time / impact problem).
   #   • HV indicator           — default selection (no `selection: crowding`).
-  #   • al_tol_schedule        — the ε schedule [4900 → 100 over gens
+  #   • al_tol_schedule        — the ε schedule [3585 → 100 over gens
   #                              100..250].
   #   • arnold_beta / arnold_cc omitted ⇒ paper defaults 0.1/(n+2), 1/(n+2).
   # Seed with:  python3 src/init_population_l1d.py --pop-size 24 ... \
@@ -181,15 +181,16 @@ experiments:
     pop_size: 24
     step_size: 0.1
     p4_treatment: null
-    al_tol: 4900
+    al_tol: 3585
     features:
       psucc_sentinel_as_failure: true
-      al_tol_schedule: [4900, 100.0, 100, 250]
+      al_tol_schedule: [3585, 100.0, 100, 250]
       # B4 (FRONT-ALAMO-aligned proxy shaping) — uncomment to A/B against
       # the legacy mean-of-all-parents proxy.  Both default off (legacy).
       # al_proxy_front_only: true
       # al_proxy_g_quantile: 0.9
   - *arnold
+
   # ════════════════════════════════════════════════════════════════════════
   # CONTRAST: Resampling_AL — the rejection-sampling baseline for the CHT
   # comparison.  IDENTICAL to the &arnold block above in every respect
@@ -219,7 +220,6 @@ experiments:
       al_tol_schedule: [3585, 100.0, 100, 250]
       # resample_max_iterations: 100   # rejection cap (default 100)
   - *resample
-
 
   # ────────────────────────────────────────────────────────────────────────
   # Anti-degeneration feature sweep — each entry enables exactly ONE
