@@ -286,6 +286,15 @@ class StrategyMultiObjective(object):
         # diagnostics CSVs on this branch, but the records are kept in
         # memory for tests / ad-hoc inspection).
         self.arnold_diag_buffer = []
+        # Diagnostic buffer for the rejection-resampling path: one record per
+        # INFEASIBLE DRAW (the initial infeasible offspring plus every
+        # rejected redraw) consumed in resample_infeasibles_rejection().
+        # Always present so the drain stays sim_type-agnostic; only populated
+        # for the Resampling family.  ``_last_resample_stats`` carries the
+        # slot-level counts (infeasible slots / redraws / unresolved) that the
+        # per-gen drain pairs with the aggregated violation counts.
+        self.resample_diag_buffer = []
+        self._last_resample_stats = {}
 
         self.indicator = params.get("indicator", tools.hypervolume)
         self.time_spent_fixing = 0
@@ -1324,6 +1333,15 @@ class StrategyMultiObjective(object):
         ``feasibility_check`` has the same contract as for the other handlers:
         a CHEAP check that does NOT call L1d.
 
+        Side effects
+        ------------
+        - ``self.resample_diag_buffer`` gains one record per INFEASIBLE DRAW
+          (the initial infeasible offspring plus every rejected redraw), so
+          the per-gen drain can build a gen×constraint violation heatmap
+          reflecting *every* infeasible individual sampled — not just the
+          λ final offspring.  ``self._last_resample_stats`` records the
+          slot-level counts for the same drain.
+
         Returns
         -------
         n_redraws : int
@@ -1333,6 +1351,8 @@ class StrategyMultiObjective(object):
         """
         n = self.dim
         n_redraws = 0
+        n_infeasible_slots = 0     # offspring slots infeasible on their first draw
+        n_unresolved = 0           # slots still infeasible after the cap (dropped)
 
         for ind in population:
             feasible, g = feasibility_check(ind)
@@ -1343,6 +1363,11 @@ class StrategyMultiObjective(object):
                 continue
 
             p_idx = ind._ps[1]
+            n_infeasible_slots += 1
+            # The initial (generate()-produced) offspring is itself an
+            # infeasible individual sampled — record it before redrawing.
+            self._record_resample_violation(p_idx, g)
+
             for _ in range(max_iterations):
                 z = np.random.randn(n)
                 mutation = self.sigmas[p_idx] * np.dot(self.A[p_idx], z)
@@ -1359,10 +1384,39 @@ class StrategyMultiObjective(object):
                 ind._feasible = feasible
                 if feasible:
                     break
+                # Rejected redraw — another infeasible individual sampled.
+                self._record_resample_violation(p_idx, g)
             # Loop exhausted while still infeasible ⇒ ind._feasible is False;
-            # _select() drops the slot, no further action needed.
+            # _select() drops the slot.
+            if not ind._feasible:
+                n_unresolved += 1
 
+        self._last_resample_stats = {
+            "n_infeasible_slots": n_infeasible_slots,
+            "n_redraws":          n_redraws,
+            "n_unresolved":       n_unresolved,
+        }
         return n_redraws
+
+    def _record_resample_violation(self, parent_idx, g):
+        """Append one infeasible-draw record to ``resample_diag_buffer``.
+
+        Records which constraints this draw violated — finite ``g_j > 0``,
+        the same "active" definition Arnold/Chocat use (``+inf`` physical-
+        space slots emitted for a box violation are skipped; the box
+        violation itself carries a finite-positive entry).  Called once per
+        infeasible draw so the drained counts reflect EVERY infeasible
+        individual sampled across all rejection draws.
+        """
+        active_js = [
+            j for j in range(len(g))
+            if np.isfinite(g[j]) and g[j] > 0.0
+        ]
+        self.resample_diag_buffer.append({
+            "parent_idx": int(parent_idx),
+            "active_js":  active_js,
+            "m_active":   len(active_js),
+        })
 
     # ─────────────────────────────────────────────────────────────────────────
     # Arnold & Hansen 2012 CHT — one-shot infeasibility consumer

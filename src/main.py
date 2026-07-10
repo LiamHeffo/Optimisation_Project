@@ -104,6 +104,8 @@ from al_plots            import (
 )
 from arnold_diagnostics  import drain_and_persist as _arnold_drain_and_persist
 from arnold_diagnostics  import plot_all as _arnold_plot_all
+from resample_diagnostics import drain_and_persist as _resample_drain_and_persist
+from resample_diagnostics import plot_all as _resample_plot_all
 from utils               import parallelization_setup
 
 
@@ -202,6 +204,7 @@ OUTPUT_FOLDERS_AL = [
     "summary",
     "cht_diagnostics",
     "arnold_diagnostics",
+    "resample_diagnostics",
     "strategy_diagnostics",
     "al_diagnostics",
     # End-of-run post-processing figures (.eps): archive Pareto scatter,
@@ -1507,6 +1510,18 @@ def main(experiment_type, seed_population=None):
                 n_lambda=LAMBDA,
             )
 
+        # Drain resample diagnostics for this generation.  Mirrors the Arnold
+        # block but writes resample_per_gen.csv from the per-infeasible-draw
+        # buffer (initial offspring + every rejected redraw).  The heatmap is
+        # drawn once at end-of-run (see _resample_plot_all below).
+        if is_resample_active(sim_type):
+            _resample_drain_and_persist(
+                strategy,
+                gen=bookshelf_gen,
+                out_dir=folders["resample_diagnostics"],
+                n_lambda=LAMBDA,
+            )
+
         # Drain AL diagnostics (one row per generation) — only writes
         # anything when is_al_active(sim_type); for other sim_types the
         # buffer is empty and this is a no-op write of zero rows.
@@ -1665,6 +1680,15 @@ def main(experiment_type, seed_population=None):
         figs = _arnold_plot_all(folders["arnold_diagnostics"])
         print(f"Arnold diagnostics: wrote {len(figs)} figure(s) to "
               f"{folders['arnold_diagnostics']}")
+
+    # ── Resample diagnostic figures (once, at end of run) ─────────────────
+    # resample_per_gen.csv has been appended every generation by the drain
+    # block.  Emit the per-constraint violation heatmap (all draws) and the
+    # infeasible-draws-per-generation trace from it.
+    if is_resample_active(sim_type):
+        figs = _resample_plot_all(folders["resample_diagnostics"])
+        print(f"Resample diagnostics: wrote {len(figs)} figure(s) to "
+              f"{folders['resample_diagnostics']}")
 
     # ── Convergence data ──────────────────────────────────────────────────
     convergence_dir = folders["convergence"]
