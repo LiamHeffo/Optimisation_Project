@@ -865,7 +865,9 @@ def main(experiment_type, seed_population=None):
     N           = 6
     pop_size    = experiment_type[1]
     MU, LAMBDA  = pop_size, pop_size
-    NGEN        = 350
+    # Number of generations.  Read from the config's per-experiment `n_gen`
+    # (tuple slot 9); older tuples without it fall back to the historic 350.
+    NGEN        = experiment_type[9] if len(experiment_type) > 9 else 350
     sim_type    = experiment_type[0]
     p4_treatment = experiment_type[3]
     step_size   = experiment_type[2]
@@ -1895,14 +1897,15 @@ if __name__ == "__main__":
     with open(_config_path) as _f:
         _config = yaml.safe_load(_f)
 
-    # 9-tuple: (sim_type, pop_size, step_size, p4_treatment, al_tol,
-    #           cht_gamma, features_dict, arnold_beta, arnold_cc).
+    # 10-tuple: (sim_type, pop_size, step_size, p4_treatment, al_tol,
+    #            cht_gamma, features_dict, arnold_beta, arnold_cc, n_gen).
     # ``al_tol``      : (AL family) constraint tolerance ε (m/s).
     # ``cht_gamma``   : (Chocat family) shrinkage strength; None ⇒ default.
     # ``features``    : dict of optional anti-degeneration toggles.  See the
     #                   YAML header comment.  Empty dict = baseline.
     # ``arnold_beta`` / ``arnold_cc`` : (Arnold family) Eq. 7 / Eq. 6
     #                   coefficients; None ⇒ paper defaults.
+    # ``n_gen``       : number of generations; omitted ⇒ historic default 350.
     experiment_types = [
         (
             exp["sim_type"],
@@ -1914,6 +1917,7 @@ if __name__ == "__main__":
             exp.get("features", {}) or {},
             exp.get("arnold_beta", None),
             exp.get("arnold_cc", None),
+            exp.get("n_gen", 350),
         )
         for exp in _config["experiments"]
     ]
