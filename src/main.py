@@ -289,6 +289,42 @@ def _is_sentinel(ind):
             or getattr(ind, "_spark_sentinel", False))
 
 
+def _git_stamp():
+    """Return the repo's short commit SHA (``-dirty`` suffix if the working
+    tree has uncommitted changes), or ``"unknown"`` if git is unavailable.
+
+    Captured once at run time and written into summary/output.txt so every
+    result folder is self-identifying: the exact code + working-tree state
+    that produced it.  Best-effort — a missing git or non-repo checkout must
+    never abort a multi-hour optimisation, hence the broad except.
+    """
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    try:
+        sha = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+        dirty = subprocess.check_output(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+    return f"{sha}-dirty" if dirty else sha
+
+
+def _features_oneline(features):
+    """Render a features dict as one compact, greppable, sorted line.
+
+    Empty / None ⇒ ``"(none)"``.  Matches the ``key = value`` idiom of the
+    surrounding output.txt so a whole run's config sits on two lines
+    (git commit + features) rather than being scattered across the log.
+    """
+    if not features:
+        return "(none)"
+    return ", ".join(f"{k}={v}" for k, v in sorted(features.items()))
+
+
 def _cheap_al_proxy(strategy):
     """Return (F̄, ḡ_AL, stats) cheap proxy from the current parent set.
 
@@ -351,10 +387,18 @@ def _cheap_al_proxy(strategy):
     # al_first_front augments by the same AL penalty _select uses, so the
     # front here matches the one selection keeps.  An empty front (should
     # not occur with ≥1 candidate) falls back to all candidates.
+    #
+    # Tiny-front guard (al_proxy_front_min_size): only restrict to the front
+    # when it is a statistically meaningful sample.  A high g-quantile over a
+    # handful of front points collapses to ≈ the worst violator, which
+    # spuriously arms the AL as ε tightens (root cause of the al_cht_0088–0091
+    # coverage collapse).  Below the threshold we keep the full parent set so
+    # the quantile is taken over enough points to be robust.
     proxy_set = candidates
+    min_front = getattr(strategy, "al_proxy_front_min_size", None)
     if getattr(strategy, "al_proxy_front_only", None):
         front = strategy.al_first_front(candidates)
-        if front:
+        if front and (min_front is None or len(front) >= min_front):
             proxy_set = front
 
     g_arr = np.stack([np.asarray(p._g_al, dtype=float) for p in proxy_set],
@@ -379,6 +423,7 @@ def _cheap_al_proxy(strategy):
         "n_proxy_set":        int(len(proxy_set)),
         "proxy_front_only":   bool(getattr(strategy, "al_proxy_front_only", None)),
         "proxy_g_quantile":   (float(q) if q is not None else None),
+        "proxy_front_min_size": (int(min_front) if min_front is not None else None),
     }
     return float(np.mean(F_arr)), g_proxy, stats
 
@@ -1279,10 +1324,15 @@ def main(experiment_type, seed_population=None):
                 # Arnold (ArnoldCHT / ArnoldCHT_AL): one-shot per parent.
                 # Infeasibles are consumed via Eq. 6 + Eq. 7 BEFORE
                 # evaluation and marked _feasible=False so evaluate()
-                # short-circuits them (fit=None) and selection drops them.
-                # No resample loop — the slot contributes no candidate.
+                # short-circuits them (fit=None).  By default the slot then
+                # contributes no candidate (paper behaviour).  With the
+                # arnold_resample_infeasibles feature the slot is instead
+                # rejection-resampled from the shrunk distribution until
+                # feasible or the cap is hit (Arnold-resample hybrid).
                 strategy.apply_arnold_infeasibility(
                     population, feasibility_check=_check,
+                    resample=strategy.arnold_resample_infeasibles,
+                    max_iterations=strategy.arnold_resample_max_iterations,
                 )
                 toolbox.logbook.bookshelf['resample_iterations'][gen] = 0
             else:
@@ -1820,6 +1870,12 @@ def main(experiment_type, seed_population=None):
         file.write(f"step size = {experiment_type[2]}\n")
         file.write(f'pop size = {pop_size}\n')
         file.write(f'p4 treatment = {p4_treatment}\n')
+        # Provenance stamp: the exact code + working-tree state and the full
+        # anti-degeneration feature set that produced this run.  Two runs that
+        # differ only by features (the al_cht_0086–0091 confound) are now
+        # distinguishable straight from output.txt, no diagnostics archaeology.
+        file.write(f"git commit = {_git_stamp()}\n")
+        file.write(f"features = {_features_oneline(features)}\n")
         file.write(f"time taken = {toolbox.logbook.bookshelf['time taken']}\n")
         file.write(f'Number of generations = {NGEN}\n')
         file.write(f'Current Time = {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}\n')

@@ -388,8 +388,19 @@ class StrategyMultiObjective(object):
         #     FRONT-ALAMO drives the update from the WORST violation; a high
         #     quantile is the noise/sentinel-robust surrogate for the raw
         #     max.  None ⇒ mean (legacy).
+        #   al_proxy_front_min_size: int guard on al_proxy_front_only.  Only
+        #     restrict the proxy set to the first non-dominated front when that
+        #     front has at least this many members; otherwise fall back to all
+        #     surviving parents.  Defuses the tiny-front pathology (see RCA of
+        #     the al_cht_0088–0091 collapse): a high g-quantile over a handful
+        #     of front points degenerates to ≈ the single worst violator, which
+        #     spuriously arms the AL penalty as the ε-schedule tightens and
+        #     culls the constraint-adjacent coverage edge.  Arnold runs carry
+        #     small fronts (~μ/4), so the guard matters most there.  None ⇒ no
+        #     guard (restrict whenever the front is non-empty; legacy B4).
         self.al_proxy_front_only = features.get("al_proxy_front_only")
         self.al_proxy_g_quantile = features.get("al_proxy_g_quantile")
+        self.al_proxy_front_min_size = features.get("al_proxy_front_min_size")
         # C1: tolerance for is_feasible() inside the CHT resample loop.
         # Higher ⇒ more permissive (fewer offspring re-sampled / fewer
         # CHT calls).  None or 0.0 ⇒ strict feasibility.
@@ -402,6 +413,22 @@ class StrategyMultiObjective(object):
         # let it contribute to its donor parent's psucc / σ update.
         # Decouples σ adaptation from CHT-induced "successes".
         self.psucc_exclude_resampled = bool(features.get("psucc_exclude_resampled", False))
+        # Arnold-resample hybrid (features.arnold_resample_infeasibles).
+        # Legacy Arnold drops an infeasible slot after the Eq. 6/7 shrink,
+        # so the slot yields no selection candidate that generation.  When
+        # this is True, the slot is instead rejection-resampled from the
+        # *shrunk* (σ_i, A_i) until feasible or the cap is hit — a hybrid of
+        # Arnold's directional covariance adaptation and rejection sampling.
+        # Distinct from Resampling_AL, which redraws from the UNCHANGED
+        # distribution; here the redraw benefits from Arnold's active pull
+        # toward feasibility.  None/False ⇒ paper behaviour (drop).
+        # ``arnold_resample_max_iterations`` caps the redraw tail.
+        self.arnold_resample_infeasibles = bool(
+            features.get("arnold_resample_infeasibles", False)
+        )
+        self.arnold_resample_max_iterations = int(
+            features.get("arnold_resample_max_iterations", 100)
+        )
         # Group-C reversal toggle: treat sentinel offspring in the
         # not-chosen branch as honest failures rather than skipping the
         # update entirely.  Reframes SPARK/PITOT3 failures as information
@@ -692,6 +719,7 @@ class StrategyMultiObjective(object):
             "n_proxy_set":        stats.get("n_proxy_set"),
             "proxy_front_only":   stats.get("proxy_front_only"),
             "proxy_g_quantile":   stats.get("proxy_g_quantile"),
+            "proxy_front_min_size": stats.get("proxy_front_min_size"),
         })
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1422,8 +1450,9 @@ class StrategyMultiObjective(object):
     # Arnold & Hansen 2012 CHT — one-shot infeasibility consumer
     # ─────────────────────────────────────────────────────────────────────────
 
-    def apply_arnold_infeasibility(self, population, feasibility_check):
-        """Consume infeasible offspring via Eq. 6 + Eq. 7 (no resampling).
+    def apply_arnold_infeasibility(self, population, feasibility_check,
+                                   resample=False, max_iterations=100):
+        """Consume infeasible offspring via Eq. 6 + Eq. 7.
 
         Faithful to the (1+1) lifecycle of Arnold & Hansen 2012 mapped onto
         the (μ+λ) batched setting: each parent gets exactly one sample per
@@ -1432,10 +1461,27 @@ class StrategyMultiObjective(object):
           1. For each violated constraint j, update v_{j,i} (Eq. 6).
           2. Apply the multi-rank subtractive update to A_i (Eq. 7), with a
              Cholesky-PSD guard.
-          3. Mark the offspring infeasible so it bypasses both the heavy
-             L1d evaluation and the selection pool — no resample, the slot
-             simply contributes no candidate this generation (paper Fig. 3
-             step 3: "the iteration is complete").
+          3. Disposition of the slot depends on ``resample`` (below).
+
+        ``resample`` selects what happens to the infeasible slot after the
+        covariance shrink:
+
+          * ``False`` (paper behaviour): mark the offspring infeasible so it
+            bypasses both the heavy L1d evaluation and the selection pool —
+            the slot contributes no candidate this generation (paper Fig. 3
+            step 3: "the iteration is complete").
+          * ``True`` (Arnold-resample hybrid): rejection-resample the slot
+            from the *shrunk* (σ_i, A_i) until feasible or ``max_iterations``
+            is hit.  Eq. 6/7 is applied ONCE (on the initial infeasible
+            sample), preserving the paper's one-covariance-update-per-slot
+            accounting and the Arnold diagnostics semantics; the redraw tail
+            is pure rejection from the tightened distribution.  A slot still
+            infeasible after the cap stays ``_feasible=False`` and is dropped
+            by selection — the same end-state as the drop path.  Contrast
+            ``resample_infeasibles_rejection`` (redraws from the UNCHANGED
+            distribution) and ``resample_infeasibles`` (Chocat: isotropic
+            shrink each pass); here the redraw benefits from Arnold's
+            *directional* pull toward feasibility.
 
         After this returns, ``ind._g`` and ``ind._feasible`` are set for
         every individual, mirroring the post-condition of
@@ -1444,6 +1490,7 @@ class StrategyMultiObjective(object):
         ``feasibility_check`` has the same contract as for
         ``resample_infeasibles``: a CHEAP check that does not call L1d.
         """
+        n = self.dim
         for ind in population:
             feasible, g = feasibility_check(ind)
             ind._g = g
@@ -1467,19 +1514,41 @@ class StrategyMultiObjective(object):
                 # κ snapshot for this lineage stay faithful.
                 self._record_arnold_diag(p_idx, lineage_id,
                                          active_js=[], v_norms=[])
-                continue
-            self.A[p_idx], self.invCholesky[p_idx], upd = self._arnold_update_A(
-                self.A[p_idx], self.invCholesky[p_idx], p_idx, active_js,
-            )
-            # ‖v_j‖ of each active constraint, read AFTER the Eq. 6 filter
-            # update — this is the quantity the mean-‖v_j‖ figure tracks.
-            v_norms = [float(np.linalg.norm(self.v[p_idx][j])) for j in active_js]
-            self._record_arnold_diag(
-                p_idx, lineage_id, active_js, v_norms,
-                A_delta_fro=upd["A_delta_fro"],
-                shrink_applied=upd["shrink_applied"],
-                psd_fallback=upd["psd_fallback"],
-            )
+            else:
+                self.A[p_idx], self.invCholesky[p_idx], upd = self._arnold_update_A(
+                    self.A[p_idx], self.invCholesky[p_idx], p_idx, active_js,
+                )
+                # ‖v_j‖ of each active constraint, read AFTER the Eq. 6 filter
+                # update — this is the quantity the mean-‖v_j‖ figure tracks.
+                v_norms = [float(np.linalg.norm(self.v[p_idx][j])) for j in active_js]
+                self._record_arnold_diag(
+                    p_idx, lineage_id, active_js, v_norms,
+                    A_delta_fro=upd["A_delta_fro"],
+                    shrink_applied=upd["shrink_applied"],
+                    psd_fallback=upd["psd_fallback"],
+                )
+
+            # Arnold-resample hybrid: give the slot a feasible candidate by
+            # redrawing from the just-shrunk (σ_i, A_i).  Pure rejection tail
+            # (no further covariance surgery), so the covariance accounting
+            # above stays one-update-per-slot.  Genes are mutated in place so
+            # ind_number / _ps / DEAP fitness slot survive; _Az is kept
+            # truthful to the accepted step and _resampled is tagged so the
+            # C3 (psucc_exclude_resampled) opt-out can see it.
+            if resample:
+                for _ in range(max_iterations):
+                    z = np.random.randn(n)
+                    mutation = self.sigmas[p_idx] * np.dot(self.A[p_idx], z)
+                    new_x = self.parents[p_idx] + mutation
+                    for k in range(n):
+                        ind[k] = float(new_x[k])
+                    ind._Az = np.array(mutation, copy=True)
+                    feasible, g = feasibility_check(ind)
+                    ind._g = g
+                    ind._feasible = feasible
+                    if feasible:
+                        break
+                ind._resampled = True
 
     def _record_arnold_diag(self, parent_idx, lineage_id, active_js, v_norms,
                             A_delta_fro=None, shrink_applied=False,

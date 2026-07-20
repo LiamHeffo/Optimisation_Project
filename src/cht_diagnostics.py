@@ -201,6 +201,7 @@ AL_PER_GEN_FIELDS = [
     "n_proxy_set",           # points actually summarised (front size or all)
     "proxy_front_only",      # True ⇒ proxy restricted to first non-dom front
     "proxy_g_quantile",      # upper quantile used for g_al (None ⇒ mean)
+    "proxy_front_min_size",  # tiny-front guard threshold (None ⇒ no guard)
 ]
 
 

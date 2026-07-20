@@ -33,6 +33,8 @@
 #
 #   pop_size     : population size  (MU = LAMBDA = pop_size)
 #
+#   n_gen        : number of generations to run.  Optional; omitted ⇒ 350.
+#
 #   step_size    : initial CMA-ES step size (sigma), in normalised [1,2]^6 space
 #
 #   p4_treatment : how to enforce the upper p4 bound after mutation
@@ -112,12 +114,22 @@
 #                        analogue of pricing "the current solution(s)"
 #                        (FRONT-ALAMO, Cocchi/Lapucci/Mansueto 2021).
 #                        Affects only the update, NOT the iqr bootstrap.
-#                    al_proxy_g_quantile: float in [0, 1] (e.g. 0.9)
+#                    al_proxy_g_quantile: float in [0, 1] (e.g. 0.75)
 #                        aggregate g_al over the proxy set with this upper
 #                        quantile instead of the mean.  FRONT-ALAMO uses the
 #                        WORST violation; a high quantile is the robust
 #                        surrogate for max (mean lets feasible members mask
 #                        infeasible ones, stalling the penalty).
+#                    al_proxy_front_min_size: int (e.g. 12)
+#                        guard on al_proxy_front_only.  Only restrict the
+#                        proxy set to the first front when that front holds
+#                        at least this many members; otherwise fall back to
+#                        all surviving parents.  Defuses the tiny-front
+#                        pathology (RCA of al_cht_0088–0091): a high
+#                        g-quantile over a handful of front points collapses
+#                        to ≈ the worst violator and spuriously arms the AL
+#                        as ε tightens.  Matters most for Arnold, whose
+#                        fronts stay small.  Omit ⇒ no guard (legacy B4).
 #
 #                  Group C — redefine / re-treat infeasibility
 #                    cht_resample_tol: float (e.g. 0.02)
@@ -130,6 +142,18 @@
 #                        exclude CHT-resampled offspring from the donor
 #                        parent's σ/psucc adaptation.  Decouples σ from
 #                        CHT-induced "successes".
+#                    arnold_resample_infeasibles: bool (true/false)
+#                        (Arnold family only) after the Eq. 6/7 covariance
+#                        shrink, rejection-resample the infeasible slot from
+#                        the SHRUNK (σ_i, A_i) until feasible instead of
+#                        dropping it.  Hybrid of Arnold's directional
+#                        adaptation and rejection sampling — distinct from
+#                        Resampling_AL, which redraws from the UNCHANGED
+#                        distribution.  Default false (paper drop behaviour).
+#                    arnold_resample_max_iterations: int (e.g. 100)
+#                        rejection-tail cap for arnold_resample_infeasibles.
+#                        A slot still infeasible after the cap is dropped by
+#                        selection (same end-state as the drop path).
 #                    psucc_sentinel_as_failure: bool (true/false)
 #                        partial reversal of Fix-S3.  When True, PITOT3
 #                        and SPARK sentinel offspring in the *not-chosen*
@@ -157,69 +181,76 @@
 
 experiments:
   # ════════════════════════════════════════════════════════════════════════
-  # ACTIVE: ArnoldCHT_AL seeded from the L1d init population.
-  #   • sim_type ArnoldCHT_AL  — Arnold & Hansen 2012 covariance update
-  #                              (per-parent v_j, Eq. 6/7) + Augmented
-  #                              Lagrangian on delta_vs1 (2-objective
-  #                              hold_time / impact problem).
-  #   • HV indicator           — default selection (no `selection: crowding`).
-  #   • al_tol_schedule        — the ε schedule [3585 → 100 over gens
-  #                              100..250].
-  #   • arnold_beta / arnold_cc omitted ⇒ paper defaults 0.1/(n+2), 1/(n+2).
-  # Seed with:  python3 src/init_population_l1d.py --pop-size 24 ... \
-  #                 --launch-cmaes
-  # (the seed pop_size must match this block's pop_size — see --seed-npz).
+  # ARNOLD CHT — three staged simulations from the RCA of the al_cht_0088–0091
+  # coverage collapse.  Dispatched back-to-back in fresh subprocesses (one per
+  # entry, in list order) from the SAME seed population, so the ONLY variable
+  # is the constraint-handling treatment:
+  #     python3 src/init_population_l1d.py --pop-size 24 ... --launch-cmaes
+  #     python3 src/main.py --seed-npz <npz>
+  # All three share pop_size=24, step_size=0.1, al_tol=3585, n_gen=500, the
+  # ε schedule [3585 → 100 over gens 100..250], HV-indicator selection, and
+  # arnold_beta / arnold_cc omitted ⇒ paper defaults 0.1/(n+2), 1/(n+2).
   #
-  # TWO IDENTICAL REPLICATES: the `&arnold` anchor defines the config once
-  # and `*arnold` repeats it, so `python3 src/main.py --seed-npz <npz>`
-  # (dispatcher mode) runs both back-to-back in fresh subprocesses — same
-  # seed population + hyperparameters, differing only by CMA-ES RNG draws.
-  # Delete the `*arnold` line to run a single simulation.
+  #   1) LEGACY Arnold  — B4 proxy shaping OFF, so the per-gen AL update is
+  #        driven by the mean g_al over ALL surviving parents (this is the
+  #        run-86 configuration that produced a well-spread front).  Infeasible
+  #        offspring shrink the parent covariance (Eq. 6/7), then the slot is
+  #        dropped.
+  #   2) FRONT GUARD    — B4 proxy shaping ON (front-only, 0.75 quantile) but
+  #        guarded by al_proxy_front_min_size: only summarise the first front
+  #        when it holds ≥12 members (μ/2); below that, fall back to all
+  #        parents.  Defuses the tiny-front pathology the RCA identified (a
+  #        0.75-quantile over ~6 front points ≈ the worst violator, spuriously
+  #        arming the AL as ε tightens).  Same drop-on-infeasible as (1).
+  #   3) GUARD + RESAMPLE — as (2), plus arnold_resample_infeasibles: an
+  #        infeasible slot is rejection-resampled from the Arnold-SHRUNK
+  #        (σ_i, A_i) until feasible instead of being dropped.  Hybrid of
+  #        Arnold's directional covariance adaptation and rejection sampling
+  #        (distinct from Resampling_AL, which redraws from the UNCHANGED
+  #        distribution).
   # ════════════════════════════════════════════════════════════════════════
-  - &arnold
-    sim_type: ArnoldCHT_AL
+  # 1) Legacy Arnold CHT — B4 off (run-86 proxy)
+  - sim_type: ArnoldCHT_AL
     pop_size: 24
     step_size: 0.1
     p4_treatment: null
     al_tol: 3585
+    n_gen: 500
     features:
       psucc_sentinel_as_failure: true
       al_tol_schedule: [3585, 100.0, 100, 250]
-      # B4 (FRONT-ALAMO-aligned proxy shaping) — uncomment to A/B against
-      # the legacy mean-of-all-parents proxy.  Both default off (legacy).
-      # al_proxy_front_only: true
-      # al_proxy_g_quantile: 0.9
-  - *arnold
+      # B4 proxy shaping intentionally OFF ⇒ legacy mean-of-all-parents proxy.
 
-  # ════════════════════════════════════════════════════════════════════════
-  # CONTRAST: Resampling_AL — the rejection-sampling baseline for the CHT
-  # comparison.  IDENTICAL to the &arnold block above in every respect
-  # (pop_size, step_size, al_tol, features, ε-schedule) so the ONLY variable
-  # is the pre-eval constraint handler:
-  #   • Arnold      — infeasible offspring shrink the parent covariance
-  #                   (Eq. 6/7), then the slot is dropped.
-  #   • Resampling  — infeasible offspring are redrawn from the UNCHANGED
-  #                   (σ, A) until feasible (pure rejection); no covariance
-  #                   surgery.  Cap via features.resample_max_iterations
-  #                   (default 100); a slot still infeasible after the cap is
-  #                   dropped by selection.
-  # Dispatch both families from the SAME seed population so the contrast is
-  # not confounded by initial conditions:
-  #     python3 src/main.py --seed-npz <same npz as arnold>
-  # Two replicates (&resample / *resample) mirror the arnold pair, differing
-  # only by CMA-ES RNG draws.  Comment these two lines out to skip.
-  # ════════════════════════════════════════════════════════════════════════
-  - &resample
-    sim_type: Resampling_AL
+  # 2) Arnold CHT — B4 on, guarded against tiny fronts
+  - sim_type: ArnoldCHT_AL
     pop_size: 24
     step_size: 0.1
     p4_treatment: null
     al_tol: 3585
+    n_gen: 500
     features:
       psucc_sentinel_as_failure: true
       al_tol_schedule: [3585, 100.0, 100, 250]
-      # resample_max_iterations: 100   # rejection cap (default 100)
-  - *resample
+      al_proxy_front_only: true
+      al_proxy_g_quantile: 0.75
+      al_proxy_front_min_size: 12    # μ/2 guard — fall back to all parents below this
+
+  # 3) Arnold CHT — guard + resample infeasibles from the shrunk distribution
+  - sim_type: ArnoldCHT_AL
+    pop_size: 24
+    step_size: 0.1
+    p4_treatment: null
+    al_tol: 3585
+    n_gen: 500
+    features:
+      psucc_sentinel_as_failure: true
+      al_tol_schedule: [3585, 100.0, 100, 250]
+      al_proxy_front_only: true
+      al_proxy_g_quantile: 0.75
+      al_proxy_front_min_size: 12
+      arnold_resample_infeasibles: true
+      arnold_resample_max_iterations: 100   # rejection-tail cap (default 100)
+
 
   # ────────────────────────────────────────────────────────────────────────
   # Anti-degeneration feature sweep — each entry enables exactly ONE
