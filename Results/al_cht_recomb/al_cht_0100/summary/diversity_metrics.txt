@@ -1,0 +1,21 @@
+# Diversity metrics — Deb's Δ on the non-dominated set
+# Lower Δ = more uniform spread along the front.
+# Δ uses per-set extremes (d_f = d_l = 0); for cross-run
+# coverage compare ext_0 and ext_1 directly.
+
+[Final population]
+  n_nd = 24
+  ext_0 = 0.327838
+  ext_1 = 0.101673
+  d_bar = 0.015108
+  spacing = 0.021954
+  delta = 0.620943
+
+[External archive]
+  total_size = 87
+  n_nd = 87
+  ext_0 = 0.429824
+  ext_1 = 0.106366
+  d_bar = 0.005764
+  spacing = 0.015070
+  delta = 1.238289
