@@ -433,14 +433,9 @@ def plot_geometry(
         ax.plot(xs, y_up, color="black", lw=1.0, zorder=2)
         ax.plot(xs, y_lo, color="black", lw=1.0, zorder=2)
 
-        # Break-points + numeric labels
+        # Break-points (markers only — the ordinal labels crowded the
+        # profile without adding information the figure needs).
         ax.plot(xs, y_lo, "o", ms=4, color="black", zorder=3)
-        for i, (x, d) in enumerate(zip(xs, Ds), start=1):
-            ax.annotate(
-                str(i), xy=(x, -d / 2),
-                xytext=(3, -10), textcoords="offset points",
-                fontsize=8, color="black",
-            )
 
         # Piston
         ax.add_patch(Rectangle(
@@ -485,11 +480,16 @@ def plot_geometry(
     _draw_common(ax_over)
     _draw_common(ax_zoom)
 
-    # Region labels on the overview only (cluttered on zoom).
-    ax_over.text(0.5 * (reservoir_xL + piston_xL0), 0.0,
-                 "Reservoir", ha="center", va="center", fontsize=11)
-    ax_over.text(0.5 * (piston_xR0 + pd_x), 0.0,
-                 "Compression Tube", ha="center", va="center", fontsize=11)
+    # Region labels on the overview only (cluttered on zoom).  Each sits
+    # just clear of its own local wall rather than inside the bore, where
+    # the cell-face ticks and centre dots ran through the text.  The
+    # profile is monotonic in x, so np.interp gives the local wall height.
+    def _label_above(ax, x_mid, text, pad=0.022):
+        y = float(np.interp(x_mid, xs, y_up)) + pad
+        ax.text(x_mid, y, text, ha="center", va="bottom", fontsize=11)
+
+    _label_above(ax_over, 0.5 * (reservoir_xL + piston_xL0), "Reservoir")
+    _label_above(ax_over, 0.5 * (piston_xR0 + pd_x), "Compression Tube")
     ax_over.text(piston_xL0 + 0.5 * (piston_xR0 - piston_xL0), 0.18,
                  "Piston", ha="center", va="bottom", fontsize=9)
 
@@ -519,7 +519,24 @@ def plot_geometry(
     if "x_orifice_centre" in derived:
         ax_zoom.axvline(derived["x_orifice_centre"], color="purple",
                         ls=":", lw=0.8, alpha=0.7, label="Orifice centre")
-    ax_zoom.legend(loc="upper right", fontsize=8)
+
+    # Displaced stud volume (Eq 4.13) — this is the V_buffer that sets the
+    # upstream volume-conserving ramp, so it belongs beside the geometry it
+    # produces.  Carried by the stud patch's own legend entry rather than a
+    # free-floating text box, so it stays attached to the hatched region.
+    V_buffer = buffer_stud_volume(buffer_length)
+    handles, labels = ax_zoom.get_legend_handles_labels()
+    if buffer_length > 0:
+        # Proxy artist: built for the legend only and deliberately never
+        # added to the axes, so it carries the hatch swatch without being
+        # drawn on the plot.  (Adding it and hiding it suppresses the
+        # legend handle too.)
+        handles.append(Rectangle((0, 0), 1, 1, facecolor="none",
+                                 edgecolor="black", lw=0.8, hatch="////"))
+        labels.append(
+            f"Buffer studs, $V_\\mathrm{{buffer}}$ = {V_buffer * 1e3:.3f} L"
+        )
+    ax_zoom.legend(handles, labels, loc="upper right", fontsize=8)
 
     plt.tight_layout()
     if save_path is not None:
